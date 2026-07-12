@@ -1,4 +1,4 @@
-# control-browser-from-server
+# understudy
 
 An LLM-driven system that puppets a user's *already-logged-in* browser via a Chromium
 extension, coordinated by a Cloudflare-hosted backend brain. The backend never touches a

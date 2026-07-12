@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "CDP Spike (M0) — control-browser-from-server",
+  "name": "CDP Spike (M0) — understudy",
   "version": "0.0.1",
   "description": "Throwaway M0 harness: verifies the chrome.debugger CDP command surface the plan depends on.",
   "minimum_chrome_version": "114",

@@ -2,7 +2,7 @@
 
 ## Baseline
 
-- **Repo**: `proofoftech/control-browser-from-server`, greenfield. Branch `master`, **no commits yet**. Empty except `.git`.
+- **Repo**: `proofoftech/understudy` (local dir may still be named `control-browser-from-server` until renamed). Branch `master`. Initial scaffold committed at `9fb7c28`: **M1 protocol package done + tested; M0 CDP-spike harness built** (`apps/cdp-spike`) — the M0 probe still needs to be run in a real Chromium to capture the finding.
 - **Main branch for PRs**: `main` (does not exist yet; create on first push).
 - **Runtime targets decided**: Cloudflare-first backend; Chromium-only extension; multi-user product; CDP (`chrome.debugger`) as the automation driver. Self-host (Node) backend is a *future* target, kept open behind an interface — not built in v1.
 - **Env quirks to know before building**:
@@ -65,7 +65,7 @@ Loop:  a11y snapshot ─▶ Claude returns tool_use(s) ─▶ [approval gate on 
 ## Repo layout
 
 ```
-control-browser-from-server/
+understudy/
   package.json                 # pnpm workspaces root
   pnpm-workspace.yaml
   packages/
