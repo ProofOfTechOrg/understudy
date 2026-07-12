@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Cloudflare / Wrangler (added at M3)
+.wrangler/
+
+# WXT extension build (added at M2)
+.wxt/
+.output/
+
+# codebase-memory MCP local bundle — never commit
+.codebase-memory/
+
+.DS_Store
+*.log

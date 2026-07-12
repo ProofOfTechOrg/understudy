@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "CDP Spike (M0) — control-browser-from-server",
+  "version": "0.0.1",
+  "description": "Throwaway M0 harness: verifies the chrome.debugger CDP command surface the plan depends on.",
+  "minimum_chrome_version": "114",
+  "permissions": ["debugger", "tabs", "activeTab", "storage", "sidePanel"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": { "default_title": "Open CDP Spike panel" }
+}

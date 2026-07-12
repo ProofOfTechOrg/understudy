@@ -1,0 +1,12 @@
+packages:
+  - "packages/*"
+  # apps/* become workspace members at M2 (extension) / M3 (backend).
+  # apps/cdp-spike is a buildless vanilla-JS harness — intentionally NOT a member.
+
+# Supply-chain guard: quarantine freshly published versions for 7 days (minutes).
+minimumReleaseAge: 10080
+
+# Dependency build-script approvals (pnpm). esbuild is a trusted vitest/vite
+# dependency that links its platform binary via an install script.
+allowBuilds:
+  esbuild: true
