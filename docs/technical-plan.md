@@ -2,7 +2,7 @@
 
 ## Baseline
 
-- **Repo**: `proofoftech/understudy` (local dir may still be named `control-browser-from-server` until renamed). Branch `master`. Initial scaffold committed at `9fb7c28`: **M1 protocol package done + tested; M0 CDP-spike harness built** (`apps/cdp-spike`) — the M0 probe still needs to be run in a real Chromium to capture the finding.
+- **Repo**: `proofoftech/understudy`. Branch `master`; HEAD `11565d6` (scaffold `9fb7c28` + rename/scoping chores). **M1 protocol package done + tested (9 tests). M0 CDP spike RUN in a real logged-in Chromium 2026-07-13 — 10/11 CDP commands OK; only `Target.getTargets` is restricted (`"Not allowed"`), which does not affect the design (see "M0 findings" below). The CDP targeting approach (D2/D7) is validated; the plan's one gating technical risk is retired.**
 - **Main branch for PRs**: `main` (does not exist yet; create on first push).
 - **Runtime targets decided**: Cloudflare-first backend; Chromium-only extension; multi-user product; CDP (`chrome.debugger`) as the automation driver. Self-host (Node) backend is a *future* target, kept open behind an interface — not built in v1.
 - **Env quirks to know before building**:
@@ -43,7 +43,7 @@
 │  • task input            • holds WS to backend         [ chrome.debugger ] │
 │  • approval prompts  ⇄   • holds CDP session      ⇄    CDP: Accessibility, │
 │  • live status           • command router               DOM, Input, Page, │
-│  (chrome.runtime msg)    • 20-25s WS keepalive          Runtime, Target    │
+│  (chrome.runtime msg)    • 20-25s WS keepalive          Runtime            │
 └───────────────────────────────┬───────────────────────────────────────────┘
                                  │ wss://<backend>/agent/<userId>   (auth token)
                                  ▼
@@ -138,7 +138,31 @@ The hard problem. Approach (matches Playwright / chrome-devtools-mcp):
 4. **Staleness**: a `ref` is valid only for the snapshot generation that produced it. Every mutating action is followed by an implicit re-snapshot before the next `tool_use` needs one. If a `ref` no longer resolves, return `action_result{ok:false, error:"stale ref"}`; the loop re-snapshots and retries.
 5. **Screenshots** (`mode:"screenshot"` → `Page.captureScreenshot`) are a *fallback* the model can request when the a11y tree is insufficient (canvas, visual layout). Sent to Claude as a base64 image block (Opus 4.8 high-res vision, ≤2576px long edge). DOM/a11y-first keeps cost down.
 
-> `chrome.debugger` exposes the CDP domains needed here (Accessibility, DOM, Input, Page, Runtime, Target). **Spike this first** (Milestone 0) — confirming the exact allowed-command surface under `chrome.debugger` (a few CDP commands are restricted vs. raw CDP) is the one real technical risk of the CDP approach.
+> `chrome.debugger` exposes the CDP domains needed here (Accessibility, DOM, Input, Page, Runtime). **Milestone 0 confirmed this surface on 2026-07-13 — see "M0 findings" below.** The `Target` domain's `getTargets` is restricted under `chrome.debugger` (`"Not allowed"`); tab enumeration/switching is therefore backed by the WebExtensions `chrome.tabs.*` API (not CDP), and per-tab attach uses `chrome.debugger.attach({ tabId })`. This was the one real technical risk of the CDP approach; it is now retired.
+
+## M0 findings — CDP surface + a11y ref-model confirmed (2026-07-13)
+
+Probe run via `apps/cdp-spike` on a **real logged-in Chromium tab** (a signed-in Google session — the a11y tree exposed the account holder, confirming CDP reads the *actual* logged-in page, not a fresh context — the entire premise of D1). **10/11 CDP commands OK; the a11y `ref` pruning produced usable targets; and the full attach → snapshot → screenshot → detach cycle completed with a clean detach. The CDP targeting approach (D2/D7) is validated; the plan's single biggest technical risk is retired.**
+
+CDP command surface:
+
+| CDP command | Result |
+|---|---|
+| `Accessibility.enable` / `getFullAXTree` | OK — ~2024–2060 nodes on a live page |
+| `DOM.enable` / `getDocument` / `getBoxModel` | OK — `getBoxModel` via `backendNodeId` returned a box (1710×978); `ref → coordinates` works |
+| `Runtime.enable` / `evaluate` | OK |
+| `Input.dispatchMouseEvent` | OK (no-op move) |
+| `Page.enable` / `captureScreenshot` | OK — ~235 KB PNG |
+| `Target.getTargets` | **FAIL — `{ code: -32000, message: "Not allowed" }`** (restricted under `chrome.debugger`) |
+
+a11y `ref` model (D7): pruning the full tree yielded **162 actionable nodes out of 2060 (~8%)**, each a `{ ref, role, name }` with a human-meaningful `name` — the search combobox, real button labels (`Share`, `Google apps`, `Search by voice`/`image`), and links (`Page 2…5`, `Go to Google Home`). This is exactly the compact shape the backend feeds the LLM, and the actionable elements are captured with usable names. D7 confirmed end-to-end.
+
+**Impact of the one failure: none on the design.** The `Target` domain's target-*discovery* methods are blocked under `chrome.debugger` by design (a privilege-escalation guard). This does not affect us:
+- **Per-tab attach** uses `chrome.debugger.attach({ tabId })` with a WebExtensions tab id — never CDP `Target.attachToTarget`. `getTargets` was never on the attach path.
+- **Multi-tab awareness** (`get_tabs` → `TabInfo[]`, `switch_tab`) is backed by the WebExtensions `chrome.tabs.*` API (`chrome.tabs.query`, `chrome.tabs.update(tabId, { active: true })`), the correct source for browser-level tab state. The protocol commands are unchanged; only their extension-side *implementation* is pinned here.
+- v1 scope is a single designated tab anyway (see "Out of scope"), so tab enumeration is not even on the v1 critical path.
+
+**One sub-question deferred to M2:** cross-origin / out-of-process iframe (OOPIF) traversal. `getFullAXTree` returned the main frame's tree; reaching *into* OOPIFs via CDP normally needs `Target.setAutoAttach` (a *different* `Target` method than the blocked `getTargets`, and generally permitted under `chrome.debugger`). It was not exercised by this probe. If cross-frame targeting is needed, add a focused `setAutoAttach{ flatten: true }` sub-probe at M2 before relying on it — the single-frame path is proven.
 
 ## Agent loop + LLM (`packages/agent-core`)
 
@@ -207,7 +231,7 @@ Grounded against the current Anthropic API (verified via the `claude-api` skill)
 
 ## Milestones (build order — each independently verifiable)
 
-- **M0 — CDP spike (de-risk first).** *Scaffolded → `apps/cdp-spike/` (buildless vanilla-JS MV3 harness, throwaway — the real extension is M2 in `apps/extension`).* Attaches `chrome.debugger`, and its "Probe CDP surface" button reports OK/FAIL for `Accessibility.getFullAXTree`, `DOM.getDocument`/`getBoxModel`, `Runtime.evaluate`, `Input.dispatchMouseEvent`, `Page.captureScreenshot`, `Target.getTargets`. **Goal: confirm the allowed CDP command surface** and that ref→backendNodeId→click works. This is the single biggest technical risk. Load unpacked in Chromium to run it (`apps/cdp-spike/README.md`).
+- **M0 — CDP spike (de-risk first). ✅ DONE (2026-07-13) — 10/11 CDP commands OK; only `Target.getTargets` restricted (non-blocking); a11y ref-model pruning validated (162/2060 actionable). CDP approach validated. See "M0 findings".** *Scaffolded → `apps/cdp-spike/` (buildless vanilla-JS MV3 harness, throwaway — the real extension is M2 in `apps/extension`).* Attaches `chrome.debugger`, and its "Probe CDP surface" button reports OK/FAIL for `Accessibility.getFullAXTree`, `DOM.getDocument`/`getBoxModel`, `Runtime.evaluate`, `Input.dispatchMouseEvent`, `Page.captureScreenshot`, `Target.getTargets`. **Goal: confirm the allowed CDP command surface** and that ref→backendNodeId→click works. This was the single biggest technical risk. Load unpacked in Chromium to run it (`apps/cdp-spike/README.md`).
 - **M1 — Protocol package.** `packages/protocol` with zod schemas + types. No runtime yet; unit-test round-trip validation.
 - **M2 — Extension driver.** SW holds a WS to a stub server; `cdp.ts` implements `snapshot`/`click`/`type`/`navigate`; command router maps protocol → CDP. Verify by driving a real logged-in page from `wscat`-style scripted commands. Add 20–25 s keepalive + `chrome.alarms` backstop. Manifest (`manifest_version: 3`) permissions: **`debugger`** (the one that gates CDP attach — easy to miss), `tabs`, `activeTab`, `storage`, `sidePanel`, `alarms`, `offscreen` (backstop connection), plus `host_permissions` for the origins the agent may act on.
 - **M3 — Backend skeleton.** Hono + Agents SDK `BrowserSessionAgent`; `routeAgentRequest`; echo/loopback the protocol; `setState` reflected in a trivial Side Panel. Auth stub.
