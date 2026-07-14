@@ -1,0 +1,19 @@
+# Copy this file to .dev.vars for local `wrangler dev`. Never commit the
+# real .dev.vars (see the root .gitignore) - these values are dev-only
+# placeholders, not real secrets.
+#
+# The defaults here match apps/backend/scripts/stub-consumer.mjs's own
+# defaults, so `node scripts/stub-consumer.mjs` works against a `wrangler
+# dev` started with this file copied into place, with no extra flags.
+
+AUTH_HMAC_SECRET=dev-hmac-secret-change-me
+
+# JSON map: caller bearer token -> {actor, tenantId}. Matches
+# stub-consumer.mjs's default CALLER_TOKEN.
+CALLER_TOKENS={"dev-caller-token":{"actor":"stub-consumer","tenantId":"dev-tenant"}}
+
+# JSON map: extension per-user token -> tenantId. Matches
+# stub-consumer.mjs's default EXTENSION_TOKEN; paste the WS URL stub-consumer
+# prints (which embeds this token) into the M2 extension's connection
+# settings.
+EXTENSION_TOKENS={"dev-ext-token":"dev-tenant"}

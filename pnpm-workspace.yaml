@@ -11,11 +11,26 @@ minimumReleaseAge: 10080
 # trusted vitest/vite/WXT dependency that links its platform binary via an
 # install script.
 allowBuilds:
+  # core-js-pure's postinstall is a wrapped, error-swallowed require of a
+  # donation-nag script (no build, no native step); it arrives via
+  # agents -> mimetext -> @babel/runtime-corejs3 (agents' unused email
+  # feature) and has no functional effect if skipped.
+  core-js-pure: false
   esbuild: true
+  # sharp is miniflare's (wrangler / @cloudflare/vitest-pool-workers) native
+  # image binding, pulled in transitively for local asset/image-resizing
+  # emulation; its install script performs a real native build/link, not a
+  # no-op, so denying it risks breaking wrangler dev at runtime.
+  sharp: true
   # spawn-sync is a vestigial sync-spawn polyfill for Node <0.11; it no-ops on
   # Node 22+ and nothing in the WXT/Vite toolchain needs its native build.
   # Explicitly denied so pnpm 11 does not hard-fail on an undecided build script.
   spawn-sync: false
+  # workerd is the actual Cloudflare Workers runtime binary that wrangler dev
+  # and @cloudflare/vitest-pool-workers (apps/backend, added at M3) execute
+  # Workers code inside; its postinstall fetches the platform binary and is
+  # required for either tool to run at all.
+  workerd: true
 
 # WXT 0.20.27 uses the Vite 6+ hook-filter plugin API, but `vitest` (^2.1, in
 # both packages/protocol and apps/extension) anchors vite 5.4.21 into the

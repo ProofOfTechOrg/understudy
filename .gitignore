@@ -4,6 +4,7 @@ dist/
 
 # Cloudflare / Wrangler (added at M3)
 .wrangler/
+.dev.vars
 
 # WXT extension build (added at M2)
 .wxt/

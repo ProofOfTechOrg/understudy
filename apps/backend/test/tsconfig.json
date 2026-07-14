@@ -1,0 +1,13 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    // The vitest-pool-workers ambient `cloudflare:test`/`cloudflare:workers`
+    // ambient module augmentations live under the package's `/types`
+    // subpath, not its package root (which is the `cloudflareTest` plugin
+    // module) - verified against the installed
+    // @cloudflare/vitest-pool-workers@0.18.0 package.json `exports` map and
+    // Cloudflare's own vitest-pool-workers-examples fixtures.
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"]
+  },
+  "include": ["./**/*.ts"]
+}

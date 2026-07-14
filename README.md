@@ -7,17 +7,23 @@ real tab via CDP and reports back.
 
 **Full design + build plan: [`docs/technical-plan.md`](docs/technical-plan.md).** Read it first.
 
-## Layout (current scaffold — milestones M0 + M1 + M2)
+## Layout (current scaffold — milestones M0 + M1 + M2 + M3)
 
-- **`packages/protocol`** — the shared command/event protocol (TypeScript + zod). The stable
-  contract between backend and extension; the core IP.
+- **`packages/protocol`** — the shared command/event protocol (TypeScript + zod 4, published
+  `@understudy/protocol`). The stable contract between backend and extension; the core IP.
 - **`apps/cdp-spike`** — **M0** throwaway harness: a buildless MV3 extension that verifies the
   `chrome.debugger` CDP command surface (the plan's one gating technical risk). See its README.
 - **`apps/extension`** — **M2** the real extension: a WXT + React MV3 extension that puppets a
   logged-in Chromium tab over a WebSocket. See its README.
+- **`apps/backend`** — **M3** the browser-execution service: a Cloudflare Worker (Hono) plus one
+  Agents-SDK Durable Object per session, terminating the extension's WebSocket and exposing
+  `POST /v1/sessions/:id/commands` for consumer apps (metamind, smart-compliance) to drive. Runs
+  no LLM and embeds no agent framework — the brain and governance (breakwater/flowsafe) live in
+  the consumers. See its README.
 
-Coming next per the plan: `apps/backend` (Hono + Cloudflare Agents SDK, M3), `packages/agent-core`
-(portable agent loop, M4).
+Coming next per the plan: **M4** — consumer integration + published contract
+(`@understudy/protocol` plus a reference `@understudy/connector`); the agent loop and
+governance (breakwater/flowsafe) stay consumer-side, per Topology 1.
 
 ## Develop
 
