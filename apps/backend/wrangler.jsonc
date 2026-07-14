@@ -1,0 +1,48 @@
+{
+  "name": "understudy-backend",
+  "main": "src/index.ts",
+  // Pinned at-or-before the pinned wrangler release date (see package.json)
+  // so the bundled workerd is guaranteed to recognize this compatibility date.
+  "compatibility_date": "2026-07-01",
+  // Agents SDK Durable Objects require Node.js compatibility.
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      // One SessionAgent DO per sessionId (per tenant/case) - DL-006.
+      // SessionAgent itself lands in src/session.ts at M-004 (wired into the
+      // Worker entry, src/index.ts, at M-005); the binding is declared now
+      // so wrangler.jsonc doesn't churn again for that milestone.
+      { "name": "SESSION", "class_name": "SessionAgent" }
+    ]
+  },
+  "migrations": [
+    // Agents SDK Durable Objects are SQLite-backed.
+    { "tag": "v1", "new_sqlite_classes": ["SessionAgent"] }
+  ],
+  "kv_namespaces": [
+    {
+      // Credential vault: fill_secret's secretRef -> plaintext, resolved
+      // service-side by secrets.ts (M-007) and never logged or written to DO
+      // state (DL-004). A KV namespace gives the dynamic get-by-key lookup
+      // an arbitrary per-fill secretRef needs; CF's Secrets / Secrets Store
+      // bindings are static (one binding per fixed secret name) and cannot
+      // address a runtime-chosen key. A per-tenant external KMS is a
+      // possible future swap behind the same Env.VAULT seam (src/types.ts).
+      "binding": "VAULT",
+      // Replace with a real namespace id (`wrangler kv namespace create
+      // VAULT`) before any dev/deploy that touches this binding.
+      "id": "REPLACE_WITH_VAULT_KV_NAMESPACE_ID"
+    }
+  ],
+  "secrets": {
+    // AUTH_HMAC_SECRET signs/verifies server-minted sessionIds so
+    // scopeSession can verify tenant ownership statelessly (M-006, DL-008).
+    // CALLER_TOKENS / EXTENSION_TOKENS (src/types.ts) are optional and are
+    // set via `wrangler secret put <NAME>` only when used, so they are
+    // intentionally not listed as required here.
+    "required": ["AUTH_HMAC_SECRET"]
+  },
+  "observability": {
+    "enabled": true
+  }
+}

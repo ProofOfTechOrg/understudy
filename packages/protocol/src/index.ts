@@ -63,6 +63,13 @@ export const CommandSchema = z.discriminatedUnion("type", [
     submit: z.boolean().optional(),
   }),
   z.object({
+    type: z.literal("fill_secret"),
+    commandId: z.string(),
+    ref: z.string(),
+    secretRef: z.string(),
+    submit: z.boolean().optional(),
+  }),
+  z.object({
     type: z.literal("key"),
     commandId: z.string(),
     keys: z.string(),
@@ -87,7 +94,7 @@ export type Command = z.infer<typeof CommandSchema>;
 export type CommandType = Command["type"];
 
 // State-changing commands gate on human approval (D8). Reads run freely.
-const WRITE_COMMANDS = new Set<CommandType>(["click", "type", "key", "navigate"]);
+const WRITE_COMMANDS = new Set<CommandType>(["click", "type", "key", "navigate", "fill_secret"]);
 export const isWriteCommand = (c: Command): boolean => WRITE_COMMANDS.has(c.type);
 
 // ── Events: extension → backend ──────────────────────────────────────────────
@@ -121,6 +128,7 @@ export const EventSchema = z.discriminatedUnion("type", [
     ok: z.boolean(),
     error: z.string().optional(),
     url: z.string().optional(),
+    simulated: z.boolean().optional(),
   }),
   z.object({
     type: z.literal("page_event"),

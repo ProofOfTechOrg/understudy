@@ -34,6 +34,23 @@ describe("CommandSchema", () => {
     const cmd = { type: "navigate", commandId: "c1", url: "https://example.com/" };
     expect(CommandSchema.parse(cmd)).toEqual(cmd);
   });
+
+  it("parses a valid fill_secret command", () => {
+    const cmd = {
+      type: "fill_secret",
+      commandId: "c1",
+      ref: "s1e2",
+      secretRef: "vault://x",
+      submit: true,
+    };
+    expect(parseCommand(cmd)).toEqual(cmd);
+  });
+
+  it("rejects fill_secret missing secretRef", () => {
+    expect(
+      safeParseCommand({ type: "fill_secret", commandId: "c1", ref: "s1e2" }).success,
+    ).toBe(false);
+  });
 });
 
 describe("isWriteCommand", () => {
@@ -43,11 +60,31 @@ describe("isWriteCommand", () => {
     expect(isWriteCommand(click)).toBe(true);
     expect(isWriteCommand(snap)).toBe(false);
   });
+
+  it("classifies fill_secret as a write", () => {
+    const fillSecret: Command = {
+      type: "fill_secret",
+      commandId: "c1",
+      ref: "s1e2",
+      secretRef: "vault://x",
+    };
+    expect(isWriteCommand(fillSecret)).toBe(true);
+  });
 });
 
 describe("EventSchema", () => {
   it("round-trips an action_result", () => {
     const ev = { type: "action_result", commandId: "c1", ok: true, url: "https://example.com/" };
+    expect(EventSchema.parse(ev)).toEqual(ev);
+  });
+
+  it("round-trips an action_result with simulated:true", () => {
+    const ev = { type: "action_result", commandId: "c1", ok: true, simulated: true };
+    expect(EventSchema.parse(ev)).toEqual(ev);
+  });
+
+  it("parses an action_result without simulated (optional)", () => {
+    const ev = { type: "action_result", commandId: "c1", ok: true };
     expect(EventSchema.parse(ev)).toEqual(ev);
   });
 
