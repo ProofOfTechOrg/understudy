@@ -54,6 +54,19 @@ describe("EventSchema", () => {
   it("rejects a malformed event", () => {
     expect(safeParseEvent({ type: "action_result" }).success).toBe(false);
   });
+
+  it("round-trips a tabs_result", () => {
+    const ev = {
+      type: "tabs_result",
+      commandId: "c1",
+      tabs: [{ tabId: 1, url: "https://x/", title: "X", active: true }],
+    };
+    expect(EventSchema.parse(ev)).toEqual(ev);
+  });
+
+  it("rejects a tabs_result missing tabs", () => {
+    expect(safeParseEvent({ type: "tabs_result", commandId: "c1" }).success).toBe(false);
+  });
 });
 
 describe("A11yNodeSchema", () => {

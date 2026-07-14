@@ -7,15 +7,17 @@ real tab via CDP and reports back.
 
 **Full design + build plan: [`docs/technical-plan.md`](docs/technical-plan.md).** Read it first.
 
-## Layout (current scaffold — milestones M0 + M1)
+## Layout (current scaffold — milestones M0 + M1 + M2)
 
 - **`packages/protocol`** — the shared command/event protocol (TypeScript + zod). The stable
   contract between backend and extension; the core IP.
 - **`apps/cdp-spike`** — **M0** throwaway harness: a buildless MV3 extension that verifies the
   `chrome.debugger` CDP command surface (the plan's one gating technical risk). See its README.
+- **`apps/extension`** — **M2** the real extension: a WXT + React MV3 extension that puppets a
+  logged-in Chromium tab over a WebSocket. See its README.
 
-Coming next per the plan: `apps/extension` (WXT + TS, M2), `apps/backend` (Hono + Cloudflare
-Agents SDK, M3), `packages/agent-core` (portable agent loop, M4).
+Coming next per the plan: `apps/backend` (Hono + Cloudflare Agents SDK, M3), `packages/agent-core`
+(portable agent loop, M4).
 
 ## Develop
 

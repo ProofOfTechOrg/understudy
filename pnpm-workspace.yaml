@@ -1,12 +1,25 @@
 packages:
   - "packages/*"
-  # apps/* become workspace members at M2 (extension) / M3 (backend).
-  # apps/cdp-spike is a buildless vanilla-JS harness — intentionally NOT a member.
+  - "apps/*"
+  # apps/extension joins at M2; apps/backend at M3.
+  # apps/cdp-spike (no package.json) is a buildless vanilla-JS harness — NOT a member.
 
-# Supply-chain guard: quarantine freshly published versions for 7 days (minutes).
+  # Supply-chain guard: quarantine freshly published versions for 7 days (minutes).
 minimumReleaseAge: 10080
 
-# Dependency build-script approvals (pnpm). esbuild is a trusted vitest/vite
-# dependency that links its platform binary via an install script.
+# Dependency build-script approvals (pnpm 11 `allowBuilds` map). esbuild is a
+# trusted vitest/vite/WXT dependency that links its platform binary via an
+# install script.
 allowBuilds:
   esbuild: true
+  # spawn-sync is a vestigial sync-spawn polyfill for Node <0.11; it no-ops on
+  # Node 22+ and nothing in the WXT/Vite toolchain needs its native build.
+  # Explicitly denied so pnpm 11 does not hard-fail on an undecided build script.
+  spawn-sync: false
+
+# WXT 0.20.27 uses the Vite 6+ hook-filter plugin API, but `vitest` (^2.1, in
+# both packages/protocol and apps/extension) anchors vite 5.4.21 into the
+# workspace and pnpm dedupes WXT's vite onto it -> `wxt prepare` breaks. Pin
+# WXT's vite to 8.1.3 (already vetted by the quarantine for @wxt-dev/module-react).
+overrides:
+  wxt>vite: 8.1.3

@@ -51,7 +51,7 @@ export const CommandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("navigate"),
     commandId: z.string(),
-    url: z.string().url(),
+    url: z.url(),
     tabId: z.number().optional(),
   }),
   z.object({ type: z.literal("click"), commandId: z.string(), ref: z.string() }),
@@ -109,6 +109,11 @@ export const EventSchema = z.discriminatedUnion("type", [
     commandId: z.string(),
     mime: z.string(),
     b64: z.string(),
+  }),
+  z.object({
+    type: z.literal("tabs_result"),
+    commandId: z.string(),
+    tabs: z.array(TabInfoSchema),
   }),
   z.object({
     type: z.literal("action_result"),
