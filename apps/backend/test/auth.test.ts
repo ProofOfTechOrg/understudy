@@ -25,6 +25,7 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
     AUTH_HMAC_SECRET: "test-hmac-secret-do-not-use-in-prod",
     CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),
     EXTENSION_TOKENS: JSON.stringify(EXTENSION_TOKENS),
+    VAULT_MASTER_KEY: "unused-by-auth-tests",
     ...overrides,
   };
 }

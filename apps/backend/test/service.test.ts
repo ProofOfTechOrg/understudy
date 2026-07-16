@@ -5,7 +5,14 @@ import { safeParseCommand, safeParseEvent } from "@understudy/protocol";
 import type { Command } from "@understudy/protocol";
 import type { SessionAgent } from "../src/session";
 import type { SessionStatus } from "../src/types";
-import { CALLER_TOKEN_A, CALLER_TOKEN_B, EXTENSION_TOKEN_A } from "./tokens";
+import { encryptSecret } from "../src/vault";
+import {
+  CALLER_TOKEN_A,
+  CALLER_TOKEN_B,
+  EXTENSION_TOKEN_A,
+  EXTENSION_TOKEN_B,
+  TEST_VAULT_MASTER_KEY,
+} from "./tokens";
 import { BASE, getSessionStub, getWebSocket } from "./helpers";
 
 /**
@@ -13,12 +20,14 @@ import { BASE, getSessionStub, getWebSocket } from "./helpers";
  * production code can never write through it. The real binding is a KV
  * namespace (wrangler.jsonc), which does support `put` - tests need that to
  * seed fixtures, so this narrow, test-only widening stays local to this file
- * rather than loosening the production-facing type.
+ * rather than loosening the production-facing type. Values are sealed with
+ * the same envelope the production seeder writes (scripts/vault-put.mjs):
+ * KV never holds plaintext, in tests either.
  */
-function seedVault(secretRef: string, plaintext: string): Promise<void> {
+async function seedVault(secretRef: string, plaintext: string): Promise<void> {
   return (env.VAULT as unknown as { put(key: string, value: string): Promise<void> }).put(
     secretRef,
-    plaintext,
+    await encryptSecret(TEST_VAULT_MASTER_KEY, plaintext),
   );
 }
 
@@ -388,6 +397,43 @@ describe("fill_secret", () => {
       socket.close(1000, "done");
     }
   });
+
+  it("fails closed with a scrubbed ok:false when a stored vault value is not a valid envelope", async () => {
+    // #given a RAW (non-envelope) value written straight to KV, as a legacy
+    // plaintext row or a value sealed under a rotated key would look at rest
+    await (env.VAULT as unknown as { put(key: string, value: string): Promise<void> }).put(
+      "vault://legacy-raw",
+      "legacy-plaintext-not-an-envelope",
+    );
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const received = collectCommands(socket);
+
+    try {
+      // #when a consumer fill_secrets that ref
+      const res = await postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "fill_secret",
+        commandId: "c-legacy",
+        ref: "s1e1",
+        secretRef: "vault://legacy-raw",
+      });
+
+      // #then EncryptedKvVault refuses to decrypt it -> the DO's catch returns
+      // the same scrubbed ok:false as any resolution failure (no envelope
+      // material, no key material, no 500), and nothing is typed
+      const event = await res.json();
+      expect(event).toEqual({
+        type: "action_result",
+        commandId: "c-legacy",
+        ok: false,
+        error: "fill_secret: secret could not be resolved",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
 });
 
 describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a secret)", () => {
@@ -493,6 +539,69 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
       // #then the extension received nothing - no probe, no navigate
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(received).toEqual([]);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("dryRun switch_tab simulates ok:true and never switches the tab (a write, not a read)", async () => {
+    // #given a connected fake extension
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const received = collectCommands(socket);
+
+    try {
+      // #when a consumer dry-runs switch_tab (reclassified as a write in protocol v0.4.0)
+      const res = await postCommand(
+        sessionId,
+        CALLER_TOKEN_A,
+        { type: "switch_tab", commandId: "c-swt-dry", tabId: 3 },
+        true,
+      );
+
+      // #then it simulates ok:true (no ref to probe, zero wire) rather than
+      // actually switching the user's tab - the dry-run-safety fix
+      const event = await res.json();
+      expect(event).toEqual({
+        type: "action_result",
+        commandId: "c-swt-dry",
+        ok: true,
+        simulated: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("dryRun scroll probes its ref and simulates, never scrolling", async () => {
+    // #given a connected fake extension whose ref map resolves the target
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const messages = answerResolveRefsWith(socket, ["s1e4"]);
+
+    try {
+      // #when a consumer dry-runs a ref-bearing scroll
+      const res = await postCommand(
+        sessionId,
+        CALLER_TOKEN_A,
+        { type: "scroll", commandId: "c-scr-dry", ref: "s1e4", dy: 100 },
+        true,
+      );
+
+      // #then only the read-only probe hits the wire - never the scroll itself
+      const event = await res.json();
+      expect(event).toEqual({
+        type: "action_result",
+        commandId: "c-scr-dry",
+        ok: true,
+        simulated: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(messages).toEqual([
+        { type: "resolve_ref", commandId: expect.any(String), ref: "s1e4" },
+      ]);
     } finally {
       socket.close(1000, "done");
     }
@@ -722,6 +831,26 @@ describe("extension liveness fail-fast", () => {
       replacement.close(1000, "done");
     }
   });
+
+  it("detaches once the LAST authorized socket closes, after a replacement briefly coexisted", async () => {
+    // #given two authorized sockets, the old one replaced by a newer one
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const old = await connectFakeExtension(sessionId);
+    const replacement = await connectFakeExtension(sessionId);
+
+    // #when the old one closes first - the replacement keeps the session live
+    old.close(1000, "replaced");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const stub = await getSessionStub(sessionId);
+    expect((await stub.getStatus()).status).toBe("connected");
+
+    // #when the replacement then also closes - now nothing authorized remains
+    replacement.close(1000, "gone");
+    await waitForStatus(sessionId, "detached");
+
+    // #then the session finally detaches (the full replaced-then-both-closed order)
+    expect((await stub.getStatus()).status).toBe("detached");
+  });
 });
 
 describe("error taxonomy (route mapping)", () => {
@@ -743,7 +872,7 @@ describe("error taxonomy (route mapping)", () => {
     expect(await res.json()).toEqual({ error: "invalid body" });
   });
 
-  it("maps an in-flight command abandoned by a hello resync to the uniform JSON 500", async () => {
+  it("maps an in-flight command abandoned by a hello resync to a retryable 503", async () => {
     // #given a connected extension holding a command in flight
     const sessionId = await openSession(CALLER_TOKEN_A);
     const socket = await connectFakeExtension(sessionId);
@@ -761,11 +890,12 @@ describe("error taxonomy (route mapping)", () => {
         JSON.stringify({ type: "hello", browser: "chrome", extVersion: "1.0.0", tabs: [] }),
       );
 
-      // #then the abandoned dispatch surfaces as the uniform JSON 500 -
-      // app.onError's shape, with no stack or internals in the body
+      // #then the abandoned dispatch surfaces as a retryable 503 with its
+      // own honest reason - the extension is alive (it just resynced), so
+      // this is infrastructure weather, not the masked 500 it once was
       const res = await resPromise;
-      expect(res.status).toBe(500);
-      expect(await res.json()).toEqual({ error: "internal error" });
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "session resynced mid-command" });
     } finally {
       socket.close(1000, "done");
     }
@@ -804,4 +934,300 @@ describe("error taxonomy (route mapping)", () => {
     },
     40_000,
   );
+});
+
+describe("WS upgrade gate (pre-accept, index.ts onBeforeConnect/onBeforeRequest)", () => {
+  it("refuses a bad-token upgrade with 401 before the DO ever accepts a socket", async () => {
+    // #given a session and an upgrade carrying an unknown extension token
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    // #when the upgrade hits the worker router
+    const res = await exports.default.fetch(
+      new Request(`${BASE}/agents/session/${sessionId}?token=not-a-real-token`, {
+        headers: { Upgrade: "websocket" },
+      }),
+    );
+
+    // #then it is rejected at the edge - a plain 401, no accepted-then-closed
+    // socket, so an attacker never enters the DO's connection set at all
+    expect(res.status).toBe(401);
+    expect(res.webSocket ?? null).toBeNull();
+  });
+
+  it("refuses a cross-tenant upgrade with 404, not 403 - no existence oracle (DL-008)", async () => {
+    // #given a session owned by tenantA and tenantB's valid extension token
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    // #when tenantB's token attempts the upgrade
+    const res = await exports.default.fetch(
+      new Request(`${BASE}/agents/session/${sessionId}?token=${EXTENSION_TOKEN_B}`, {
+        headers: { Upgrade: "websocket" },
+      }),
+    );
+
+    // #then it collapses to the same 404 a malformed sessionId gets
+    expect(res.status).toBe(404);
+    expect(res.webSocket ?? null).toBeNull();
+  });
+
+  it("gates non-WebSocket requests on the agent path too (onBeforeRequest)", async () => {
+    // #given a plain HTTP request (no Upgrade) to the agent route with no token
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    // #when it hits the worker router
+    const res = await exports.default.fetch(
+      new Request(`${BASE}/agents/session/${sessionId}`),
+    );
+
+    // #then the SDK's HTTP surface on the DO is unreachable without a token
+    expect(res.status).toBe(401);
+  });
+
+  it("a rejected upgrade never disturbs the session's status", async () => {
+    // #given a fresh (pending) session
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    // #when a bad-token upgrade is refused
+    await exports.default.fetch(
+      new Request(`${BASE}/agents/session/${sessionId}?token=nope`, {
+        headers: { Upgrade: "websocket" },
+      }),
+    );
+
+    // #then the session still reads pending - nothing was accepted, nothing
+    // closed, nothing stamped
+    const stub = await getSessionStub(sessionId);
+    expect((await stub.getStatus()).status).toBe("pending");
+  });
+});
+
+describe("idempotent write replay (stable commandId contract)", () => {
+  it("replays a completed write's Event for a retry under the same commandId without re-executing", async () => {
+    // #given a connected extension that answered a click once
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const received = collectCommands(socket);
+
+    try {
+      const incoming = waitForCommand(socket);
+      const firstRes = postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "ik_case1:step1:click",
+        ref: "s1e1",
+      });
+      await incoming;
+      socket.send(
+        JSON.stringify({
+          type: "action_result",
+          commandId: "ik_case1:step1:click",
+          ok: true,
+          url: "https://portal.example/done",
+        }),
+      );
+      const first = await (await firstRes).json();
+
+      // #when the consumer retries the SAME commandId (its previous response
+      // was lost or unparseable - the connector derives the id from the
+      // breakwater idempotency key, so a retry reuses it)
+      const retryRes = await postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "ik_case1:step1:click",
+        ref: "s1e1",
+      });
+
+      // #then the recorded Event is replayed byte-for-byte and the extension
+      // never saw a second click - the write executed exactly once
+      expect(retryRes.status).toBe(200);
+      expect(await retryRes.json()).toEqual(first);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received.filter((cmd) => cmd.type === "click")).toHaveLength(1);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("replays a completed write even with no extension connected - a replay needs no liveness", async () => {
+    // #given a write completed while an extension was attached, which then dropped
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const incoming = waitForCommand(socket);
+    const firstRes = postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "navigate",
+      commandId: "ik_case1:step2:navigate",
+      url: "https://example.com/",
+    });
+    await incoming;
+    socket.send(
+      JSON.stringify({ type: "action_result", commandId: "ik_case1:step2:navigate", ok: true }),
+    );
+    const first = await (await firstRes).json();
+    socket.close(1000, "gone");
+
+    // #when the consumer retries after the extension detached
+    const retryRes = await postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "navigate",
+      commandId: "ik_case1:step2:navigate",
+      url: "https://example.com/",
+    });
+
+    // #then the recorded outcome is served instead of a 503 - the work
+    // already happened; only NEW work needs the wire
+    expect(retryRes.status).toBe(200);
+    expect(await retryRes.json()).toEqual(first);
+  });
+
+  it("refuses a concurrent duplicate write commandId as 409 while the first is still in flight", async () => {
+    // #given a write parked in the coordinator, not yet answered
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+
+    try {
+      const incoming = waitForCommand(socket);
+      const firstRes = postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "ik_case1:step3:click",
+        ref: "s1e1",
+      });
+      await incoming;
+
+      // #when the same commandId is posted again mid-flight
+      const dupRes = await postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "ik_case1:step3:click",
+        ref: "s1e1",
+      });
+
+      // #then the duplicate is refused without disturbing the original...
+      expect(dupRes.status).toBe(409);
+      expect(await dupRes.json()).toEqual({ error: "command already in flight" });
+
+      // ...which still resolves normally when the extension answers
+      socket.send(
+        JSON.stringify({ type: "action_result", commandId: "ik_case1:step3:click", ok: true }),
+      );
+      expect((await firstRes).status).toBe(200);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("a retried fill_secret replays the recorded result without touching the vault again", async () => {
+    // #given a fill_secret that completed once
+    await seedVault("vault://replay-pw", "hunter2-replay");
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+
+    try {
+      const incoming = waitForCommand(socket);
+      const firstRes = postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "fill_secret",
+        commandId: "ik_case1:login:fill",
+        ref: "s1e1",
+        secretRef: "vault://replay-pw",
+      });
+      await incoming;
+      socket.send(
+        JSON.stringify({ type: "action_result", commandId: "ik_case1:login:fill", ok: true }),
+      );
+      const first = await (await firstRes).json();
+
+      // #when the consumer retries the same commandId
+      const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+      try {
+        const retryRes = await postCommand(sessionId, CALLER_TOKEN_A, {
+          type: "fill_secret",
+          commandId: "ik_case1:login:fill",
+          ref: "s1e1",
+          secretRef: "vault://replay-pw",
+        });
+
+        // #then the recorded result is replayed with zero vault access and
+        // zero re-typing - no second plaintext materialization (DL-004)
+        expect(retryRes.status).toBe(200);
+        expect(await retryRes.json()).toEqual(first);
+        expect(vaultGetSpy).not.toHaveBeenCalled();
+      } finally {
+        vaultGetSpy.mockRestore();
+      }
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("replays a completed write across a hello resync (completedWrites survives the resync)", async () => {
+    // #given a write that completed on a connected extension
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+
+    try {
+      const incoming = waitForCommand(socket);
+      const firstRes = postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "ik_resync:click",
+        ref: "s1e1",
+      });
+      await incoming;
+      socket.send(
+        JSON.stringify({
+          type: "action_result",
+          commandId: "ik_resync:click",
+          ok: true,
+          url: "https://portal.example/after",
+        }),
+      );
+      const first = await (await firstRes).json();
+
+      // #when the extension resyncs (hello bumps generation, abandons in-flight)
+      socket.send(
+        JSON.stringify({ type: "hello", browser: "chrome", extVersion: "1.0.0", tabs: [] }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // #then a retry of the same commandId still replays the recorded Event
+      // unchanged - completedWrites is untouched by the resync, and replay is
+      // keyed by commandId alone (no generation dependence)
+      const retryRes = await postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "ik_resync:click",
+        ref: "s1e1",
+      });
+      expect(retryRes.status).toBe(200);
+      expect(await retryRes.json()).toEqual(first);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("does NOT replay reads - the same get_tabs commandId re-executes freely", async () => {
+    // #given a read that completed once
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const received = collectCommands(socket);
+
+    try {
+      expect((await roundTripGetTabs(socket, sessionId, "read-1")).status).toBe(200);
+
+      // #when the same read commandId is posted again
+      // #then it round-trips to the extension again - reads are free to
+      // re-execute; only writes carry the exactly-once contract
+      expect((await roundTripGetTabs(socket, sessionId, "read-1")).status).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received.filter((cmd) => cmd.type === "get_tabs")).toHaveLength(2);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  /** One full get_tabs round-trip (duplicated from the liveness suite's roundTrip, which is scoped there). */
+  async function roundTripGetTabs(
+    socket: WebSocket,
+    sessionId: string,
+    commandId: string,
+  ): Promise<Response> {
+    const incoming = waitForCommand(socket);
+    const resPromise = postCommand(sessionId, CALLER_TOKEN_A, { type: "get_tabs", commandId });
+    const received = await incoming;
+    socket.send(JSON.stringify({ type: "tabs_result", commandId: received.commandId, tabs: [] }));
+    return resPromise;
+  }
 });

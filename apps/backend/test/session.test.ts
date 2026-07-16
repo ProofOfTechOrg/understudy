@@ -1,51 +1,70 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { runInDurableObject, evictDurableObject } from "cloudflare:test";
-import type { Connection } from "agents";
+import type { Connection, ConnectionContext } from "agents";
 import type { Command } from "@understudy/protocol";
 import { mintSessionId } from "../src/auth";
 import type { SessionAgent } from "../src/session";
 import { EXTENSION_TOKEN_A, EXTENSION_TOKEN_B } from "./tokens";
 import { BASE, getSessionStub, getWebSocket } from "./helpers";
 
-function waitForClose(socket: WebSocket): Promise<{ code: number }> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error("timed out waiting for a WebSocket close")),
-      10_000,
-    );
-    socket.addEventListener("close", (event) => {
-      clearTimeout(timeout);
-      resolve(event as unknown as { code: number });
-    });
-  });
-}
-
 /** onMessage only reads `connection.state.authorized` (the onConnect auth gate) - see src/session.ts. */
 const FAKE_CONNECTION = { state: { authorized: true } } as unknown as Connection;
 
-describe("onConnect token verification", () => {
+/**
+ * A mutable stand-in for a Connection at the onConnect/onClose surface.
+ * The spies are returned alongside the connection (not only as its
+ * properties) so assertions hold direct references; setState mirrors onto
+ * .state the way the SDK does, so isAuthorizedConnection() reads what
+ * onConnect wrote.
+ */
+function fakeConnection(initialState: { authorized?: boolean } | null = null): {
+  connection: Connection;
+  close: ReturnType<typeof vi.fn>;
+  setState: ReturnType<typeof vi.fn>;
+} {
+  const close = vi.fn();
+  const holder: { state: { authorized?: boolean } | null } = { state: initialState };
+  const setState = vi.fn((next: unknown) => {
+    holder.state = next as { authorized?: boolean } | null;
+  });
+  const connection = Object.assign(holder, { close, setState }) as unknown as Connection;
+  return { connection, close, setState };
+}
+
+function upgradeContextFor(sessionId: string, token: string): ConnectionContext {
+  return {
+    request: new Request(`${BASE}/agents/session/${sessionId}?token=${token}`),
+  } as ConnectionContext;
+}
+
+/**
+ * The worker-level gate (index.ts onBeforeConnect) now refuses bad upgrades
+ * before the DO accepts anything - service.test.ts covers that layer. These
+ * tests drive onConnect DIRECTLY, proving the in-DO gate stands on its own
+ * (defense in depth): any path that reached the DO without the router would
+ * still be refused.
+ */
+describe("onConnect token verification (in-DO defense in depth)", () => {
   it("closes the connection with 1008 for a bad extension token", async () => {
-    // #given a WS upgrade request carrying an unknown token
+    // #given a DO instance and a connection whose upgrade carried an unknown token
     const sessionId = crypto.randomUUID();
-    const res = await exports.default.fetch(
-      new Request(`${BASE}/agents/session/${sessionId}?token=not-a-real-token`, {
-        headers: { Upgrade: "websocket" },
-      }),
+    const stub = await getSessionStub(sessionId);
+    const { connection, close, setState } = fakeConnection();
+
+    // #when onConnect runs its auth check
+    await runInDurableObject(stub, (instance: SessionAgent) =>
+      instance.onConnect(connection, upgradeContextFor(sessionId, "not-a-real-token")),
     );
-    const socket = getWebSocket(res);
-    const closed = waitForClose(socket);
 
-    // #when the client accepts the upgrade
-    socket.accept();
-
-    // #then the server closes it with 1008
-    const event = await closed;
-    expect(event.code).toBe(1008);
+    // #then the socket is closed 1008 and never marked authorized
+    expect(close).toHaveBeenCalledWith(1008, "invalid extension token");
+    expect(setState).not.toHaveBeenCalled();
   });
 
   it("binds the session to its tenant and stays connected for a good extension token", async () => {
-    // #given a WS upgrade request carrying a valid extension token for the session's own tenant
+    // #given a WS upgrade request carrying a valid extension token for the
+    // session's own tenant, through the REAL worker route (both gates pass)
     const sessionId = await mintSessionId("tenantA", env);
     const res = await exports.default.fetch(
       new Request(`${BASE}/agents/session/${sessionId}?token=${EXTENSION_TOKEN_A}`, {
@@ -70,20 +89,53 @@ describe("onConnect token verification", () => {
   it("closes the connection with 1008 for a cross-tenant extension token", async () => {
     // #given a session owned by tenantA (its sessionId HMAC-embeds tenantA)
     const sessionId = await mintSessionId("tenantA", env);
-    const res = await exports.default.fetch(
-      new Request(`${BASE}/agents/session/${sessionId}?token=${EXTENSION_TOKEN_B}`, {
-        headers: { Upgrade: "websocket" },
-      }),
+    const stub = await getSessionStub(sessionId);
+    const { connection, close, setState } = fakeConnection();
+
+    // #when a tenantB extension token reaches onConnect directly
+    await runInDurableObject(stub, (instance: SessionAgent) =>
+      instance.onConnect(connection, upgradeContextFor(sessionId, EXTENSION_TOKEN_B)),
     );
-    const socket = getWebSocket(res);
-    const closed = waitForClose(socket);
 
-    // #when a tenantB extension token attempts to attach to tenantA's session
-    socket.accept();
+    // #then it is closed 1008 instead of binding a foreign tenant
+    expect(close).toHaveBeenCalledWith(1008, "tenant mismatch");
+    expect(setState).not.toHaveBeenCalled();
+  });
+});
 
-    // #then the server closes it with 1008 instead of binding a foreign tenant
-    const event = await closed;
-    expect(event.code).toBe(1008);
+describe("onClose status stamping", () => {
+  it("a never-authorized socket's close does not stamp a pending session detached", async () => {
+    // #given a fresh (pending) session and a connection that never passed auth
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    const { connection: unauthorized } = fakeConnection(null);
+
+    // #when that connection closes (e.g. right after onConnect's 1008)
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      expect(instance.state.status).toBe("pending");
+      await instance.onClose(unauthorized, 1008, "invalid extension token", true);
+    });
+
+    // #then the session still reads pending - a socket that never
+    // contributed to the status cannot change it
+    expect((await stub.getStatus()).status).toBe("pending");
+  });
+
+  it("an authorized socket's close still detaches when it was the last one", async () => {
+    // #given a session an authorized socket connected to (status: connected)
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    const { connection: authorized } = fakeConnection({ authorized: true });
+
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      instance.setState({ ...instance.state, status: "connected" });
+
+      // #when it closes with no surviving authorized socket
+      await instance.onClose(authorized, 1000, "gone", true);
+    });
+
+    // #then the session reads detached, as before
+    expect((await stub.getStatus()).status).toBe("detached");
   });
 });
 
@@ -119,8 +171,8 @@ describe("dispatch / resolvePending", () => {
       return dispatchPromise;
     });
 
-    // #then dispatch resolves with that event and the marker is cleared
-    expect(result).toEqual({ type: "tabs_result", commandId: "s1", tabs: [] });
+    // #then dispatch resolves with that event (as an ok outcome) and the marker is cleared
+    expect(result).toEqual({ ok: true, event: { type: "tabs_result", commandId: "s1", tabs: [] } });
     await runInDurableObject(stub, (instance: SessionAgent) => {
       expect(instance.state.awaitingCommandIds).toEqual([]);
     });
@@ -179,29 +231,22 @@ describe("DO eviction resilience (DL-007)", () => {
 
 describe("hello resync", () => {
   it("bumps generation, records browser/tabs, sets connected, and abandons in-flight commands", async () => {
-    // #given a dispatched command still awaiting its result, later
-    // abandoned (rejected asynchronously, from the separate onMessage call
-    // below). A rejection handler is attached in the SAME synchronous tick
-    // as the dispatch() call (converting it into an always-resolving
-    // outcome captured in this closure) rather than awaited later:
-    // attaching `.rejects` only once the promise is retrieved later leaves
-    // a window where nothing has claimed the rejection yet, which surfaces
-    // as an unhandled rejection - and fails the process exit code - even
-    // though this test's own assertion on it passes (verified empirically).
+    // #given a dispatched command still awaiting its result, later abandoned
+    // by the separate onMessage call below. dispatch() converts the
+    // coordinator's abandon-rejection into a resolved outcome in-isolate
+    // (types.ts::DispatchOutcome), so nothing here can surface as an
+    // unhandled rejection.
     const sessionId = crypto.randomUUID();
     const stub = await getSessionStub(sessionId);
     const cmd: Command = { type: "get_tabs", commandId: "resync-1" };
-    let outcome!: Promise<{ settled: "resolved" | "rejected"; value: unknown }>;
+    let outcome!: ReturnType<SessionAgent["dispatch"]>;
 
     await runInDurableObject(stub, (instance: SessionAgent) => {
       // Stand in for a live authorized socket (see "resolves a dispatched
-      // command's promise" above), or the fail-fast gate rejects before the
+      // command's promise" above), or the fail-fast gate refuses before the
       // marker is ever parked and there is nothing for the resync to abandon.
       Object.assign(instance, { hasAuthorizedConnection: () => true });
-      outcome = instance.dispatch(cmd).then(
-        (value) => ({ settled: "resolved", value }) as const,
-        (error: unknown) => ({ settled: "rejected", value: error }) as const,
-      );
+      outcome = instance.dispatch(cmd);
       expect(instance.state.awaitingCommandIds).toContain("resync-1");
     });
 
@@ -218,10 +263,12 @@ describe("hello resync", () => {
       ),
     );
 
-    // #then the in-flight dispatch is abandoned (rejected)
-    const result = await outcome;
-    expect(result.settled).toBe("rejected");
-    expect(result.value).toBeInstanceOf(Error);
+    // #then the in-flight dispatch resolves to the typed abandoned outcome
+    await expect(outcome).resolves.toEqual({
+      ok: false,
+      reason: "resynced",
+      message: "session resynced: hello",
+    });
 
     // #then the session state reflects the resync
     await runInDurableObject(stub, (instance: SessionAgent) => {

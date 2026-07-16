@@ -124,7 +124,93 @@ async function probe() {
   return { summary: `${passed}/${results.length} commands OK`, results };
 }
 
-const HANDLERS = { attach, detach, a11y: getA11y, screenshot, probe };
+// ── OOPIF probe (M5 follow-up to the M0 findings) ────────────────────────────
+// Answers the sub-question M0 deferred: does Target.setAutoAttach{flatten:true}
+// work under chrome.debugger, delivering attachedToTarget events with
+// sessionIds that session-scoped sendCommand (Chrome 125+) can drive? That is
+// the entire mechanism cross-origin-iframe (OOPIF) targeting would build on.
+
+/** Target.attachedToTarget params observed since the last OOPIF probe reset. */
+let attachedTargetEvents = [];
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (!attached || source.tabId !== attached.tabId) return;
+  if (method === "Target.attachedToTarget") attachedTargetEvents.push(params);
+});
+
+async function probeOopif() {
+  if (!attached) throw new Error("Not attached — click Attach first");
+  const tabId = attached.tabId;
+  const results = [];
+  const step = async (label, fn) => {
+    try {
+      const detail = await fn();
+      results.push({ label, ok: true, detail: detail ?? "" });
+    } catch (e) {
+      results.push({ label, ok: false, detail: String((e && e.message) || e) });
+    }
+  };
+  const inSession = (sessionId, method, params) =>
+    chrome.debugger.sendCommand({ tabId, sessionId }, method, params);
+
+  attachedTargetEvents = [];
+  await step("Target.setAutoAttach {flatten:true}", () =>
+    cdp("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }),
+  );
+  // Auto-attach announces existing OOPIFs asynchronously; give it a beat.
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+
+  const frames = attachedTargetEvents.filter((p) => p.targetInfo && p.targetInfo.type === "iframe");
+  results.push({
+    label: "Target.attachedToTarget events",
+    ok: attachedTargetEvents.length > 0,
+    detail:
+      attachedTargetEvents
+        .map((p) => `${p.targetInfo.type} ${String(p.targetInfo.url || "").slice(0, 60)}`)
+        .join(" | ") || "none received",
+  });
+
+  // Drive each auto-attached target through ITS OWN session: proves the
+  // sessionId routing the real driver (apps/extension) would need.
+  for (const p of attachedTargetEvents) {
+    const sessionId = p.sessionId;
+    const tag = `[${String(p.targetInfo.url || p.targetInfo.type).slice(0, 40)}]`;
+    await step(`${tag} Runtime.evaluate via sessionId`, async () => {
+      await inSession(sessionId, "Runtime.enable");
+      const { result } = await inSession(sessionId, "Runtime.evaluate", {
+        expression: "location.href",
+        returnByValue: true,
+      });
+      return String(result.value).slice(0, 70);
+    });
+    await step(`${tag} Accessibility.getFullAXTree via sessionId`, async () => {
+      await inSession(sessionId, "Accessibility.enable");
+      const { nodes } = await inSession(sessionId, "Accessibility.getFullAXTree");
+      const pruned = pruneAxTree(nodes);
+      const sample = pruned
+        .slice(0, 3)
+        .map((n) => `${n.role}:${n.name}`)
+        .join(", ");
+      return `${nodes.length} nodes, ${pruned.length} actionable${sample ? ` (${sample})` : ""}`;
+    });
+  }
+
+  await step("Target.setAutoAttach off (cleanup)", () =>
+    cdp("Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }),
+  );
+
+  const sessionSteps = results.filter((r) => r.label.includes("via sessionId"));
+  const sessionsOk = sessionSteps.length > 0 && sessionSteps.every((r) => r.ok);
+  const summary =
+    frames.length > 0 && sessionsOk
+      ? `OOPIF auto-attach WORKS: ${frames.length} iframe target(s) attached and driven via session-scoped commands`
+      : frames.length > 0
+        ? "iframe target(s) attached but session-scoped commands FAILED — see rows above"
+        : "no OOPIF targets announced — is oopif-test.html (cross-origin iframe) open in the attached tab?";
+  return { summary, results };
+}
+
+const HANDLERS = { attach, detach, a11y: getA11y, screenshot, probe, oopif: probeOopif };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const handler = msg && HANDLERS[msg.cmd];

@@ -5,18 +5,17 @@
  * plaintext and returns it - nothing else. It performs no dispatch (imports
  * neither session.ts nor the coordinator) and writes the plaintext to no
  * log, no state, and no error string. The only caller is SessionAgent.
- * fillSecret (M-004, DO-side): it awaits resolveSecret(this.env.VAULT,
+ * fillSecret (M-004, DO-side): it awaits resolveSecret(createVault(this.env),
  * cmd.secretRef) and immediately dispatches the resulting keystrokes via the
  * coordinator, so plaintext exists only transiently inside that Durable
  * Object and never reaches the Worker/route, the model, or any durable
  * surface (setState, audit, Event response).
  *
- * Pre-production security gate: the concrete VAULT binding wired in
- * wrangler.jsonc is a KV namespace (see types.ts's VaultBinding doc), and KV
- * values are readable back at rest. That is acceptable for dev, where no
- * real credential is stored, but a stronger backend (per-tenant KMS, or a
- * Secrets-Store-via-API binding) MUST be swapped in behind this same
- * VaultBinding.get seam before any real credential is stored.
+ * At-rest posture: the VaultBinding handed in is vault.ts's decrypting
+ * layer over the KV namespace - KV itself holds only AES-256-GCM envelopes
+ * (see vault.ts), so a KV read-back at rest yields ciphertext without the
+ * VAULT_MASTER_KEY Worker secret. A per-tenant external KMS remains a
+ * possible future swap behind this same VaultBinding.get seam.
  */
 
 import type { VaultBinding } from "./types";

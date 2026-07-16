@@ -144,10 +144,12 @@ export type ObserveOutput = z.infer<typeof observeOutput>;
 // agent boundary can additionally reject high-entropy strings leaking into
 // type.text.
 //
-// Stricter than the protocol's isWriteCommand on purpose: scroll and
-// switch_tab are protocol non-writes, but both change what the user's real
-// browser shows, so they sit behind the approval gate here. Keep this union
-// in sync with the protocol's WRITE_COMMANDS when it changes.
+// This union is exactly the protocol's write class minus fill_secret (which
+// fill_credential carries): click/type/navigate/key/scroll/switch_tab. Since
+// the protocol reclassified scroll/switch_tab as writes (they are user-visible
+// side effects), there is no longer any divergence to reconcile - the
+// relationship is pinned at compile time AND runtime in index.test.ts, so a
+// protocol classification change breaks the build instead of drifting.
 export const actInput = z.object({
   sessionId: z.string(),
   action: z.discriminatedUnion("type", [
@@ -225,12 +227,28 @@ async function callUnderstudy(
   return parseEvent(await res.json());
 }
 
-// crypto.randomUUID() is non-deterministic, which is safe here: breakwater's
-// idempotency layer replays a completed key WITHOUT re-running execute(), so
-// a command is built at most once per logical action even across DO
-// hibernation/retry.
-function toCommand(fields: object): Command {
-  return parseCommand({ ...fields, commandId: crypto.randomUUID() });
+// Writes pass a stable commandId derived from the breakwater idempotency
+// key; everything else gets a random UUID. breakwater replays a COMPLETED
+// key without re-running execute(), but a failed attempt (response lost or
+// unparseable after the service performed the write) releases the key and
+// the retry re-runs execute() - under a random id the service could not
+// recognize the retry, and the write would run twice. Under the derived id
+// the service replays the recorded Event instead (its completedWrites
+// cache), making write retries exactly-once end to end.
+function toCommand(fields: object, commandId?: string): Command {
+  return parseCommand({ ...fields, commandId: commandId ?? crypto.randomUUID() });
+}
+
+// The wrapper hands config.execute the same ToolExecutionContext it read the
+// idempotency key from, so the derived commandId and breakwater's replay
+// store always key off the same value. Structural access: Mastra's context
+// type does not surface requestContext.get on every version.
+function idempotencyCommandId(ctx: ToolExecutionContext): string | undefined {
+  const requestContext = (
+    ctx as { requestContext?: { get?: (key: string) => unknown } }
+  ).requestContext;
+  const key = requestContext?.get?.(IDEMPOTENCY_KEY_CONTEXT_KEY);
+  return typeof key === "string" && key.length > 0 ? `ik_${key}` : undefined;
 }
 
 // -- Connectors ------------------------------------------------------------------
@@ -310,8 +328,9 @@ export function createBrowserConnectors(
       dryRun: true,
       rateLimit: "60/min",
     },
-    execute: async (input, _ctx, runtime): Promise<ActOutput> => {
-      const ev = await callUnderstudy(runtime, env, input.sessionId, toCommand(input.action));
+    execute: async (input, ctx, runtime): Promise<ActOutput> => {
+      const command = toCommand(input.action, idempotencyCommandId(ctx));
+      const ev = await callUnderstudy(runtime, env, input.sessionId, command);
       if (ev.type === "action_result") return { ok: ev.ok, url: ev.url, error: ev.error };
       throw new Error(`act: unexpected event '${ev.type}'`);
     },
@@ -350,13 +369,16 @@ export function createBrowserConnectors(
       dryRun: true,
       rateLimit: "30/min",
     },
-    execute: async (input, _ctx, runtime): Promise<FillCredentialOutput> => {
-      const command = toCommand({
-        type: "fill_secret",
-        ref: input.ref,
-        secretRef: input.secretRef, // opaque handle; resolved service-side
-        ...(input.submit !== undefined ? { submit: input.submit } : {}),
-      });
+    execute: async (input, ctx, runtime): Promise<FillCredentialOutput> => {
+      const command = toCommand(
+        {
+          type: "fill_secret",
+          ref: input.ref,
+          secretRef: input.secretRef, // opaque handle; resolved service-side
+          ...(input.submit !== undefined ? { submit: input.submit } : {}),
+        },
+        idempotencyCommandId(ctx),
+      );
       const ev = await callUnderstudy(runtime, env, input.sessionId, command);
       if (ev.type === "action_result") return { ok: ev.ok, filled: ev.ok, error: ev.error };
       throw new Error(`fillCredential: unexpected event '${ev.type}'`);

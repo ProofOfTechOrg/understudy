@@ -24,8 +24,14 @@ type HelloBrowserInfo = Pick<Extract<Event, { type: "hello" }>, "browser" | "ext
  * agnostic: the concrete Cloudflare binding is a KV namespace (see
  * wrangler.jsonc's VAULT binding), because an arbitrary per-fill secretRef
  * needs a dynamic keyed lookup that CF's Secrets / Secrets Store bindings -
- * one static binding per fixed secret name - cannot address. A per-tenant
- * external KMS is a possible future swap behind this same seam.
+ * one static binding per fixed secret name - cannot address.
+ *
+ * Two layers implement this same interface: Env.VAULT (the raw KV namespace,
+ * which stores only AES-256-GCM envelopes - never plaintext at rest) and
+ * vault.ts's EncryptedKvVault (which wraps it and decrypts with
+ * VAULT_MASTER_KEY). resolveSecret always goes through the decrypting layer
+ * via vault.ts's createVault(env). A per-tenant external KMS remains a
+ * possible future swap behind this seam.
  */
 export interface VaultBinding {
   get(secretRef: string): Promise<string | null>;
@@ -48,6 +54,13 @@ export interface Env {
   CALLER_TOKENS: string;
   /** Extension per-user token(s) (JSON), verified independently of caller auth. Required via `secrets.required`, like CALLER_TOKENS. */
   EXTENSION_TOKENS: string;
+  /**
+   * base64url-encoded 32-byte AES-256-GCM key that envelope-encrypts every
+   * vault value (vault.ts). KV holds only ciphertext; without this secret a
+   * KV read-back at rest yields nothing usable. Required via
+   * `secrets.required`, like the token maps.
+   */
+  VAULT_MASTER_KEY: string;
 }
 
 /**
@@ -70,4 +83,29 @@ export interface SessionState {
   generation: number;
   awaitingCommandIds: string[];
   status: SessionStatus;
+  /**
+   * Completed WRITE commands' Events, oldest first, capped in session.ts -
+   * the service half of the idempotent-retry contract. A consumer retrying
+   * a write under the same commandId (the connector derives it from the
+   * breakwater idempotency key) gets the recorded Event back instead of a
+   * second execution, closing the write-performed-but-response-lost gap.
+   * Only ever holds action_results for writes: small, and plaintext-free by
+   * the DL-004 construction (fill_secret results carry ok/error only).
+   */
+  completedWrites: { commandId: string; event: Event }[];
 }
+
+/**
+ * What dispatch/fillSecret return across the DO RPC boundary. Expected
+ * delivery failures travel as data, not exceptions: a rejected RPC promise
+ * is logged by workerd as an uncaught exception even when the Worker-side
+ * caller handles it, and a typed reason beats message-prefix parsing at the
+ * route. Unknown errors still throw - those are genuine 500s.
+ */
+export type DispatchOutcome =
+  | { ok: true; event: Event }
+  | {
+      ok: false;
+      reason: "not_connected" | "timed_out" | "resynced" | "duplicate_in_flight";
+      message: string;
+    };

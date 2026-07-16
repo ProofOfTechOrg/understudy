@@ -5,6 +5,10 @@ dist/
 # Cloudflare / Wrangler (added at M3)
 .wrangler/
 .dev.vars
+# Operator-local secret backups (the deployed worker is canonical; these are
+# recoverable copies of values Cloudflare never shows again). NEVER commit.
+# Specific prefix so the tracked .dev.vars.example template is unaffected.
+.secrets*
 
 # WXT extension build (added at M2)
 .wxt/

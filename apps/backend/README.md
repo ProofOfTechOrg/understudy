@@ -27,20 +27,35 @@ sessionId's embedded tenant matches the caller's, 404 on mismatch) → `safePars
 → the correlated Event is returned as JSON. This order is load-bearing: an
 unauthenticated or cross-tenant request never reaches parsing or dispatch.
 
-Dispatch failures map to status codes by error-message prefix (the only signal
-that survives the DO RPC boundary; the constants live in `src/coordinator.ts`):
+Expected dispatch failures cross the DO RPC boundary as a typed
+`DispatchOutcome` (`src/types.ts`), never as a rejected RPC promise — workerd
+logs every server-side RPC rejection as an uncaught exception even when the
+caller handles it, and a typed reason beats message-prefix parsing at the
+route (internally the coordinator still rejects with the `src/coordinator.ts`
+prefix constants; `SessionAgent.dispatchFailure` maps them in-isolate). The
+route maps reasons to statuses:
 **503** `{error: "extension not connected"}` when the session has no live,
 onConnect-authorized extension socket — the gate consults that delivery
-predicate directly (not the persisted `status` scalar, which a late close from
-a replaced socket can leave stale), fails fast instead of burning the 30s
-timeout, and answers non-2xx deliberately: a 200 `ok:false` Event would be
-cached by a consumer's idempotency store and replayed after reconnect;
-**504** `{error: "command timed out"}` when a connected extension never
-answered; anything else is a uniform JSON **500** via `app.onError`. A real
-`fill_secret` checks the same predicate *before* touching the vault, so no
-plaintext is ever resolved for a command that cannot dispatch. Exception:
-a ref-less dryRun write (e.g. navigate) still short-circuits to simulated
-`ok:true` without touching the wire — it was never a liveness signal.
+predicate directly (not the persisted `status` scalar), fails fast instead of
+burning the 30s timeout, and answers non-2xx deliberately: a 200 `ok:false`
+Event would be cached by a consumer's idempotency store and replayed after
+reconnect; **503** `{error: "session resynced mid-command"}` when a fresh
+`hello` abandoned the in-flight command (the extension reconnected — same
+retryable family, its own honest reason); **504** `{error: "command timed
+out"}` when a connected extension never answered; **409** `{error: "command
+already in flight"}` for a concurrent duplicate of a still-pending write
+commandId; anything else is a genuine bug and remains a uniform JSON **500**
+via `app.onError`. A real `fill_secret` checks the liveness predicate
+*before* touching the vault, so no plaintext is ever resolved for a command
+that cannot dispatch. Exception: a ref-less dryRun write (e.g. navigate)
+still short-circuits to simulated `ok:true` without touching the wire — it
+was never a liveness signal.
+
+Completed **writes** are additionally recorded per commandId
+(`SessionState.completedWrites`, capped at 100): a retry under the same
+commandId — the connector derives it from the breakwater idempotency key —
+replays the recorded Event instead of executing twice, closing the
+write-performed-but-response-lost retry gap. Reads never replay.
 
 Inside the DO, `SessionAgent` holds a `CfSessionCoordinator` (the Cloudflare
 implementation of the portable `SessionCoordinator` interface). `send(cmd)` writes
@@ -60,11 +75,22 @@ command API (`index.ts`, `session.ts`) is unaffected.
 
 ## WebSocket security model
 
-`onConnect` runs an async token check (`verifyExtensionToken`) before marking a
-connection `connection.setState({ authorized: true })`. The Agents SDK accepts a
-socket — and admits it to the connection set `getConnections()` returns — before
-that async check resolves, so an unauthenticated or wrong-tenant socket can sit in
-the connection set during that window. Four things close this gap:
+The first gate is at the **Worker edge**: `routeAgentRequest`'s
+`onBeforeConnect`/`onBeforeRequest` hooks (`index.ts::gateAgentRequest`)
+verify the extension token and tenant scope before the Durable Object ever
+accepts the socket (or serves the SDK's HTTP surface). A bad token is a
+plain 401 and a cross-tenant sessionId a 404 (no existence oracle, matching
+the /v1 discipline) — the socket never enters the DO's connection set at
+all.
+
+The in-DO gate remains as defense in depth for any path that reaches the DO
+without that router: `onConnect` runs the same async checks
+(`verifyExtensionToken` + `scopeSession`) before marking a connection
+`connection.setState({ authorized: true })`, closing with 1008 otherwise.
+The Agents SDK accepts a socket — and admits it to the connection set
+`getConnections()` returns — before that async check resolves, so an
+unauthenticated or wrong-tenant socket could sit in the connection set
+during that window. Four things close this gap:
 
 - `sendToExtension` (the coordinator's outbound path) iterates
   `getConnections()` but filters to `isAuthorizedConnection`, so a command is
@@ -122,15 +148,19 @@ the connection set during that window. Four things close this gap:
   secret. A dry-run `ok` guarantees *resolvability* (the ref maps to a live
   node in the current generation) — not *executability* of the eventual
   dispatch (e.g. box-model availability), which only the real command proves.
-- **The vault binding (`Env.VAULT`) is a KV namespace, not CF Secrets/Secrets
-  Store**: `fill_secret`'s `secretRef` is chosen per-call at runtime, and CF's
-  Secrets/Secrets Store bindings are static — one binding per fixed secret name —
-  which cannot address an arbitrary runtime-chosen key. KV's `get(key)` can. The
-  `wrangler.jsonc` `VAULT` KV namespace id is a dev-only placeholder
-  (`REPLACE_WITH_VAULT_KV_NAMESPACE_ID`); because KV values are readable back at
-  rest, a stronger backend (per-tenant KMS, or a Secrets-Store-via-API binding)
-  must replace it behind the same `VaultBinding.get` seam (`types.ts`) before any
-  real credential is stored — this is a pre-production gate, not yet done.
+- **The vault binding (`Env.VAULT`) is a KV namespace holding only AES-256-GCM
+  envelopes, not CF Secrets/Secrets Store**: `fill_secret`'s `secretRef` is
+  chosen per-call at runtime, and CF's Secrets/Secrets Store bindings are
+  static — one binding per fixed secret name — which cannot address an
+  arbitrary runtime-chosen key. KV's `get(key)` can. Because raw KV values are
+  readable back at rest, every value is envelope-encrypted (`src/vault.ts`,
+  format `v1.<iv>.<ct>`, fresh IV per value) under `VAULT_MASTER_KEY` — a
+  Worker secret that never touches KV or wrangler.jsonc — and decrypted only
+  inside the DO via `createVault(env)`. Seed values with
+  `scripts/vault-put.mjs` (same envelope, plain Node), never a raw
+  `wrangler kv key put`; a legacy plaintext value fails closed at read time
+  ("not a recognized envelope"). A per-tenant external KMS remains a possible
+  future swap behind the same `VaultBinding.get` seam (`types.ts`).
 - **Hibernation cannot lose an in-flight command; only shutdown/restart can**:
   verified against the Cloudflare Durable Objects docs (2026-07-14) — hibernation
   requires no pending timer, no in-progress awaited fetch, no active WS use, and no
@@ -161,11 +191,22 @@ the connection set during that window. Four things close this gap:
 - Every *successfully dispatched* `Command` produces exactly one `Event`
   bearing its `commandId`, and the command route returns exactly that Event;
   a command that cannot dispatch or never resolves maps to a non-2xx JSON
-  error instead (503/504/500 — see the failure mapping above).
+  error instead (503/504/409/500 — see the failure mapping above).
+- A **write** commandId executes at most once within a session's last 100
+  writes: a repeat of a completed write replays its recorded Event
+  (`completedWrites`, cap 100), a repeat of a still-pending write is refused
+  409, and the extension keeps a matching 100-entry replay + in-flight record
+  for the case where the service times out while the extension is still
+  executing (a duplicate is dropped, not re-run). A retry delayed beyond 100
+  intervening writes degrades to re-execution. Reads never replay.
 - `fill_secret` plaintext never enters `setState`, logs, the Event response, or an
-  error string; the coordinator logs only `{commandId, type}`.
+  error string; the coordinator logs only `{commandId, type}`. A replayed
+  `fill_secret` touches neither the vault nor the wire.
+- The vault at rest holds only `v1.<iv>.<ct>` AES-256-GCM envelopes; a value
+  that does not decrypt under `VAULT_MASTER_KEY` is refused, never served.
 - One Durable Object per `sessionId`; a sessionId whose embedded tenant disagrees
-  with the authenticated caller is refused with 404, never 403.
+  with the authenticated caller is refused with 404, never 403 — on the /v1
+  API and on the agent WS/HTTP path alike.
 - A mid-command DO hibernation cannot happen (see above); an interrupting
   shutdown/restart is bounded by the per-command timeout, and the persisted
   awaiting-marker reconciles any orphaned late result rather than mis-resolving it.
@@ -174,5 +215,68 @@ the connection set during that window. Four things close this gap:
   itself imports nothing Cloudflare-specific.
 - `dryRun` never dispatches a mutating command and never resolves a secret; it
   always returns a simulated `action_result` from a read-only ref check.
-- An accepted-but-not-yet-authorized WebSocket connection can neither receive a
-  command nor have its inbound messages processed (see WebSocket security model).
+- An unauthorized WS upgrade is refused at the Worker edge (401/404) before
+  the DO accepts it; any socket that still reaches the DO unauthorized can
+  neither receive a command, have its inbound messages processed, nor change
+  the session's status by closing (see WebSocket security model).
+- Expected delivery failures never cross the DO RPC boundary as rejections
+  (no workerd "Uncaught (in promise)" noise); only genuine bugs throw.
+
+## Deploy
+
+First deployed 2026-07-17 to `https://understudy-backend.gcharang.workers.dev`
+(account `056cbaa6f5c3d8ff5584f1aa84bbe050`). The account id is deliberately
+NOT pinned in `wrangler.jsonc` (public repo, two local accounts): pass it per
+command. Runbook, from `apps/backend`:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID=056cbaa6f5c3d8ff5584f1aa84bbe050
+
+# One-time: the ciphertext store (id goes into wrangler.jsonc kv_namespaces)
+pnpm exec wrangler kv namespace create VAULT
+
+# Secrets - all four are required; `wrangler deploy` refuses to ship without
+# them (wrangler.jsonc `secrets.required`). Mint strong values:
+openssl rand -hex 32 | pnpm exec wrangler secret put AUTH_HMAC_SECRET
+printf '%s' '{"<caller-token>":{"actor":"<who>","tenantId":"<tenant>"}}' | pnpm exec wrangler secret put CALLER_TOKENS
+printf '%s' '{"<extension-token>":"<tenant>"}' | pnpm exec wrangler secret put EXTENSION_TOKENS
+openssl rand 32 | basenc --base64url | tr -d '=' | pnpm exec wrangler secret put VAULT_MASTER_KEY
+
+pnpm exec wrangler deploy
+curl -s https://understudy-backend.gcharang.workers.dev/health   # {"ok":true}
+
+# Seed a vault secret (encrypts locally; KV never sees plaintext):
+printf '%s' 'the-secret' | VAULT_MASTER_KEY=<key> node scripts/vault-put.mjs 'vault://tenant/ref'
+```
+
+The extension connects to
+`wss://understudy-backend.gcharang.workers.dev/agents/session/<sessionId>?token=<extension-token>`.
+
+### Secrets
+
+All four are **required** — `wrangler deploy` refuses to ship without them
+(`wrangler.jsonc` `secrets.required`, which is also the `.dev.vars` allowlist
+for local dev). Cloudflare stores them encrypted and **never shows a value
+again** after `wrangler secret put`, so the deployed worker is the canonical
+copy and the only readable backup is the operator-local, gitignored
+`apps/backend/.secrets.production.env` (created out of band, never committed —
+`.secrets*` in the root `.gitignore`). Lose that file and a secret can only be
+*rotated*, not recovered.
+
+| secret | what it is | regenerate | rotation impact |
+|---|---|---|---|
+| `AUTH_HMAC_SECRET` | HMAC-SHA256 key signing minted sessionIds (stateless tenant scoping) | `openssl rand -hex 32` | invalidates every outstanding sessionId — consumers must re-mint |
+| `CALLER_TOKENS` | JSON map `bearer token → {actor, tenantId}`; a consumer sends the raw token as `Authorization: Bearer …` | token: `printf 'uk_caller_%s\n' "$(openssl rand -hex 24)"` | the affected consumer swaps its `UNDERSTUDY_TOKEN` |
+| `EXTENSION_TOKENS` | JSON map `WS token → tenantId`; the extension sends the raw token as `?token=…` | token: `printf 'uk_ext_%s\n' "$(openssl rand -hex 24)"` | that user pastes the new WS URL into the extension panel |
+| `VAULT_MASTER_KEY` | base64url 32-byte AES-256-GCM key envelope-encrypting every vault value | `openssl rand 32 \| basenc --base64url \| tr -d '='` | **every stored vault value must be re-sealed** (`vault-put.mjs`) — old envelopes become undecryptable |
+
+**When to rotate:** on suspected exposure of that specific secret, when
+offboarding a tenant/user (edit the relevant JSON map and re-put), or on a
+periodic schedule for the two keys. `CALLER_TOKENS`/`EXTENSION_TOKENS` are
+add/remove-an-entry edits — rotating one caller/extension does not disturb the
+others.
+
+**Re-push after editing the backup file** (from `apps/backend`) — one at a
+time with `wrangler secret put <NAME>`, or all four via the bulk endpoint (the
+`.secrets.production.env` header carries a ready-made env→JSON one-liner that
+pipes into `wrangler secret bulk`).

@@ -1,6 +1,6 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
-import { CALLER_TOKENS, EXTENSION_TOKENS } from "./test/tokens";
+import { CALLER_TOKENS, EXTENSION_TOKENS, TEST_VAULT_MASTER_KEY } from "./test/tokens";
 
 export default defineConfig({
   plugins: [
@@ -16,6 +16,7 @@ export default defineConfig({
           AUTH_HMAC_SECRET: "test-hmac-secret-do-not-use-in-prod",
           CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),
           EXTENSION_TOKENS: JSON.stringify(EXTENSION_TOKENS),
+          VAULT_MASTER_KEY: TEST_VAULT_MASTER_KEY,
         },
       },
     }),

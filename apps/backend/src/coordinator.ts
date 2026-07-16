@@ -13,14 +13,19 @@ import type { Command, Event } from "@understudy/protocol";
 import type { SessionStatus } from "./types";
 
 /**
- * send()'s delivery-failure vocabulary. A message prefix is the only failure
- * signal that survives an RPC boundary (custom Error subclasses do not), so
- * every throw site and every host mapping failures onto its transport (the
- * Cloudflare Worker maps these to 503/504 in index.ts) shares these
- * constants instead of free-typing the strings.
+ * send()'s delivery-failure vocabulary. These prefixes never cross the RPC
+ * boundary as rejections: SessionAgent.dispatch/fillSecret catch coordinator
+ * rejections IN-ISOLATE and map each prefix to a typed DispatchOutcome
+ * (types.ts), which the Worker maps to 503/504/409 (index.ts). Keeping the
+ * rejection inside the Durable Object matters twice over - a structured
+ * outcome instead of message-prefix parsing at the route, and no
+ * "Uncaught (in promise)" instrumentation noise from workerd, which reports
+ * every RPC promise that rejects server-side even when the caller handles it.
  */
 export const SESSION_NOT_CONNECTED = "session not connected";
 export const COMMAND_TIMED_OUT = "command timed out";
+export const SESSION_RESYNCED = "session resynced";
+export const DUPLICATE_COMMAND = "duplicate command in flight";
 
 /** One outstanding `send(cmd)` call, awaiting its correlated Event. */
 export interface PendingCommand {

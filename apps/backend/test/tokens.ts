@@ -21,3 +21,7 @@ export const EXTENSION_TOKENS = {
   [EXTENSION_TOKEN_A]: "tenantA",
   [EXTENSION_TOKEN_B]: "tenantB",
 };
+
+// base64url of the 32-byte literal "test-vault-master-key-abcdefghij" -
+// the AES-256-GCM key vault.ts envelopes test secrets with (src/vault.ts).
+export const TEST_VAULT_MASTER_KEY = "dGVzdC12YXVsdC1tYXN0ZXIta2V5LWFiY2RlZmdoaWo";

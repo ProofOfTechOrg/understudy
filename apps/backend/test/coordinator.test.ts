@@ -175,4 +175,27 @@ describe("CfSessionCoordinator", () => {
     await expect(promiseB).rejects.toThrow("session resynced: hello received");
     expect(host.getAwaitingCommandIds()).toEqual([]);
   });
+
+  it("refuses a second send for a commandId already in flight, leaving the first undisturbed", async () => {
+    // #given a command parked and awaiting its event
+    const host = createFakeHost();
+    const coordinator = new CfSessionCoordinator(host);
+    const cmd: Command = { type: "click", commandId: "c-dup", ref: "r1" };
+    const first = coordinator.send(cmd);
+
+    // #when the same commandId is sent again mid-flight (stable consumer-
+    // derived ids make this reachable)
+    const err = await coordinator.send(cmd).catch((e: unknown) => e);
+
+    // #then the duplicate is refused with the mappable prefix, nothing extra
+    // hit the wire, and the original still resolves normally
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("duplicate command in flight: c-dup is already awaiting its event");
+    expect(host.sent).toHaveLength(1);
+
+    const event: Event = { type: "action_result", commandId: "c-dup", ok: true };
+    coordinator.resolvePending(event);
+    await expect(first).resolves.toEqual(event);
+    expect(host.getAwaitingCommandIds()).toEqual([]);
+  });
 });

@@ -13,9 +13,8 @@
 import { Hono } from "hono";
 import { getAgentByName, routeAgentRequest } from "agents";
 import { safeParseCommand } from "@understudy/protocol";
-import { authenticate, mintSessionId, scopeSession } from "./auth";
-import { COMMAND_TIMED_OUT, SESSION_NOT_CONNECTED } from "./coordinator";
-import type { Env } from "./types";
+import { authenticate, mintSessionId, scopeSession, verifyExtensionToken } from "./auth";
+import type { DispatchOutcome, Env } from "./types";
 import type { SessionAgent } from "./session";
 
 export { SessionAgent } from "./session";
@@ -78,28 +77,44 @@ app.post("/v1/sessions/:sessionId/commands", async (c) => {
   // carrying a secret through this route (DL-004).
   const dryRun = body?.dryRun === true;
   const stub = await getSessionStub(c.env, sessionId);
-  try {
-    const event =
-      parsed.data.type === "fill_secret"
-        ? await stub.fillSecret(parsed.data, dryRun)
-        : await stub.dispatch(parsed.data, dryRun);
-    return c.json(event);
-  } catch (err) {
-    // The DO's throw crosses the RPC boundary as a plain Error; its message
-    // prefix is the contract (coordinator.ts). "Not connected" is 503 - a
-    // retryable infrastructure state - deliberately NOT a 200 ok:false
-    // Event, which a consumer's idempotency store would cache and replay
-    // even after the extension reconnects.
-    const message = err instanceof Error ? err.message : String(err);
-    if (message.startsWith(SESSION_NOT_CONNECTED)) {
+  const outcome: DispatchOutcome =
+    parsed.data.type === "fill_secret"
+      ? await stub.fillSecret(parsed.data, dryRun)
+      : await stub.dispatch(parsed.data, dryRun);
+  if (outcome.ok) return c.json(outcome.event);
+
+  // Expected delivery failures arrive as typed outcomes, never as RPC
+  // rejections (types.ts::DispatchOutcome). All of these are deliberately
+  // non-2xx rather than a 200 ok:false Event, which a consumer's
+  // idempotency store would cache and replay even after the extension
+  // reconnects. Only a genuine bug still throws (-> the uniform 500).
+  //
+  // The honest reason is logged for observability; by DL-004 construction it
+  // carries only {commandId, type}-level detail, never a command payload.
+  console.warn("command dispatch failed", outcome.message);
+  switch (outcome.reason) {
+    case "not_connected":
+      // Retryable infrastructure state: no live, authorized extension socket.
       return c.json({ error: "extension not connected" }, 503);
-    }
-    if (message.startsWith(COMMAND_TIMED_OUT)) {
+    case "timed_out":
       return c.json({ error: "command timed out" }, 504);
-    }
-    throw err;
+    case "resynced":
+      // The extension reconnected mid-command, abandoning whatever it had in
+      // flight. Retryable, like not_connected - the session itself is healthy.
+      return c.json({ error: "session resynced mid-command" }, 503);
+    case "duplicate_in_flight":
+      return c.json({ error: "command already in flight" }, 409);
+    default:
+      // A new DispatchOutcome.reason without a route mapping fails the build
+      // here (assertNever) instead of silently returning undefined.
+      return assertNever(outcome.reason);
   }
 });
+
+// Compile-time exhaustiveness backstop for the DispatchOutcome.reason switch.
+function assertNever(value: never): never {
+  throw new Error(`unhandled dispatch outcome reason: ${String(value)}`);
+}
 
 // Anything a route throws (or rethrows above) becomes a uniform JSON 500
 // instead of workerd's opaque non-JSON error page. Command payloads never
@@ -110,9 +125,36 @@ app.onError((err, c) => {
   return c.json({ error: "internal error" }, 500);
 });
 
+/**
+ * Worker-level gate on every request routeAgentRequest matches, BEFORE the
+ * Durable Object ever accepts the socket (or serves an SDK HTTP surface).
+ * Defense-in-depth with SessionAgent.onConnect: the in-DO gate stays (it
+ * covers any path that reaches the DO without this router), but an
+ * unauthorized upgrade is now refused at the edge instead of being
+ * accepted-but-inert. Failure statuses mirror the /v1 discipline: bad token
+ * 401; a sessionId whose tenant disagrees with the token collapses to 404,
+ * never 403 (DL-008: no existence oracle). `lobby.name` is the raw
+ * `:sessionId` path segment routeAgentRequest extracted.
+ */
+async function gateAgentRequest(
+  req: Request,
+  lobby: { name: string },
+  env: Env,
+): Promise<Response | undefined> {
+  const token = new URL(req.url).searchParams.get("token") ?? "";
+  const verified = await verifyExtensionToken(token, env);
+  if (verified === null) return new Response("invalid extension token", { status: 401 });
+  const scope = await scopeSession(lobby.name, verified.tenantId, env);
+  if (scope !== "ok") return new Response("not found", { status: 404 });
+  return undefined;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const agentResponse = await routeAgentRequest(request, env);
+    const agentResponse = await routeAgentRequest(request, env, {
+      onBeforeConnect: (req, lobby) => gateAgentRequest(req, lobby, env),
+      onBeforeRequest: (req, lobby) => gateAgentRequest(req, lobby, env),
+    });
     if (agentResponse) return agentResponse;
     return app.fetch(request, env, ctx);
   },

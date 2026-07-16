@@ -34,6 +34,13 @@ bind("probe", "probe", (d) => {
   }
 });
 
+bind("oopif", "oopif", (d) => {
+  log(`— ${d.summary} —`, d.summary.includes("WORKS") ? "ok" : undefined);
+  for (const r of d.results) {
+    log(`${r.ok ? "OK  " : "FAIL"} ${r.label}${r.detail ? " — " + r.detail : ""}`, r.ok ? "ok" : "fail");
+  }
+});
+
 bind("a11y", "a11y", (d) =>
   log(`a11y: ${d.actionable}/${d.total} actionable\n` + JSON.stringify(d.sample, null, 2)),
 );

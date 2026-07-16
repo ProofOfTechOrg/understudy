@@ -28,7 +28,9 @@ WXT + React MV3 extension driving protocol Commands into a real Chromium tab via
 | `src/core/ws-client.ts` | `ReconnectingWs` — WebSocket with backoff reconnect and self-driven pong heartbeat | Changing reconnect/backoff/heartbeat behavior |
 | `src/core/router.ts` | `routeCommand` — dispatches a parsed `Command` to a `CdpSession` executor or tab handler | Adding a new protocol Command type |
 | `src/core/router.test.ts` | Unit tests for `routeCommand` (one Event per Command, error paths) | Verifying command routing |
-| `src/entrypoints/background.ts` | MV3 service worker: WS lifecycle, CDP session ownership, wake-time reattachment, alarm/heartbeat keepalive, panel `Port` host | Debugging SW eviction/reconnect, attach/detach flow, keepalive |
+| `src/core/dedupe.ts` | `WriteDedupe` — `claim()` (execute / replay a completed write / drop an in-flight duplicate) + `remember`/`release`/`clear`; idempotent-retry contract, storage.session-mirrored, cap 100 | Changing write replay/dedupe/in-flight behavior |
+| `src/core/dedupe.test.ts` | Unit tests for `WriteDedupe` (claim decisions, concurrent-claim atomicity, in-flight drop, cap, eviction survival, clear-on-session-change) | Verifying dedupe behavior |
+| `src/entrypoints/background.ts` | MV3 service worker: WS lifecycle, CDP session ownership, write dedupe, wake-time reattachment, alarm/heartbeat keepalive, panel `Port` host | Debugging SW eviction/reconnect, attach/detach flow, keepalive |
 | `src/entrypoints/sidepanel/index.html` | Sidepanel HTML entry | Changing the sidepanel document shell |
 | `src/entrypoints/sidepanel/main.tsx` | React root mount for the sidepanel | Changing sidepanel bootstrap |
 | `src/entrypoints/sidepanel/App.tsx` | Sidepanel UI: WS status, WS URL field, Attach/Detach, live log, `Port` reconnect on SW eviction | Changing sidepanel UI or panel↔SW messaging |

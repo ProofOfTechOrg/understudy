@@ -3,7 +3,7 @@
   "name": "CDP Spike (M0) — understudy",
   "version": "0.0.1",
   "description": "Throwaway M0 harness: verifies the chrome.debugger CDP command surface the plan depends on.",
-  "minimum_chrome_version": "114",
+  "minimum_chrome_version": "125",
   "permissions": ["debugger", "tabs", "activeTab", "storage", "sidePanel"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
