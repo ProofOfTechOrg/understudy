@@ -21,28 +21,34 @@
   ],
   "kv_namespaces": [
     {
-      // Credential vault: fill_secret's secretRef -> plaintext, resolved
-      // service-side by secrets.ts (M-007) and never logged or written to DO
-      // state (DL-004). A KV namespace gives the dynamic get-by-key lookup
-      // an arbitrary per-fill secretRef needs; CF's Secrets / Secrets Store
-      // bindings are static (one binding per fixed secret name) and cannot
-      // address a runtime-chosen key. A per-tenant external KMS is a
-      // possible future swap behind the same Env.VAULT seam (src/types.ts).
+      // Credential vault ciphertext store: fill_secret's secretRef ->
+      // AES-256-GCM envelope (src/vault.ts; seed with scripts/vault-put.mjs
+      // - never `wrangler kv key put` a raw plaintext). Resolution is
+      // service-side (secrets.ts via vault.ts) and the plaintext is never
+      // logged or written to DO state (DL-004). A KV namespace gives the
+      // dynamic get-by-key lookup an arbitrary per-fill secretRef needs;
+      // CF's Secrets / Secrets Store bindings are static (one binding per
+      // fixed secret name) and cannot address a runtime-chosen key. A
+      // per-tenant external KMS remains a possible future swap behind the
+      // same Env.VAULT seam (src/types.ts).
       "binding": "VAULT",
-      // Replace with a real namespace id (`wrangler kv namespace create
-      // VAULT`) before any dev/deploy that touches this binding.
-      "id": "REPLACE_WITH_VAULT_KV_NAMESPACE_ID"
+      // Created 2026-07-17 via `wrangler kv namespace create VAULT` on the
+      // production account (see README "Deploy"). Namespace ids are not
+      // secrets; the values inside are ciphertext envelopes regardless.
+      "id": "b6168345442644e3ac24ef4c43dd7f1e"
     }
   ],
   "secrets": {
     // AUTH_HMAC_SECRET signs/verifies server-minted sessionIds so
     // scopeSession can verify tenant ownership statelessly (M-006, DL-008).
+    // VAULT_MASTER_KEY (base64url, 32 bytes) envelope-encrypts every vault
+    // value; without it a KV read-back at rest yields only ciphertext.
     // CALLER_TOKENS / EXTENSION_TOKENS must be listed as well: when `secrets`
     // is declared, wrangler loads ONLY the listed keys from .dev.vars and
     // excludes the rest (no "optional" tier exists), which silently breaks
     // dev auth. They are operationally required anyway - without them the
     // service 401s every caller and rejects the extension WS.
-    "required": ["AUTH_HMAC_SECRET", "CALLER_TOKENS", "EXTENSION_TOKENS"]
+    "required": ["AUTH_HMAC_SECRET", "CALLER_TOKENS", "EXTENSION_TOKENS", "VAULT_MASTER_KEY"]
   },
   "observability": {
     "enabled": true

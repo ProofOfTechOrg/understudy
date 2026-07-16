@@ -6,11 +6,14 @@ import {
   InMemoryIdempotencyStore,
   InMemoryRateLimitStore,
 } from "@proofoftech/breakwater/connector-sdk";
+import { WRITE_COMMAND_TYPES, type WriteCommandType } from "@understudy/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  actInput,
   BROWSER_ACT_CONNECTOR,
   BROWSER_FILL_CREDENTIAL_CONNECTOR,
   BROWSER_WRITE_CONNECTOR_IDS,
+  type ActInput,
   type ActOutput,
   type ConnectorStores,
   type FillCredentialOutput,
@@ -123,9 +126,12 @@ describe("act", () => {
     expect(headers.authorization).toBe("Bearer caller-token-1");
     expect(body).toMatchObject({
       dryRun: false,
-      command: { type: "click", ref: "s1e2" },
+      // The commandId is DERIVED from the idempotency key ("ik_" + key), not
+      // random: a retry after a lost/unparseable response re-runs execute()
+      // under the same key, and only a stable id lets the service replay the
+      // recorded Event instead of executing the write twice.
+      command: { type: "click", ref: "s1e2", commandId: "ik_case1:step1:click" },
     });
-    expect((body as { command: { commandId: unknown } }).command.commandId).toBeTypeOf("string");
   });
 
   it("dry-run needs no grant, sends dryRun:true, and marks the output simulated", async () => {
@@ -141,6 +147,10 @@ describe("act", () => {
     expect(preview.ok).toBe(true);
     const { body } = sentRequest(fetchSpy);
     expect(body).toMatchObject({ dryRun: true, command: { type: "click" } });
+    // No idempotency key on a simulation - the commandId stays random, so a
+    // dry-run can never collide with (or replay) the real write's record.
+    const dryId = (body as { command: { commandId: string } }).command.commandId;
+    expect(dryId.startsWith("ik_")).toBe(false);
   });
 });
 
@@ -361,5 +371,51 @@ describe("service bridge hardening", () => {
     expect(sentRequest(fetchSpy).url).toBe(
       "https://understudy.example.com/v1/sessions/s%2F..%2F1/commands",
     );
+  });
+});
+
+describe("write-classification sync with @understudy/protocol", () => {
+  // Compile-time pin: act gates exactly the protocol write class minus
+  // fill_secret (which fill_credential carries). Since the protocol
+  // reclassified scroll/switch_tab as writes, that is the whole relationship -
+  // no extras. If WRITE_COMMAND_TYPES changes upstream, this assignment stops
+  // compiling until actInput is deliberately revisited.
+  type GatedActionType = ActInput["action"]["type"];
+  type ExpectedGatedActionType = Exclude<WriteCommandType, "fill_secret">;
+  type MutuallyAssignable<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+  const actGateMatchesProtocol: MutuallyAssignable<GatedActionType, ExpectedGatedActionType> = true;
+
+  it("act's runtime schema gates the same set the types promise", () => {
+    // #given the literal action types the act schema actually accepts
+    const gated = new Set(actInput.shape.action.options.map((option) => option.shape.type.value));
+
+    // #then they are exactly protocol WRITE_COMMAND_TYPES minus fill_secret
+    const expected = new Set<string>(
+      WRITE_COMMAND_TYPES.filter((type) => type !== "fill_secret"),
+    );
+    expect(gated).toEqual(expected);
+    expect(actGateMatchesProtocol).toBe(true);
+  });
+
+  it("fill_credential carries the remaining protocol write with a key-derived commandId", async () => {
+    // #given a granted fill_credential call under an idempotency key
+    const fetchSpy = vi.fn().mockResolvedValue(
+      eventResponse({ type: "action_result", commandId: "c1", ok: true }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const { fillCredential } = createBrowserConnectors(ENV, stores());
+
+    // #when it executes
+    await callBrowserWrite(
+      fillCredential,
+      { sessionId: "s-1", ref: "s1e9", secretRef: "vault://x" },
+      grantFor(BROWSER_FILL_CREDENTIAL_CONNECTOR),
+      "case1:login:fill",
+    );
+
+    // #then the wire carries fill_secret under the derived stable id
+    expect(sentRequest(fetchSpy).body).toMatchObject({
+      command: { type: "fill_secret", commandId: "ik_case1:login:fill" },
+    });
   });
 });

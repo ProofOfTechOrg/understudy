@@ -45,3 +45,16 @@ allowBuilds:
 # WXT's vite to 8.1.3 (already vetted by the quarantine for @wxt-dev/module-react).
 overrides:
   wxt>vite: 8.1.3
+
+# Declared peer compatibility for upstream ranges that lag what we install;
+# each is verified working by this repo's own suites, so the install-time
+# warnings were noise. Drop an entry when the upstream range catches up.
+peerDependencyRules:
+  allowedVersions:
+    # agents' partyserver (and wrangler's optional peer) still declare
+    # workers-types ^4; v5 is the same auto-generated surface, newer date.
+    "partyserver>@cloudflare/workers-types": "5"
+    "wrangler>@cloudflare/workers-types": "5"
+    # agents' legacy ai-sdk v4-era deps peer zod ^3; the workspace is zod 4.
+    "@ai-sdk/provider-utils>zod": "4"
+    "@ai-sdk/ui-utils>zod": "4"

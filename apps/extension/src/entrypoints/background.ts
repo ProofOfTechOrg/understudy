@@ -1,6 +1,7 @@
 import { safeParseCommand } from "@understudy/protocol";
 import type { Browser } from "wxt/browser";
 import { ReconnectingWs } from "../core/ws-client";
+import { WriteDedupe } from "../core/dedupe";
 import { routeCommand } from "../core/router";
 import { CdpSession } from "../driver/cdp";
 import { classifyCdpEvent } from "../driver/cdp-events";
@@ -41,6 +42,10 @@ let wsUrlEpoch = 0;
 
 let session: CdpSession | null = null;
 let attachedTitle: string | undefined;
+
+// Write-replay record (idempotent-retry contract); hydrates lazily from
+// storage.session, so rebuilding it each wake loses nothing.
+const dedupe = new WriteDedupe(browser.storage.session);
 
 const logBuffer: LogEntry[] = [];
 const ports = new Set<Browser.runtime.Port>();
@@ -153,8 +158,34 @@ async function handleCommand(raw: unknown): Promise<void> {
     }
     return;
   }
-  const ev = await routeCommand(parsed.data, session);
-  ws?.send(ev);
+
+  // Idempotent-retry gate for WRITE commands (reads always execute). A retry
+  // under the same commandId either replays a recorded result, or - if the
+  // original is still executing (the service timed out and the consumer
+  // retried) - is dropped so the write runs exactly once; the running
+  // execution's response resolves the service's parked promise.
+  const decision = await dedupe.claim(parsed.data);
+  if (decision.kind === "replay") {
+    log(`replayed recorded result for duplicate write ${parsed.data.commandId}`);
+    ws?.send(decision.event);
+    return;
+  }
+  if (decision.kind === "drop") {
+    log(`dropped duplicate in-flight write ${parsed.data.commandId}; the original execution will answer`);
+    return;
+  }
+
+  try {
+    const ev = await routeCommand(parsed.data, session);
+    // Record before sending: once the write executed, a crash between the two
+    // must leave the record (a replayable result), not a re-executable gap.
+    await dedupe.remember(parsed.data, ev);
+    ws?.send(ev);
+  } finally {
+    // No-op once remember() cleared the mark; guarantees a thrown execution
+    // still frees its in-flight slot so a later retry can re-run it.
+    dedupe.release(parsed.data);
+  }
 }
 
 function extractCommandId(raw: unknown): string | null {
@@ -331,6 +362,10 @@ async function persistAttachedTabId(tabId: number): Promise<void> {
 }
 
 async function setWsUrl(url: string): Promise<void> {
+  // A different WS URL means a different session (the sessionId is in the URL
+  // path): drop the write-replay record so a reused idempotency key can't
+  // replay the previous session's result.
+  if (url !== currentWsUrl) await dedupe.clear();
   currentWsUrl = url;
   wsUrlHydrated = true;
   wsUrlEpoch += 1;

@@ -100,8 +100,31 @@ export const CommandSchema = z.discriminatedUnion("type", [
 export type Command = z.infer<typeof CommandSchema>;
 export type CommandType = Command["type"];
 
-// State-changing commands gate on human approval (D8). Reads run freely.
-const WRITE_COMMANDS = new Set<CommandType>(["click", "type", "key", "navigate", "fill_secret"]);
+// The single source of truth for the "write" class, in the OPERATIONAL sense
+// this system enforces: a command with a user-visible side effect, which must
+// be gated on approval (D8), SIMULATED (never performed) on a dry-run, and
+// REPLAYED (never repeated) on an idempotent retry. Downstream layers (the
+// service's dry-run gate + write-replay cache, the extension's dedupe, the
+// connector's `act` union) all derive from this tuple instead of hand-copying
+// the list.
+//
+// scroll and switch_tab are included even though they don't mutate the DOM:
+// both change what the user's real browser shows, so a dry-run of one must not
+// actually scroll/switch, and a lost-response retry of `scroll` (a RELATIVE dy)
+// must not double-scroll. The genuine reads — snapshot / get_tabs / wait /
+// resolve_ref — carry no side effect and stay out (they dispatch freely on a
+// dry-run and re-execute freely on a retry).
+export const WRITE_COMMAND_TYPES = [
+  "click",
+  "type",
+  "key",
+  "navigate",
+  "fill_secret",
+  "scroll",
+  "switch_tab",
+] as const satisfies readonly CommandType[];
+export type WriteCommandType = (typeof WRITE_COMMAND_TYPES)[number];
+const WRITE_COMMANDS = new Set<CommandType>(WRITE_COMMAND_TYPES);
 export const isWriteCommand = (c: Command): boolean => WRITE_COMMANDS.has(c.type);
 
 // ── Events: extension → backend ──────────────────────────────────────────────

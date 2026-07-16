@@ -7,6 +7,7 @@ import {
   parseCommand,
   safeParseCommand,
   safeParseEvent,
+  WRITE_COMMAND_TYPES,
   type Command,
 } from "./index";
 
@@ -83,6 +84,42 @@ describe("isWriteCommand", () => {
   it("classifies resolve_ref as a read - the dry-run probe must run freely", () => {
     const probe: Command = { type: "resolve_ref", commandId: "c1", ref: "s1e2" };
     expect(isWriteCommand(probe)).toBe(false);
+  });
+
+  it("classifies scroll and switch_tab as writes - user-visible side effects, not DOM reads", () => {
+    // Both change what the user's real browser shows, so a dry-run must
+    // simulate (not perform) them and a retry must replay (not repeat) them -
+    // scroll's relative dy would otherwise double-scroll on a lost-response retry.
+    const scroll: Command = { type: "scroll", commandId: "c1", dy: 100 };
+    const switchTab: Command = { type: "switch_tab", commandId: "c2", tabId: 3 };
+    expect(isWriteCommand(scroll)).toBe(true);
+    expect(isWriteCommand(switchTab)).toBe(true);
+  });
+
+  it("agrees with the exported WRITE_COMMAND_TYPES tuple for every command type", () => {
+    // #given every command type in the union, as a representative command
+    const representatives: Command[] = [
+      { type: "snapshot", commandId: "c", mode: "a11y" },
+      { type: "navigate", commandId: "c", url: "https://example.com/" },
+      { type: "click", commandId: "c", ref: "r" },
+      { type: "type", commandId: "c", ref: "r", text: "t" },
+      { type: "fill_secret", commandId: "c", ref: "r", secretRef: "vault://x" },
+      { type: "key", commandId: "c", keys: "Enter" },
+      { type: "scroll", commandId: "c", dy: 10 },
+      { type: "wait", commandId: "c", for: "load" },
+      { type: "resolve_ref", commandId: "c", ref: "r" },
+      { type: "get_tabs", commandId: "c" },
+      { type: "switch_tab", commandId: "c", tabId: 1 },
+    ];
+
+    // #then the predicate and the tuple classify identically - the tuple is
+    // the published source of truth downstream layers build on
+    for (const cmd of representatives) {
+      expect(isWriteCommand(cmd)).toBe(
+        (WRITE_COMMAND_TYPES as readonly string[]).includes(cmd.type),
+      );
+    }
+    expect(new Set(WRITE_COMMAND_TYPES).size).toBe(WRITE_COMMAND_TYPES.length);
   });
 });
 

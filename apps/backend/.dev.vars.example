@@ -17,3 +17,10 @@ CALLER_TOKENS={"dev-caller-token":{"actor":"stub-consumer","tenantId":"dev-tenan
 # prints (which embeds this token) into the M2 extension's connection
 # settings.
 EXTENSION_TOKENS={"dev-ext-token":"dev-tenant"}
+
+# base64url-encoded 32-byte AES-256-GCM key that envelope-encrypts every
+# vault value (src/vault.ts). This dev value decodes to the literal
+# "dev-vault-master-key-0123456789!". Generate a real one with:
+#   node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
+# Seed dev secrets with: node scripts/vault-put.mjs 'vault://ref' --local
+VAULT_MASTER_KEY=ZGV2LXZhdWx0LW1hc3Rlci1rZXktMDEyMzQ1Njc4OSE

@@ -3,12 +3,23 @@ import type { AgentContext, Connection, ConnectionContext, WSMessage } from "age
 import { isWriteCommand, safeParseEvent } from "@understudy/protocol";
 import type { Command, Event } from "@understudy/protocol";
 import { scopeSession, verifyExtensionToken } from "./auth";
-import { SESSION_NOT_CONNECTED } from "./coordinator";
+import {
+  COMMAND_TIMED_OUT,
+  DUPLICATE_COMMAND,
+  SESSION_NOT_CONNECTED,
+  SESSION_RESYNCED,
+} from "./coordinator";
 import { CfSessionCoordinator } from "./coordinator-cf";
 import { resolveSecret } from "./secrets";
-import type { Env, SessionState, SessionStatus } from "./types";
+import { createVault } from "./vault";
+import type { DispatchOutcome, Env, SessionState, SessionStatus } from "./types";
 
 type FillSecretCommand = Extract<Command, { type: "fill_secret" }>;
+
+// Bounds SessionState.completedWrites (the idempotent-retry replay record).
+// 100 write results at ~100 bytes each is well under any DO state budget
+// while covering far more retries than a consumer's per-case write count.
+const COMPLETED_WRITES_CAP = 100;
 
 export class SessionAgent extends Agent<Env, SessionState> {
   initialState: SessionState = {
@@ -18,6 +29,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     generation: 0,
     awaitingCommandIds: [],
     status: "pending",
+    completedWrites: [],
   };
 
   private readonly coordinator: CfSessionCoordinator;
@@ -111,7 +123,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
         this.coordinator.resolvePending(ev);
         return;
       case "hello":
-        this.coordinator.abandonInFlight("session resynced: hello");
+        this.coordinator.abandonInFlight(`${SESSION_RESYNCED}: hello`);
         this.setState({
           ...this.state,
           browser: { browser: ev.browser, extVersion: ev.extVersion },
@@ -127,6 +139,11 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
+    // A socket that never passed onConnect's auth check never contributed
+    // to the session's status, so its close must not change it either - a
+    // rejected/never-authorized socket closing on a fresh session would
+    // otherwise stamp "pending" over with "detached".
+    if (!this.isAuthorizedConnection(connection)) return;
     // Only the LAST authorized socket's close detaches the session: a late
     // close event from a replaced socket must not stamp "detached" over a
     // healthy reconnect (the closing connection is excluded explicitly, in
@@ -137,49 +154,128 @@ export class SessionAgent extends Agent<Env, SessionState> {
     if (!stillLive) this.setState({ ...this.state, status: "detached" });
   }
 
-  async dispatch(command: Command, dryRun?: boolean): Promise<Event> {
-    if (!dryRun) {
-      return this.coordinator.send(command);
-    }
-    if (!isWriteCommand(command)) {
-      return this.coordinator.send(command);
-    }
+  async dispatch(command: Command, dryRun?: boolean): Promise<DispatchOutcome> {
+    try {
+      if (dryRun === true && isWriteCommand(command)) {
+        const probe = await this.checkRefResolves(this.commandRef(command));
+        return { ok: true, event: this.simulatedResult(command.commandId, probe) };
+      }
 
-    const probe = await this.checkRefResolves(this.commandRef(command));
-    return this.simulatedResult(command.commandId, probe);
+      // Real dispatch (a dry-run READ also lands here: it executes for real).
+      // A write whose Event was already recorded replays it instead of
+      // executing twice - the consumer retries under the same commandId when
+      // its previous attempt's response was lost or unparseable. The
+      // completedWrite helpers no-op for reads (incl. a dry-run read), so no
+      // dryRun guard is needed here: a dry-run write already returned above.
+      const replayed = this.completedWriteEvent(command);
+      if (replayed !== undefined) return { ok: true, event: replayed };
+
+      const event = await this.coordinator.send(command);
+      this.rememberCompletedWrite(command, event);
+      return { ok: true, event };
+    } catch (err) {
+      return this.dispatchFailure(err);
+    }
   }
 
-  async fillSecret(cmd: FillSecretCommand, dryRun?: boolean): Promise<Event> {
-    if (dryRun) {
-      return this.simulatedResult(cmd.commandId, await this.checkRefResolves(cmd.ref));
-    }
-
-    // Gate BEFORE the vault: resolving a secret for a command that cannot
-    // dispatch would materialize plaintext (and emit a vault access) for
-    // nothing - fail-fast matters most exactly here (DL-004).
-    if (!this.hasAuthorizedConnection()) {
-      throw new Error(`${SESSION_NOT_CONNECTED}: no authorized extension connection`);
-    }
-
-    let secret: string;
+  async fillSecret(cmd: FillSecretCommand, dryRun?: boolean): Promise<DispatchOutcome> {
     try {
-      secret = await resolveSecret(this.env.VAULT, cmd.secretRef);
-    } catch {
-      return {
-        type: "action_result",
-        commandId: cmd.commandId,
-        ok: false,
-        error: "fill_secret: secret could not be resolved",
-      };
-    }
+      if (dryRun === true) {
+        return {
+          ok: true,
+          event: this.simulatedResult(cmd.commandId, await this.checkRefResolves(cmd.ref)),
+        };
+      }
 
-    return this.coordinator.send({
-      type: "type",
-      commandId: cmd.commandId,
-      ref: cmd.ref,
-      text: secret,
-      submit: cmd.submit,
-    });
+      // Replay BEFORE the connection gate and the vault: a retry of an
+      // already-performed fill needs neither liveness nor plaintext.
+      const replayed = this.completedWriteEvent(cmd);
+      if (replayed !== undefined) return { ok: true, event: replayed };
+
+      // Gate BEFORE the vault: resolving a secret for a command that cannot
+      // dispatch would materialize plaintext (and emit a vault access) for
+      // nothing - fail-fast matters most exactly here (DL-004).
+      if (!this.hasAuthorizedConnection()) {
+        return {
+          ok: false,
+          reason: "not_connected",
+          message: `${SESSION_NOT_CONNECTED}: no authorized extension connection`,
+        };
+      }
+
+      let secret: string;
+      try {
+        secret = await resolveSecret(createVault(this.env), cmd.secretRef);
+      } catch {
+        return {
+          ok: true,
+          event: {
+            type: "action_result",
+            commandId: cmd.commandId,
+            ok: false,
+            error: "fill_secret: secret could not be resolved",
+          },
+        };
+      }
+
+      const event = await this.coordinator.send({
+        type: "type",
+        commandId: cmd.commandId,
+        ref: cmd.ref,
+        text: secret,
+        submit: cmd.submit,
+      });
+      this.rememberCompletedWrite(cmd, event);
+      return { ok: true, event };
+    } catch (err) {
+      return this.dispatchFailure(err);
+    }
+  }
+
+  /**
+   * Maps the coordinator's prefixed rejections to the typed outcome union
+   * IN-ISOLATE, so no expected failure ever crosses the RPC boundary as a
+   * rejected promise (workerd logs those as uncaught exceptions even when
+   * the Worker-side caller handles them). Anything unrecognized rethrows -
+   * that is a genuine bug and deserves both the noise and the 500.
+   */
+  private dispatchFailure(err: unknown): DispatchOutcome {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.startsWith(SESSION_NOT_CONNECTED)) {
+      return { ok: false, reason: "not_connected", message };
+    }
+    if (message.startsWith(COMMAND_TIMED_OUT)) {
+      return { ok: false, reason: "timed_out", message };
+    }
+    if (message.startsWith(SESSION_RESYNCED)) {
+      return { ok: false, reason: "resynced", message };
+    }
+    if (message.startsWith(DUPLICATE_COMMAND)) {
+      return { ok: false, reason: "duplicate_in_flight", message };
+    }
+    throw err;
+  }
+
+  /** The recorded Event for an already-completed write commandId, if any. */
+  private completedWriteEvent(command: Command): Event | undefined {
+    if (!isWriteCommand(command)) return undefined;
+    return this.completedWrites().find((entry) => entry.commandId === command.commandId)?.event;
+  }
+
+  private rememberCompletedWrite(command: Command, event: Event): void {
+    if (!isWriteCommand(command)) return;
+    const next = [
+      ...this.completedWrites().filter((entry) => entry.commandId !== command.commandId),
+      { commandId: command.commandId, event },
+    ];
+    while (next.length > COMPLETED_WRITES_CAP) next.shift();
+    this.setState({ ...this.state, completedWrites: next });
+  }
+
+  // Persisted before this field existed, a session's state can lack it;
+  // initialState only seeds brand-new DOs.
+  private completedWrites(): SessionState["completedWrites"] {
+    return this.state.completedWrites ?? [];
   }
 
   async getStatus(): Promise<{
@@ -240,6 +336,10 @@ export class SessionAgent extends Agent<Env, SessionState> {
       case "type":
       case "fill_secret":
       case "key":
+      case "scroll":
+        // scroll.ref is optional (undefined => a window scroll): a ref-bearing
+        // dry-run probes it, a ref-less one simulates ok:true with no wire hop
+        // (like navigate/switch_tab) - it was never a liveness signal.
         return command.ref;
       default:
         return undefined;
@@ -252,7 +352,8 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
   // The delivery predicate the coordinator's fail-fast gate consults: the
   // same precondition sendToExtension relies on, NOT the persisted status
-  // scalar (which a late onClose from a replaced socket can leave stale).
+  // scalar (onClose guards the stamping races, but the scalar remains an
+  // eventually-consistent echo, not the delivery truth).
   private hasAuthorizedConnection(): boolean {
     for (const connection of this.getConnections()) {
       if (this.isAuthorizedConnection(connection)) return true;

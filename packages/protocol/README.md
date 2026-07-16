@@ -30,12 +30,21 @@ import {
   // parsers
   parseCommand, parseEvent, safeParseCommand, safeParseEvent,
   // classification
-  isWriteCommand,
+  isWriteCommand, WRITE_COMMAND_TYPES,
   // types
-  type Command, type CommandType, type Event,
+  type Command, type CommandType, type Event, type WriteCommandType,
   type A11yNode, type TabInfo, type SnapshotMode,
 } from "@understudy/protocol";
 ```
+
+### Runtime support
+
+Pure zod-4 schemas — no platform APIs. Runs anywhere zod does: Workers,
+browsers (the extension bundles it), and Node. Deliberately no `engines`
+field: constraining Node would only misstate that portability
+([`@understudy/connector`](https://github.com/ProofOfTechOrg/understudy/tree/master/packages/connector)
+declares `node >= 22`, mirroring its breakwater peer — that constraint lives
+there, where it is real).
 
 ## Commands (consumer/service → extension)
 
@@ -44,17 +53,23 @@ import {
 | `snapshot` | `mode: "a11y" \| "dom" \| "screenshot"`, `tabId?` | read |
 | `get_tabs` | — | read |
 | `wait` | `for: "load" \| "idle" \| "ms"`, `value?` | read |
-| `scroll` | `ref?`, `dy` | read |
 | `resolve_ref` | `ref` | read (internal — see below) |
-| `switch_tab` | `tabId` | read |
 | `click` | `ref` | **write** |
 | `type` | `ref`, `text`, `submit?` | **write** |
 | `key` | `keys`, `ref?` | **write** |
 | `navigate` | `url`, `tabId?` | **write** |
+| `scroll` | `ref?`, `dy` | **write** |
+| `switch_tab` | `tabId` | **write** |
 | `fill_secret` | `ref`, `secretRef`, `submit?` | **write** (vaulted) |
 
-`isWriteCommand` returns `true` for the write class. Two commands deserve a
-warning:
+`isWriteCommand` / `WRITE_COMMAND_TYPES` classify the write class in the
+**operational** sense this system enforces: a command with a user-visible side
+effect, which must be gated on approval (D8), simulated (never performed) on a
+`dryRun`, and replayed (never repeated) on an idempotent retry. `scroll` and
+`switch_tab` are writes here even though they don't mutate the DOM — both change
+what the user's browser shows, so a dry-run must not perform them and a
+lost-response retry of `scroll` (a *relative* `dy`) must not double-scroll. Two
+commands deserve a warning:
 
 - **`fill_secret`** carries an opaque `secretRef` (e.g. `vault://…`), never a
   plaintext secret. The understudy *service* resolves it against the vault and
@@ -94,6 +109,11 @@ generation that produced them; a stale ref returns
 
 ## Versioning
 
+- **0.4.0** — exports `WRITE_COMMAND_TYPES` / `WriteCommandType` (the single
+  write-classification source downstream layers derive from) and reclassifies
+  `scroll` / `switch_tab` as writes, so `isWriteCommand` now returns `true` for
+  them (they are user-visible side effects: dry-run must simulate, retry must
+  replay). No schema change.
 - **0.3.0** — adds the internal `resolve_ref` probe (fixes dry-run: a snapshot
   probe re-mints refs and would invalidate the consumer's outstanding refs).
 - **0.2.0** — adds `fill_secret` and the optional `action_result.simulated`

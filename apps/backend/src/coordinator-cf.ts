@@ -9,7 +9,7 @@
  */
 
 import type { Command, Event } from "@understudy/protocol";
-import { COMMAND_TIMED_OUT, SESSION_NOT_CONNECTED } from "./coordinator";
+import { COMMAND_TIMED_OUT, DUPLICATE_COMMAND, SESSION_NOT_CONNECTED } from "./coordinator";
 import type { PendingCommand, PendingMap, SessionCoordinator } from "./coordinator";
 import type { SessionStatus } from "./types";
 
@@ -27,8 +27,9 @@ export interface CoordinatorHost {
    * The delivery predicate: does a live, onConnect-authorized extension
    * socket exist right now? This is the exact precondition sendToExtension
    * relies on - NOT the persisted SessionState.status scalar, which is a
-   * lossy last-writer-wins echo of it (a late onClose from a replaced
-   * socket can stamp "detached" over a healthy reconnected session).
+   * last-writer-wins echo maintained by lifecycle hooks (onClose guards the
+   * known stamping races, but the scalar is still eventually-consistent
+   * bookkeeping, not the delivery truth).
    */
   hasAuthorizedConnection(): boolean;
   /** Reads the persisted awaiting-commandId marker (SessionState.awaitingCommandIds). */
@@ -82,6 +83,15 @@ export class CfSessionCoordinator implements SessionCoordinator {
     if (!this.host.hasAuthorizedConnection()) {
       return Promise.reject(
         new Error(`${SESSION_NOT_CONNECTED}: no authorized extension connection`),
+      );
+    }
+    // Stable, consumer-derived commandIds (the idempotent-retry contract)
+    // make a concurrent duplicate possible; letting it in would overwrite
+    // the first send's pending-map entry and strand its resolver until the
+    // orphaned timer fires. Refuse the second send instead.
+    if (this.pending.has(cmd.commandId)) {
+      return Promise.reject(
+        new Error(`${DUPLICATE_COMMAND}: ${cmd.commandId} is already awaiting its event`),
       );
     }
     return new Promise<Event>((resolve, reject) => {

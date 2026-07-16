@@ -17,12 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      # v5/v6 majors run on the node24 action runtime; the v4 majors ran on
+      # node20, which GitHub now flags with a deprecation annotation.
+      - uses: actions/checkout@v5
 
       # Reads the pnpm version from package.json "packageManager".
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm

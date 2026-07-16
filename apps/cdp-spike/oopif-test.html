@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>understudy OOPIF probe page</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; }
+      iframe { border: 2px solid #c00; }
+    </style>
+  </head>
+  <body>
+    <h1>OOPIF probe page (top frame)</h1>
+    <p>
+      Open this file directly (file://) in the tab you attach the CDP spike to,
+      then click <strong>OOPIF probe</strong> in the side panel. The iframe
+      below is <code>https://example.org</code> — a different site, so Chrome's
+      site isolation renders it in its own process (an out-of-process iframe).
+      If <code>Target.setAutoAttach</code> works under
+      <code>chrome.debugger</code>, the probe reports an attached iframe target
+      and reads its accessibility tree through a session-scoped command.
+    </p>
+    <button id="top-frame-button">top-frame button (should appear in the TOP a11y tree only)</button>
+    <p><iframe src="https://example.org/" width="640" height="320" title="cross-origin iframe"></iframe></p>
+  </body>
+</html>

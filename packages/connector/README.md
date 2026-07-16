@@ -21,10 +21,11 @@ limits, audit).
 | `act` | `browser.act` | write — approval-gated | `click`, `type`, `navigate`, `key`, `scroll`, `switch_tab` |
 | `fillCredential` | `browser.fill_credential` | vaulted write — approval-gated | `fill_secret` |
 
-`scroll` and `switch_tab` are non-writes in the protocol's own
-`isWriteCommand` classification, but this package deliberately routes them
-through the gated `act` connector: both change what the user's real browser
-shows, and the conservative direction is to gate them.
+`scroll` and `switch_tab` route through the gated `act` connector because both
+change what the user's real browser shows. The protocol classifies them as
+writes for exactly this reason (`isWriteCommand` returns `true`), so `act`
+gates precisely the protocol's write class minus `fill_secret` — no divergence
+to keep in sync.
 
 The protocol's `resolve_ref` command is deliberately unreachable from here —
 it is an internal service↔extension probe. Dry-run intent is expressed via the
@@ -37,7 +38,10 @@ pnpm add @understudy/connector @understudy/protocol @proofoftech/breakwater @mas
 ```
 
 `@proofoftech/breakwater` and `@mastra/core` are peer dependencies — the
-connectors must share the consumer's Mastra runtime.
+connectors must share the consumer's Mastra runtime. The package declares
+`engines.node >= 22`, mirroring its breakwater peer (unlike
+`@understudy/protocol`, which is runtime-agnostic and deliberately declares
+no engines constraint).
 
 ## Quick start
 
@@ -109,9 +113,18 @@ plain vars, in production.
 - **Idempotency.** Writes require a caller-supplied key
   (`callBrowserWrite`'s last argument). Replays return the stored result
   without re-executing, so DO hibernation/retry cannot double-submit after a
-  *known* outcome. The one inherent gap: if the service performed the write
-  but the response never parsed, the key stays retryable and a retry
-  re-executes — ack-based at-most-once, conservative in the retry direction.
+  *known* outcome. The once-inherent gap — write performed but the response
+  lost/unparseable, so the key stays retryable and the retry re-executes —
+  is closed end to end: the connector derives the wire `commandId` from the
+  idempotency key (`ik_<key>`), the understudy service replays a recorded
+  write Event for a repeated commandId instead of re-dispatching (and refuses
+  a still-in-flight duplicate outright), and the extension both replays its
+  own recorded result if the service timed out *after* it responded and drops
+  a duplicate that arrives while it is *still* executing — so the write runs
+  exactly once even under a timeout race. Remaining boundary: the replay
+  records are bounded (100 writes each, service- and extension-side) and
+  scoped to the session — a retry beyond that bound degrades to the old
+  conservative re-execution.
 - **Dry-run.** `callBrowserDryRun` runs the connector's simulation:
   understudy checks the `ref` still resolves (a pure ref-map lookup — it never
   re-mints refs, so outstanding refs survive the simulation) and returns a

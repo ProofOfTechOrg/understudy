@@ -213,8 +213,20 @@ Design notes:
 - `tabs_result` answers `get_tabs` with a `commandId`-bearing event (added at M2).
 - **Published runtime exports** (what consumer connectors import): `parseCommand` / `parseEvent`
   (throwing) and `safeParseCommand` / `safeParseEvent`; `CommandSchema` / `EventSchema`,
-  `A11yNodeSchema`, `TabInfoSchema`, `SnapshotModeSchema`; `isWriteCommand`; and the types
-  `Command` / `Event` / `A11yNode` / `TabInfo` / `SnapshotMode`.
+  `A11yNodeSchema`, `TabInfoSchema`, `SnapshotModeSchema`; `isWriteCommand` +
+  `WRITE_COMMAND_TYPES` (the single write-classification source of truth downstream layers
+  derive from — the connector pins its gated union to it at compile time); and the types
+  `Command` / `Event` / `WriteCommandType` / `A11yNode` / `TabInfo` / `SnapshotMode`.
+- **Write retries are idempotent end to end** (M5): the connector derives a write's `commandId`
+  from the breakwater idempotency key (`ik_<key>`); the service records completed write Events
+  per session (`completedWrites`, cap 100) and replays a repeated commandId instead of
+  re-dispatching (409 for a concurrent duplicate still in flight); the extension keeps its own
+  replay + in-flight record (cap 100, storage.session) covering BOTH the service-timed-out-
+  after-execution case (replay) and the service-timed-out-mid-execution case (drop the duplicate,
+  never re-run). This closed the documented "write performed, response unparseable → retry
+  re-executes" gap. The write class here is the protocol's `WRITE_COMMAND_TYPES` — which now
+  includes `scroll`/`switch_tab` (user-visible side effects: a dry-run simulates them and a
+  retry replays them, so a relative-`dy` scroll never double-scrolls).
 
 ## Element targeting (a11y `ref` model) — `apps/extension/src/driver/cdp.ts`
 
@@ -274,10 +286,16 @@ feeds its LLM. D7 confirmed end-to-end.
   only their extension-side *implementation* is pinned here.
 - v1 scope is a single designated tab/session anyway (see "Out of scope").
 
-**One sub-question deferred to M2:** cross-origin / out-of-process iframe (OOPIF) traversal via
-`Target.setAutoAttach{ flatten: true }` (a *different* `Target` method than the blocked `getTargets`,
-generally permitted under `chrome.debugger`). Not exercised by the probe. Add a focused sub-probe at M2
-if cross-frame targeting is needed — the single-frame path is proven.
+**One sub-question deferred at M0, probe SHIPPED at M5 (2026-07-17):** cross-origin /
+out-of-process iframe (OOPIF) traversal via `Target.setAutoAttach{ flatten: true }` (a *different*
+`Target` method than the blocked `getTargets`, generally permitted under `chrome.debugger`).
+`apps/cdp-spike` now carries a focused **OOPIF probe** (side-panel button + bundled
+`oopif-test.html` cross-origin-iframe page + runbook in its README): it runs `setAutoAttach`,
+collects `Target.attachedToTarget` events, and drives each attached target through session-scoped
+`sendCommand({tabId, sessionId}, …)` (`Runtime.evaluate` + `Accessibility.getFullAXTree`). The
+probe is attended (~5 min, real Chromium ≥125) and has not been run yet; record its verdict here
+when it runs. Driver implementation in `apps/extension` stays gated on a green probe AND a
+consumer actually needing cross-origin-iframe targeting — the single-frame path is proven.
 
 ## Consumer integration — the governed connector (breakwater + flowsafe)
 
@@ -410,9 +428,18 @@ auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer t
   flow is wired (`.github/workflows/release.yml`, single-branch master — first push publishes 0.3.0 /
   0.1.0 with no changeset needed); publishing waits on the npm `understudy` org + `NPM_TOKEN` secret.
   The consumer-side Mastra+flowsafe e2e remains open.
-- **M5 — Substrate hardening.** Session/tenant isolation verified with two tenants; credential vault +
-  D-SEC audit invariant; dialog handling; error/timeout paths on every command; session/GIF logging for
-  audit. (Approval/RBAC/policy live in the consumer, not here.)
+- **M5 — Substrate hardening. LARGELY LANDED (2026-07-17, the deferred-items sweep):**
+  pre-accept WS/HTTP auth at the Worker edge (`onBeforeConnect`/`onBeforeRequest` — unauthorized
+  upgrades are 401/404 before the DO accepts, in-DO gate kept as defense in depth); credential
+  vault hardened to AES-256-GCM envelopes over KV under a `VAULT_MASTER_KEY` Worker secret
+  (`src/vault.ts` + `scripts/vault-put.mjs`; plaintext never at rest, legacy plaintext fails
+  closed); typed `DispatchOutcome` error taxonomy across the DO RPC boundary (503 not-connected /
+  503 resynced / 504 timeout / 409 duplicate; no more RPC-rejection noise); idempotent write
+  replay (see above); onClose status stamping gated on authorization; **first real deploy** to
+  `https://understudy-backend.gcharang.workers.dev` with real minted secrets (runbook in
+  `apps/backend/README.md` "Deploy") — live smoke: health, 401, mint, fail-fast 503, WS-gate 401,
+  encrypted vault seed all verified. Still open under M5: two-tenant isolation e2e, dialog
+  handling breadth, session/GIF audit logging.
 - **M6 — Ops.** Rate/quotas at the service edge, observability, unattended-session seam scoping.
 
 ## Verification
