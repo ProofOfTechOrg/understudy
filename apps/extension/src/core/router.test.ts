@@ -13,6 +13,7 @@ interface MockSession {
   scroll: Mock;
   wait: Mock;
   navigate: Mock;
+  resolveRefCheck: Mock;
 }
 
 function createMockSession(): MockSession {
@@ -25,6 +26,7 @@ function createMockSession(): MockSession {
     scroll: vi.fn(),
     wait: vi.fn(),
     navigate: vi.fn(),
+    resolveRefCheck: vi.fn(),
   };
 }
 
@@ -160,6 +162,31 @@ describe("routeCommand", () => {
 
     expect(mock.wait).toHaveBeenCalledWith("c-wait", "ms", 500);
     expect(result).toEqual(event);
+  });
+
+  it("routes resolve_ref to session.resolveRefCheck with the ref", async () => {
+    const mock = createMockSession();
+    const event: Event = { type: "action_result", commandId: "c-resolve", ok: true };
+    mock.resolveRefCheck.mockResolvedValue(event);
+    const cmd: Command = { type: "resolve_ref", commandId: "c-resolve", ref: "s0e5" };
+
+    const result = await routeCommand(cmd, asSession(mock));
+
+    expect(mock.resolveRefCheck).toHaveBeenCalledWith("c-resolve", "s0e5");
+    expect(result).toEqual(event);
+  });
+
+  it("returns action_result failure for resolve_ref with a null session", async () => {
+    const cmd: Command = { type: "resolve_ref", commandId: "c-resolve-null", ref: "s0e5" };
+
+    const result = await routeCommand(cmd, null);
+
+    expect(result).toEqual({
+      type: "action_result",
+      commandId: "c-resolve-null",
+      ok: false,
+      error: "no active CDP session",
+    });
   });
 
   it("returns tabs_result with the mapped open tabs for get_tabs", async () => {

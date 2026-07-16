@@ -92,14 +92,21 @@ the connection set during that window. Four things close this gap:
 - **`dryRun` is a service-API parameter (`{command, dryRun?}`), not a `Command`
   union field**: adding it to every Command variant would churn the shared,
   published protocol for a cross-cutting concern. On a dryRun WRITE command,
-  `dispatch` never dispatches the *mutating* command — instead it issues a
-  read-only `snapshot` (also via `coordinator.send`) and checks that the
-  command's `ref` resolves in the returned a11y tree, returning a
-  simulated `action_result` (`simulated: true`) either way. `fillSecret` does the
-  same ref-only check on dryRun and never calls `resolveSecret` or dispatches a
-  `type` command. This is fail-safe by construction: a governance simulation
-  (called *before* an approval grant exists) can never actually mutate the page
-  or resolve a secret.
+  `dispatch` never dispatches the *mutating* command — instead it sends a
+  read-only `resolve_ref` probe (also via `coordinator.send`), which the
+  extension answers from its live ref map, returning a simulated
+  `action_result` (`simulated: true`) either way. The probe must NOT be a
+  `snapshot`: the extension re-mints every ref per snapshot (generation bump),
+  so a snapshot probe can never contain the consumer's ref — dryRun would
+  always refuse — and it invalidates every outstanding ref, breaking the
+  approved command that follows the simulation (the original M3 dry-run bug,
+  caught by the attended e2e). `fillSecret` does the same ref-only check on
+  dryRun and never calls `resolveSecret` or dispatches a `type` command. This
+  is fail-safe by construction: a governance simulation (called *before* an
+  approval grant exists) can never actually mutate the page or resolve a
+  secret. A dry-run `ok` guarantees *resolvability* (the ref maps to a live
+  node in the current generation) — not *executability* of the eventual
+  dispatch (e.g. box-model availability), which only the real command proves.
 - **The vault binding (`Env.VAULT`) is a KV namespace, not CF Secrets/Secrets
   Store**: `fill_secret`'s `secretRef` is chosen per-call at runtime, and CF's
   Secrets/Secrets Store bindings are static — one binding per fixed secret name —

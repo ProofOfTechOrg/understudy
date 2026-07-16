@@ -257,6 +257,19 @@ export class CdpSession {
     });
   }
 
+  // Pure ref-map lookup: MUST NOT snapshot or bump the generation. This is
+  // the dry-run probe's truth source; taking a snapshot here would invalidate
+  // the very ref being checked (and every other outstanding ref). Runs through
+  // the FIFO queue so it observes any generation bump already in flight.
+  resolveRefCheck(commandId: string, ref: string): Promise<Event> {
+    return this.run(commandId, async () => {
+      if (this.resolveRef(ref) === null) {
+        return actionError(commandId, `stale or unknown ref: ${ref}`);
+      }
+      return { type: "action_result", commandId, ok: true };
+    });
+  }
+
   screenshot(commandId: string): Promise<Event> {
     return this.run(commandId, async () => {
       const { data } = await this.send<Protocol.Page.CaptureScreenshotResponse>(

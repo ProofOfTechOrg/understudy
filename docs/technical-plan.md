@@ -191,11 +191,19 @@ Design notes:
   plaintext lives only transiently in the service and on that last hop; it never enters the
   connector input, the model context, the audit `detail`, or the flowsafe snapshot (D-SEC).
 - **`dryRun`** rides on the service API (`{command, dryRun?}`), not the union. The M3 service is
-  **fail-safe**: on `dryRun` it does a read-only `ref`-resolution check (via a snapshot) and returns
-  a *simulated* `action_result` — it never dispatches a mutating command and never resolves a secret
-  (a "simulation" must never execute an unapproved write, or it defeats the consumer's approval
-  gate). A richer extension-native dry-run (resolve-without-dispatch inside the executor) is a later
-  **M2 amendment**; the service does not need it to be safe.
+  **fail-safe**: on `dryRun` it does a read-only `ref`-resolution check via the `resolve_ref`
+  command (a pure lookup against the extension's live ref map — NOT a snapshot: the extension
+  re-mints every ref per snapshot, so a snapshot probe can never contain the consumer's ref and
+  invalidates all outstanding refs, breaking the approved command after the simulation; this was
+  the original M3 dry-run bug, caught by the attended e2e 2026-07-16) and returns a *simulated*
+  `action_result` — it never dispatches a mutating command and never resolves a secret (a
+  "simulation" must never execute an unapproved write, or it defeats the consumer's approval
+  gate). `resolve_ref` IS the extension-native resolve-without-dispatch probe once deferred as
+  a "later M2 amendment" — landed with the fix. A dry-run `ok` guarantees *resolvability* (the
+  ref maps to a live node in the current generation), not *executability* (e.g. box-model
+  availability at dispatch time). `resolve_ref` is an internal service↔extension probe;
+  consumers express dry-run intent via the service API's `dryRun` flag, never by sending
+  `resolve_ref` themselves.
 - `commandId` correlates the async round-trip: the service's `send(cmd)` returns a promise parked
   in a `Map<commandId, resolver>`; the matching `*_result` event resolves it. Only *in-flight*
   commands are lost on DO hibernation; persisted session state is not (see the service section).

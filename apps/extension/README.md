@@ -3,8 +3,8 @@
 WXT + React MV3 extension that puppets a user's already-logged-in Chromium tab
 over a WebSocket. It holds the WS connection, runs a CDP session against a
 single designated tab via `chrome.debugger`, and executes protocol Commands
-(`snapshot`, `click`, `type`, `navigate`, `key`, `scroll`, `wait`, `get_tabs`,
-`switch_tab`) as schema-valid `@understudy/protocol` Events. The peer in M2 is
+(`snapshot`, `click`, `type`, `navigate`, `key`, `scroll`, `wait`, `resolve_ref`,
+`get_tabs`, `switch_tab`) as schema-valid `@understudy/protocol` Events. The peer in M2 is
 a throwaway stub server (`scripts/stub-server.mjs`); the real Hono backend is
 M3.
 
