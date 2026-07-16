@@ -37,10 +37,12 @@
   "secrets": {
     // AUTH_HMAC_SECRET signs/verifies server-minted sessionIds so
     // scopeSession can verify tenant ownership statelessly (M-006, DL-008).
-    // CALLER_TOKENS / EXTENSION_TOKENS (src/types.ts) are optional and are
-    // set via `wrangler secret put <NAME>` only when used, so they are
-    // intentionally not listed as required here.
-    "required": ["AUTH_HMAC_SECRET"]
+    // CALLER_TOKENS / EXTENSION_TOKENS must be listed as well: when `secrets`
+    // is declared, wrangler loads ONLY the listed keys from .dev.vars and
+    // excludes the rest (no "optional" tier exists), which silently breaks
+    // dev auth. They are operationally required anyway - without them the
+    // service 401s every caller and rejects the extension WS.
+    "required": ["AUTH_HMAC_SECRET", "CALLER_TOKENS", "EXTENSION_TOKENS"]
   },
   "observability": {
     "enabled": true
