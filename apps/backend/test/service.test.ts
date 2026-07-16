@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { safeParseCommand, safeParseEvent } from "@understudy/protocol";
-import type { A11yNode, Command } from "@understudy/protocol";
+import type { Command } from "@understudy/protocol";
 import type { SessionAgent } from "../src/session";
 import { CALLER_TOKEN_A, CALLER_TOKEN_B, EXTENSION_TOKEN_A } from "./tokens";
 import { BASE, getSessionStub, getWebSocket } from "./helpers";
@@ -109,19 +109,28 @@ function collectCommands(socket: WebSocket): Command[] {
 }
 
 /**
- * Collects every real dispatched Command, and auto-answers each `snapshot`
- * with a `snapshot_result` carrying `tree` - the shared shape behind both
- * dryRun ref-check tests below (one where the ref resolves, one where it
- * doesn't).
+ * Collects every real dispatched Command, and auto-answers each `resolve_ref`
+ * the way the real extension does: a pure ref-map lookup - ok:true only for
+ * refs in `resolving` - never a snapshot. (A snapshot-answering fake is what
+ * masked the original dry-run bug: a real extension re-mints every ref per
+ * snapshot, so a probe snapshot can never contain the consumer's ref.)
  */
-function answerSnapshotsWith(socket: WebSocket, tree: A11yNode[]): Command[] {
+function answerResolveRefsWith(socket: WebSocket, resolving: string[]): Command[] {
   const commands: Command[] = [];
   socket.addEventListener("message", (event: MessageEvent) => {
     const command = asCommand(event.data as string);
     if (!command) return; // an Agents SDK framework message - not ours
     commands.push(command);
-    if (command.type === "snapshot") {
-      socket.send(JSON.stringify({ type: "snapshot_result", commandId: command.commandId, tree }));
+    if (command.type === "resolve_ref") {
+      const ok = resolving.includes(command.ref);
+      socket.send(
+        JSON.stringify({
+          type: "action_result",
+          commandId: command.commandId,
+          ok,
+          ...(ok ? {} : { error: `stale or unknown ref: ${command.ref}` }),
+        }),
+      );
     }
   });
   return commands;
@@ -382,10 +391,10 @@ describe("fill_secret", () => {
 
 describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a secret)", () => {
   it("performs only a read-only ref check for a write command and never dispatches the mutation", async () => {
-    // #given a connected fake extension that answers any snapshot with a tree containing the target ref
+    // #given a connected fake extension whose live ref map resolves the target ref
     const sessionId = await openSession(CALLER_TOKEN_A);
     const socket = await connectFakeExtension(sessionId);
-    const messages = answerSnapshotsWith(socket, [{ ref: "s1e1", role: "button", name: "Submit" }]);
+    const messages = answerResolveRefsWith(socket, ["s1e1"]);
 
     try {
       // #when a consumer posts a dryRun click
@@ -401,20 +410,25 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
       expect(safeParseEvent(event).success).toBe(true);
       expect(event).toEqual({ type: "action_result", commandId: "c4", ok: true, simulated: true });
 
-      // #then the extension only ever saw the read-only ref check, never the click itself
+      // #then the extension only ever saw the read-only resolve_ref probe (never a
+      // snapshot, which would bump the generation and invalidate the consumer's refs),
+      // and never the click itself
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(messages).toEqual([{ type: "snapshot", commandId: expect.any(String), mode: "a11y" }]);
+      expect(messages).toEqual([
+        { type: "resolve_ref", commandId: expect.any(String), ref: "s1e1" },
+      ]);
     } finally {
       socket.close(1000, "done");
     }
   });
 
   it("dryRun fill_secret performs only a ref check, resolving no secret and typing nothing", async () => {
-    // #given a seeded vault secret that must remain untouched, and a connected fake extension
+    // #given a seeded vault secret that must remain untouched, and a connected
+    // fake extension whose ref map resolves nothing
     await seedVault("vault://dry-pw", "should-not-be-read");
     const sessionId = await openSession(CALLER_TOKEN_A);
     const socket = await connectFakeExtension(sessionId);
-    const messages = answerSnapshotsWith(socket, []);
+    const messages = answerResolveRefsWith(socket, []);
     const vaultGetSpy = vi.spyOn(env.VAULT, "get");
 
     try {
@@ -426,7 +440,7 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
         true,
       );
 
-      // #then it returns exactly a simulated ok:false result (the empty tree never resolves the ref)
+      // #then it returns exactly a simulated ok:false result (the ref does not resolve)
       const event = await res.json();
       expect(event).toEqual({
         type: "action_result",
@@ -439,9 +453,45 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
       // #then the vault was never read for that secretRef, and nothing was ever typed
       expect(vaultGetSpy).not.toHaveBeenCalledWith("vault://dry-pw");
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(messages).toEqual([{ type: "snapshot", commandId: expect.any(String), mode: "a11y" }]);
+      expect(messages).toEqual([
+        { type: "resolve_ref", commandId: expect.any(String), ref: "s1e1" },
+      ]);
     } finally {
       vaultGetSpy.mockRestore();
+      socket.close(1000, "done");
+    }
+  });
+
+  it("dryRun navigate (a write without a ref) simulates ok:true with zero wire traffic", async () => {
+    // #given a connected fake extension
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const received = collectCommands(socket);
+
+    try {
+      // #when a consumer posts a dryRun navigate (commandRef has no ref to probe)
+      const res = await postCommand(
+        sessionId,
+        CALLER_TOKEN_A,
+        { type: "navigate", commandId: "c-nav-dry", url: "https://example.com/" },
+        true,
+      );
+
+      // #then it returns simulated ok:true (nothing to probe; the URL is already
+      // schema-checked) - note this does NOT attest session liveness, unlike a
+      // ref-bearing dry-run which round-trips to the extension
+      const event = await res.json();
+      expect(event).toEqual({
+        type: "action_result",
+        commandId: "c-nav-dry",
+        ok: true,
+        simulated: true,
+      });
+
+      // #then the extension received nothing - no probe, no navigate
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+    } finally {
       socket.close(1000, "done");
     }
   });

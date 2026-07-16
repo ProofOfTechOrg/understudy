@@ -51,6 +51,15 @@ describe("CommandSchema", () => {
       safeParseCommand({ type: "fill_secret", commandId: "c1", ref: "s1e2" }).success,
     ).toBe(false);
   });
+
+  it("parses a valid resolve_ref command", () => {
+    const cmd = { type: "resolve_ref", commandId: "c1", ref: "s1e2" };
+    expect(parseCommand(cmd)).toEqual(cmd);
+  });
+
+  it("rejects resolve_ref missing ref", () => {
+    expect(safeParseCommand({ type: "resolve_ref", commandId: "c1" }).success).toBe(false);
+  });
 });
 
 describe("isWriteCommand", () => {
@@ -69,6 +78,11 @@ describe("isWriteCommand", () => {
       secretRef: "vault://x",
     };
     expect(isWriteCommand(fillSecret)).toBe(true);
+  });
+
+  it("classifies resolve_ref as a read - the dry-run probe must run freely", () => {
+    const probe: Command = { type: "resolve_ref", commandId: "c1", ref: "s1e2" };
+    expect(isWriteCommand(probe)).toBe(false);
   });
 });
 

@@ -87,6 +87,13 @@ export const CommandSchema = z.discriminatedUnion("type", [
     for: z.enum(["load", "idle", "ms"]),
     value: z.number().optional(),
   }),
+  // Read-only probe: does `ref` still resolve in the extension's live ref map?
+  // Answered from the map alone - no snapshot, no generation bump - so a
+  // dry-run check can never invalidate the consumer's outstanding refs (a
+  // snapshot probe re-mints every ref, breaking the approved command after it).
+  // Internal service<->extension probe: consumers express dry-run intent via
+  // the service API's `dryRun` flag; they never need to send this themselves.
+  z.object({ type: z.literal("resolve_ref"), commandId: z.string(), ref: z.string() }),
   z.object({ type: z.literal("get_tabs"), commandId: z.string() }),
   z.object({ type: z.literal("switch_tab"), commandId: z.string(), tabId: z.number() }),
 ]);

@@ -63,6 +63,12 @@ export async function routeCommand(cmd: Command, session: CdpSession | null): Pr
         const { for: waitFor, value } = cmd;
         return await withSession(session, cmd.commandId, (s) => s.wait(cmd.commandId, waitFor, value));
       }
+      case "resolve_ref": {
+        const { ref } = cmd;
+        return await withSession(session, cmd.commandId, (s) =>
+          s.resolveRefCheck(cmd.commandId, ref),
+        );
+      }
       case "get_tabs":
         return await routeGetTabs(cmd.commandId);
       case "switch_tab":

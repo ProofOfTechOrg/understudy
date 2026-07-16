@@ -1,7 +1,7 @@
 import { Agent } from "agents";
 import type { AgentContext, Connection, ConnectionContext, WSMessage } from "agents";
 import { isWriteCommand, safeParseEvent } from "@understudy/protocol";
-import type { A11yNode, Command, Event } from "@understudy/protocol";
+import type { Command, Event } from "@understudy/protocol";
 import { scopeSession, verifyExtensionToken } from "./auth";
 import { CfSessionCoordinator } from "./coordinator-cf";
 import { resolveSecret } from "./secrets";
@@ -193,25 +193,20 @@ export class SessionAgent extends Agent<Env, SessionState> {
     };
   }
 
+  // Probes via resolve_ref - a pure ref-map lookup extension-side. A snapshot
+  // probe is disqualified here: the extension re-mints every ref per snapshot
+  // (generation bump), so it can never contain the consumer's ref AND it
+  // invalidates the consumer's outstanding refs, breaking the approved
+  // command that follows the dry-run.
   private async checkRefResolves(ref: string | undefined): Promise<boolean> {
     if (ref === undefined) return true;
 
     const ev = await this.coordinator.send({
-      type: "snapshot",
+      type: "resolve_ref",
       commandId: crypto.randomUUID(),
-      mode: "a11y",
+      ref,
     });
-    if (ev.type !== "snapshot_result") return false;
-
-    return this.nodeListHasRef(ev.tree, ref);
-  }
-
-  private nodeListHasRef(nodes: A11yNode[], ref: string): boolean {
-    for (const node of nodes) {
-      if (node.ref === ref) return true;
-      if (node.children && this.nodeListHasRef(node.children, ref)) return true;
-    }
-    return false;
+    return ev.type === "action_result" && ev.ok;
   }
 
   private commandRef(command: Command): string | undefined {
