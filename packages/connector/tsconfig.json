@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // WebWorker (not DOM) supplies the fetch/Response/crypto TYPES the service
+    // bridge and its tests reference without making browser-only globals
+    // (document/window) typecheck-clean in a package that must run on Workers.
+    // The runtime globals exist on Workers, Node >= 18, and browsers alike; no
+    // lib type leaks into the public dist surface (the exports are
+    // zod-inferred shapes + breakwater seam types).
+    "lib": ["ES2022", "WebWorker"]
+  },
+  "include": ["src"]
+}

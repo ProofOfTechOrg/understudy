@@ -125,6 +125,8 @@ understudy/
   packages/
     protocol/                  # PUBLISHED @understudy/protocol (zod 4): Command/Event unions + schemas.
       src/index.ts             #   The shared contract consumers import. Add fill_secret here.
+    connector/                 # PUBLISHED @understudy/connector (M4): reference breakwater connectors
+      src/index.ts             #   (observe/act/fill_credential) consumers import as Mastra tools.
   apps/
     backend/                   # Cloudflare Worker — the browser-execution SERVICE (M3)
       src/index.ts             # Hono app: POST /v1/sessions/:id/commands, session mgmt, auth, health
@@ -139,9 +141,10 @@ understudy/
       src/driver/cdp.ts               # CDP executors: snapshot/click/type/navigate/... (+ dry-run seam)
       wxt.config.ts
     # apps/backend-node/       # FUTURE self-host of the SERVICE: reuses protocol + SessionCoordinator
-  # The agent loop, Claude client, tool defs, and breakwater connectors are CONSUMER code
-  # (metamind / smart-compliance), NOT here. understudy MAY publish a reference connector
-  # (@understudy/connector) as an example, but does not run it.
+  # The agent loop, Claude client, and tool wiring are CONSUMER code (metamind /
+  # smart-compliance), NOT here. understudy PUBLISHES the reference connector
+  # (packages/connector -> @understudy/connector) for consumers to import, but does not
+  # run it - no breakwater/flowsafe/Mastra code executes in this repo's apps.
 ```
 
 ## The command protocol (`packages/protocol`) — the core contract
@@ -279,7 +282,10 @@ if cross-frame targeting is needed — the single-frame path is proven.
 ## Consumer integration — the governed connector (breakwater + flowsafe)
 
 This is CONSUMER code (in metamind / smart-compliance), documented here because it defines understudy's
-outward contract. Reference: `smart-compliance/docs/examples/understudy-browser-connector.ts`.
+outward contract. Canonical reference: **`packages/connector` (`@understudy/connector`, M4)** — tested
+against the shipped M3 service contract (bearer caller auth, protocol v0.3.0). The historical sketch it
+grew from, `smart-compliance/docs/examples/understudy-browser-connector.ts`, predates M3 (no caller
+auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer the package.
 
 - A browser action is wrapped as a **breakwater `createConnector()`** (three connectors:
   `observe` = read/no-approval, `act` = write/discriminated-union, `fill_credential` = write/vaulted).
@@ -396,7 +402,14 @@ outward contract. Reference: `smart-compliance/docs/examples/understudy-browser-
   reference breakwater connector (`@understudy/connector`, mirroring the smart-compliance example). A real
   consumer (metamind / smart-compliance) drives understudy end-to-end with a Mastra agent + flowsafe
   approvals. *Cross-repo; understudy's deliverable is the published contract + reference connector, not
-  the agent.*
+  the agent.* **Status (2026-07-16): `packages/connector` BUILT** — observe (snapshot/get_tabs/wait) /
+  act (click/type/navigate/key/scroll/switch_tab, grant-gated) / fill_credential (vaulted), egress-pinned
+  `runtime.fetch`, caller bearer auth, 15 tests against the real breakwater wrapper (fail-closed grant,
+  idempotent replay, per-hop egress denial, dry-run). Both packages are publish-ready (MIT,
+  `files`-scoped tarballs, `publishConfig.access: public`) and the changesets + GitHub Actions release
+  flow is wired (`.github/workflows/release.yml`, single-branch master — first push publishes 0.3.0 /
+  0.1.0 with no changeset needed); publishing waits on the npm `understudy` org + `NPM_TOKEN` secret.
+  The consumer-side Mastra+flowsafe e2e remains open.
 - **M5 — Substrate hardening.** Session/tenant isolation verified with two tenants; credential vault +
   D-SEC audit invariant; dialog handling; error/timeout paths on every command; session/GIF logging for
   audit. (Approval/RBAC/policy live in the consumer, not here.)

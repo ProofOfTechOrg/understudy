@@ -1,8 +1,8 @@
 {
-  "name": "@understudy/protocol",
-  "version": "0.3.0",
+  "name": "@understudy/connector",
+  "version": "0.1.0",
   "type": "module",
-  "description": "The understudy browser-execution command protocol: zod-4 Command/Event discriminated unions shared by the service, the extension driver, and consumer connectors",
+  "description": "Reference @proofoftech/breakwater connectors for the understudy browser-execution service: observe / act / fill_credential, approval-gated via flowsafe grants",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -18,19 +18,23 @@
   ],
   "sideEffects": false,
   "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ProofOfTechOrg/understudy.git",
-    "directory": "packages/protocol"
+    "directory": "packages/connector"
   },
-  "homepage": "https://github.com/ProofOfTechOrg/understudy/tree/master/packages/protocol#readme",
+  "homepage": "https://github.com/ProofOfTechOrg/understudy/tree/master/packages/connector#readme",
   "bugs": "https://github.com/ProofOfTechOrg/understudy/issues",
   "keywords": [
     "understudy",
     "browser-automation",
-    "cdp",
-    "protocol",
-    "zod"
+    "breakwater",
+    "mastra",
+    "ai-agents",
+    "connector"
   ],
   "publishConfig": {
     "access": "public"
@@ -42,9 +46,16 @@
     "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
+    "@understudy/protocol": "workspace:^",
     "zod": "^4"
   },
+  "peerDependencies": {
+    "@mastra/core": "^1.50.0",
+    "@proofoftech/breakwater": "^0.3.0"
+  },
   "devDependencies": {
+    "@mastra/core": "^1.50.0",
+    "@proofoftech/breakwater": "^0.3.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
   }
