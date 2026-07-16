@@ -2,13 +2,14 @@ import { describe, it, expect, vi } from "vitest";
 import { CfSessionCoordinator, type CoordinatorHost } from "../src/coordinator-cf";
 import type { Command, Event } from "@understudy/protocol";
 
-function createFakeHost(): CoordinatorHost & { sent: string[] } {
+function createFakeHost(connected = true): CoordinatorHost & { sent: string[] } {
   let awaiting: string[] = [];
   const sent: string[] = [];
   return {
     sendToExtension: (payload: string) => {
       sent.push(payload);
     },
+    hasAuthorizedConnection: () => connected,
     getAwaitingCommandIds: () => awaiting,
     persistAwaitingCommandIds: (ids: string[]) => {
       awaiting = ids;
@@ -53,12 +54,30 @@ describe("CfSessionCoordinator", () => {
 
       // #then it rejects with a payload-free error and the marker is cleared
       expect(err).toBeInstanceOf(Error);
-      expect((err as Error).message).toBe("command c2 (click) timed out after 1000ms");
+      expect((err as Error).message).toBe("command timed out: c2 (click) after 1000ms");
       expect((err as Error).message).not.toContain("r1");
       expect(host.getAwaitingCommandIds()).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("rejects immediately when no authorized socket exists - no marker, no frame, no timer burn", async () => {
+    // #given a host whose session has no live authorized extension socket
+    const host = createFakeHost(false);
+    const coordinator = new CfSessionCoordinator(host);
+    const cmd: Command = { type: "get_tabs", commandId: "c-fast" };
+
+    // #when send() is called
+    const err = await coordinator.send(cmd).catch((e: unknown) => e);
+
+    // #then it rejects with the route-mappable prefix before parking anything
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe(
+      "session not connected: no authorized extension connection",
+    );
+    expect(host.getAwaitingCommandIds()).toEqual([]);
+    expect(host.sent).toEqual([]);
   });
 
   it("no-ops on an unknown commandId without throwing or touching the marker", () => {

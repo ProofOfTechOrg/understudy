@@ -102,6 +102,11 @@ describe("dispatch / resolvePending", () => {
     const cmd: Command = { type: "get_tabs", commandId: "s1" };
 
     const result = await runInDurableObject(stub, async (instance: SessionAgent) => {
+      // Stand in for a live authorized extension socket: the coordinator's
+      // fail-fast gate consults the DO's connection set, which
+      // runInDurableObject cannot populate; the service-level suite covers
+      // the real predicate. This test is about correlation.
+      Object.assign(instance, { hasAuthorizedConnection: () => true });
       const dispatchPromise = instance.dispatch(cmd);
       // The marker is parked synchronously before dispatch() suspends.
       expect(instance.state.awaitingCommandIds).toContain("s1");
@@ -121,41 +126,11 @@ describe("dispatch / resolvePending", () => {
     });
   });
 
-  it(
-    "rejects a dispatched command with a payload-free error when its timeout fires",
-    async () => {
-      // #given a command sent via dispatch with no reply ever arriving,
-      // driven from a single runInDurableObject callback (see the comment
-      // above) and using the DO's real ~30s per-command timeout rather
-      // than vi.useFakeTimers(): a faked setTimeout firing outside a
-      // runInDurableObject call reaches into the Durable Object's
-      // SQLite-backed setState from the wrong I/O context and throws
-      // ("Cannot perform I/O on behalf of a different Durable Object") -
-      // verified empirically. coordinator.test.ts already covers this
-      // exact timeout/marker-clearing behavior deterministically with fake
-      // timers at the coordinator level (no DO involved); this test adds
-      // the DO-integration proof, so it pays the real ~30s cost once.
-      const sessionId = crypto.randomUUID();
-      const stub = await getSessionStub(sessionId);
-      const cmd: Command = { type: "click", commandId: "s2", ref: "secret-ref" };
-
-      const err = await runInDurableObject(stub, async (instance: SessionAgent) => {
-        const dispatchPromise = instance.dispatch(cmd);
-        expect(instance.state.awaitingCommandIds).toContain("s2");
-
-        // #when the per-command timeout elapses
-        return dispatchPromise.catch((e: unknown) => e);
-      });
-
-      // #then it rejects with a payload-free error and clears the marker
-      expect(err).toBeInstanceOf(Error);
-      expect((err as Error).message).not.toContain("secret-ref");
-      await runInDurableObject(stub, (instance: SessionAgent) => {
-        expect(instance.state.awaitingCommandIds).toEqual([]);
-      });
-    },
-    35_000,
-  );
+  // The real ~30s timeout's DO-integration proof lives in service.test.ts
+  // ("maps a timed-out command to 504"), which drives it through the full
+  // route -> RPC -> DO -> coordinator path against a connected-but-silent
+  // extension; coordinator.test.ts covers the timeout/marker-clearing
+  // machinery deterministically with fake timers.
 });
 
 describe("DO eviction resilience (DL-007)", () => {
@@ -219,6 +194,10 @@ describe("hello resync", () => {
     let outcome!: Promise<{ settled: "resolved" | "rejected"; value: unknown }>;
 
     await runInDurableObject(stub, (instance: SessionAgent) => {
+      // Stand in for a live authorized socket (see "resolves a dispatched
+      // command's promise" above), or the fail-fast gate rejects before the
+      // marker is ever parked and there is nothing for the resync to abandon.
+      Object.assign(instance, { hasAuthorizedConnection: () => true });
       outcome = instance.dispatch(cmd).then(
         (value) => ({ settled: "resolved", value }) as const,
         (error: unknown) => ({ settled: "rejected", value: error }) as const,

@@ -4,6 +4,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { safeParseCommand, safeParseEvent } from "@understudy/protocol";
 import type { Command } from "@understudy/protocol";
 import type { SessionAgent } from "../src/session";
+import type { SessionStatus } from "../src/types";
 import { CALLER_TOKEN_A, CALLER_TOKEN_B, EXTENSION_TOKEN_A } from "./tokens";
 import { BASE, getSessionStub, getWebSocket } from "./helpers";
 
@@ -440,13 +441,14 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
         true,
       );
 
-      // #then it returns exactly a simulated ok:false result (the ref does not resolve)
+      // #then it returns exactly a simulated ok:false result carrying the
+      // extension's OWN failure reason, not a collapsed generic string
       const event = await res.json();
       expect(event).toEqual({
         type: "action_result",
         commandId: "c5",
         ok: false,
-        error: "dry-run: ref did not resolve",
+        error: "dry-run: stale or unknown ref: s1e1",
         simulated: true,
       });
 
@@ -524,4 +526,282 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
       socket.close(1000, "done");
     }
   });
+
+  it("surfaces the extension's probe-failure reason on a dryRun write", async () => {
+    // #given a connected fake extension whose ref map resolves nothing
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    answerResolveRefsWith(socket, []);
+
+    try {
+      // #when a consumer posts a dryRun click on a stale ref
+      const res = await postCommand(
+        sessionId,
+        CALLER_TOKEN_A,
+        { type: "click", commandId: "c-probe-reason", ref: "s1e9" },
+        true,
+      );
+
+      // #then the simulated failure carries the extension's own reason
+      const event = await res.json();
+      expect(event).toEqual({
+        type: "action_result",
+        commandId: "c-probe-reason",
+        ok: false,
+        error: "dry-run: stale or unknown ref: s1e9",
+        simulated: true,
+      });
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+});
+
+describe("extension liveness fail-fast", () => {
+  /** Bounded poll for an async status transition (onClose runs after the socket close). */
+  async function waitForStatus(sessionId: string, want: SessionStatus): Promise<void> {
+    const stub = await getSessionStub(sessionId);
+    for (let i = 0; i < 100; i++) {
+      const status = await stub.getStatus();
+      if (status.status === want) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error(`session never reached status '${want}'`);
+  }
+
+  it("answers 503 immediately when no extension has ever connected - no timeout burn", async () => {
+    // #given a session with no extension attached (status stays "pending")
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    // #when a consumer posts a command
+    const startedAt = Date.now();
+    const res = await postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "get_tabs",
+      commandId: "c-no-ext",
+    });
+
+    // #then it fails fast as a retryable 503 (never the old 30s-timeout 500)
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "extension not connected" });
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+
+  it("answers 503 after the extension detaches", async () => {
+    // #given a session whose extension connected and then dropped
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    socket.close(1000, "gone");
+    await waitForStatus(sessionId, "detached");
+
+    // #when a consumer posts a command
+    const res = await postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "get_tabs",
+      commandId: "c-detached",
+    });
+
+    // #then it is refused as a retryable 503, not parked until the timeout
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "extension not connected" });
+  });
+
+  it("still simulates a ref-less dryRun write with no extension connected", async () => {
+    // #given a session with no extension attached
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    // #when a consumer posts a dryRun navigate (no ref, so no probe hits the wire)
+    const res = await postCommand(
+      sessionId,
+      CALLER_TOKEN_A,
+      { type: "navigate", commandId: "c-dry-no-ext", url: "https://example.com/" },
+      true,
+    );
+
+    // #then the documented zero-wire semantic is preserved: simulated ok:true,
+    // NOT a 503 - a ref-less dry-run was never a liveness signal
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      type: "action_result",
+      commandId: "c-dry-no-ext",
+      ok: true,
+      simulated: true,
+    });
+  });
+
+  it("fails a ref-bearing dryRun fast when no extension is connected (the probe needs the wire)", async () => {
+    // #given a session with no extension attached
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    // #when a consumer posts a dryRun click (its resolve_ref probe must round-trip)
+    const res = await postCommand(
+      sessionId,
+      CALLER_TOKEN_A,
+      { type: "click", commandId: "c-dry-probe-no-ext", ref: "s1e1" },
+      true,
+    );
+
+    // #then the probe fails fast as 503 rather than burning the timeout
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "extension not connected" });
+  });
+
+  it("refuses a real fill_secret on a disconnected session WITHOUT touching the vault", async () => {
+    // #given a seeded secret and a session with no extension attached
+    await seedVault("vault://gated-pw", "must-stay-unread");
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+
+    try {
+      // #when a consumer posts a real (non-dry) fill_secret
+      const res = await postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "fill_secret",
+        commandId: "c-fill-no-ext",
+        ref: "s1e1",
+        secretRef: "vault://gated-pw",
+      });
+
+      // #then it is refused as 503 and the secret was NEVER resolved - no
+      // plaintext materialized, no vault access emitted, for a command that
+      // could not dispatch (DL-004)
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "extension not connected" });
+      expect(vaultGetSpy).not.toHaveBeenCalled();
+    } finally {
+      vaultGetSpy.mockRestore();
+    }
+  });
+
+  /** One full command round-trip over `socket` (get_tabs in, tabs_result out). */
+  async function roundTrip(socket: WebSocket, sessionId: string, commandId: string): Promise<Response> {
+    const incoming = waitForCommand(socket);
+    const resPromise = postCommand(sessionId, CALLER_TOKEN_A, { type: "get_tabs", commandId });
+    const received = await incoming;
+    socket.send(JSON.stringify({ type: "tabs_result", commandId: received.commandId, tabs: [] }));
+    return resPromise;
+  }
+
+  it("recovers through the full lifecycle: pending 503 -> connected ok -> detached 503 -> reconnected ok", async () => {
+    // #given a fresh session (pending)
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    expect((await postCommand(sessionId, CALLER_TOKEN_A, { type: "get_tabs", commandId: "l1" })).status).toBe(503);
+
+    // #when an extension connects
+    const first = await connectFakeExtension(sessionId);
+    expect((await roundTrip(first, sessionId, "l2")).status).toBe(200);
+
+    // #when it drops
+    first.close(1000, "gone");
+    await waitForStatus(sessionId, "detached");
+    expect((await postCommand(sessionId, CALLER_TOKEN_A, { type: "get_tabs", commandId: "l3" })).status).toBe(503);
+
+    // #when it reconnects
+    const second = await connectFakeExtension(sessionId);
+    try {
+      // #then commands flow again - no wedged 503 after a reconnect
+      expect((await roundTrip(second, sessionId, "l4")).status).toBe(200);
+    } finally {
+      second.close(1000, "done");
+    }
+  });
+
+  it("stays connected while any authorized socket survives - a replaced socket's close is not a detach", async () => {
+    // #given two authorized sockets on one session
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const old = await connectFakeExtension(sessionId);
+    const replacement = await connectFakeExtension(sessionId);
+
+    try {
+      // #when the old socket closes late (after its replacement is live)
+      old.close(1000, "replaced");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      // #then the session is NOT stamped detached and commands still flow
+      const stub = await getSessionStub(sessionId);
+      expect((await stub.getStatus()).status).toBe("connected");
+      expect((await roundTrip(replacement, sessionId, "l5")).status).toBe(200);
+    } finally {
+      replacement.close(1000, "done");
+    }
+  });
+});
+
+describe("error taxonomy (route mapping)", () => {
+  it("rejects an unparseable JSON body as 400, not a masked 500", async () => {
+    // #given an open session
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    // #when the body is not JSON at all
+    const res = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}/commands`, CALLER_TOKEN_A, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "not json {",
+      }),
+    );
+
+    // #then it is the client's fault: 400
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "invalid body" });
+  });
+
+  it("maps an in-flight command abandoned by a hello resync to the uniform JSON 500", async () => {
+    // #given a connected extension holding a command in flight
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+
+    try {
+      const incoming = waitForCommand(socket);
+      const resPromise = postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "get_tabs",
+        commandId: "c-abandoned",
+      });
+      await incoming; // the command is now parked in the coordinator
+
+      // #when the extension resyncs (hello) instead of answering
+      socket.send(
+        JSON.stringify({ type: "hello", browser: "chrome", extVersion: "1.0.0", tabs: [] }),
+      );
+
+      // #then the abandoned dispatch surfaces as the uniform JSON 500 -
+      // app.onError's shape, with no stack or internals in the body
+      const res = await resPromise;
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ error: "internal error" });
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it(
+    "maps a timed-out command to 504 - the DO-integration proof of the real per-command timeout",
+    async () => {
+      // #given a connected extension that never answers (real ~30s timeout:
+      // fake timers cannot reach into the DO's I/O context - see the note in
+      // session.test.ts's dispatch suite)
+      const sessionId = await openSession(CALLER_TOKEN_A);
+      const socket = await connectFakeExtension(sessionId);
+
+      try {
+        // #when a consumer posts a command that will never be answered
+        const res = await postCommand(sessionId, CALLER_TOKEN_A, {
+          type: "get_tabs",
+          commandId: "c-silent",
+        });
+
+        // #then the per-command timeout surfaces as 504, not an opaque 500
+        expect(res.status).toBe(504);
+        expect(await res.json()).toEqual({ error: "command timed out" });
+
+        // #then the awaiting marker was cleared by the REAL DO-level timeout
+        // (the fake-timer coordinator test covers this deterministically;
+        // this re-asserts it through the integrated path, post-settlement)
+        const stub = await getSessionStub(sessionId);
+        await runInDurableObject(stub, (instance: SessionAgent) => {
+          expect(instance.state.awaitingCommandIds).toEqual([]);
+        });
+      } finally {
+        socket.close(1000, "done");
+      }
+    },
+    40_000,
+  );
 });

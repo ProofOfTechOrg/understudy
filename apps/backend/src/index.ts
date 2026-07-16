@@ -14,6 +14,7 @@ import { Hono } from "hono";
 import { getAgentByName, routeAgentRequest } from "agents";
 import { safeParseCommand } from "@understudy/protocol";
 import { authenticate, mintSessionId, scopeSession } from "./auth";
+import { COMMAND_TIMED_OUT, SESSION_NOT_CONNECTED } from "./coordinator";
 import type { Env } from "./types";
 import type { SessionAgent } from "./session";
 
@@ -60,7 +61,14 @@ app.post("/v1/sessions/:sessionId/commands", async (c) => {
   const scope = await scopeSession(sessionId, actor.tenantId, c.env);
   if (scope === "not-found") return c.json({ error: "not found" }, 404);
 
-  const body = await c.req.json();
+  // Unparseable JSON is the client's fault: 400, not a rethrow into the
+  // uniform 500 (which would dress a client error as a server error).
+  let body: { command?: unknown; dryRun?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid body" }, 400);
+  }
   const parsed = safeParseCommand(body?.command);
   if (!parsed.success) return c.json({ error: "invalid command" }, 400);
 
@@ -70,12 +78,36 @@ app.post("/v1/sessions/:sessionId/commands", async (c) => {
   // carrying a secret through this route (DL-004).
   const dryRun = body?.dryRun === true;
   const stub = await getSessionStub(c.env, sessionId);
-  const event =
-    parsed.data.type === "fill_secret"
-      ? await stub.fillSecret(parsed.data, dryRun)
-      : await stub.dispatch(parsed.data, dryRun);
+  try {
+    const event =
+      parsed.data.type === "fill_secret"
+        ? await stub.fillSecret(parsed.data, dryRun)
+        : await stub.dispatch(parsed.data, dryRun);
+    return c.json(event);
+  } catch (err) {
+    // The DO's throw crosses the RPC boundary as a plain Error; its message
+    // prefix is the contract (coordinator.ts). "Not connected" is 503 - a
+    // retryable infrastructure state - deliberately NOT a 200 ok:false
+    // Event, which a consumer's idempotency store would cache and replay
+    // even after the extension reconnects.
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.startsWith(SESSION_NOT_CONNECTED)) {
+      return c.json({ error: "extension not connected" }, 503);
+    }
+    if (message.startsWith(COMMAND_TIMED_OUT)) {
+      return c.json({ error: "command timed out" }, 504);
+    }
+    throw err;
+  }
+});
 
-  return c.json(event);
+// Anything a route throws (or rethrows above) becomes a uniform JSON 500
+// instead of workerd's opaque non-JSON error page. Command payloads never
+// enter error messages by construction (DL-004), so logging the message
+// leaks nothing; the response body stays generic regardless.
+app.onError((err, c) => {
+  console.error("unhandled route error", err.message);
+  return c.json({ error: "internal error" }, 500);
 });
 
 export default {

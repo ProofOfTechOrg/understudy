@@ -38,10 +38,16 @@ export interface Env {
   VAULT: VaultBinding;
   /** Signs/verifies server-minted sessionIds so scopeSession can verify tenant ownership statelessly (M-006, DL-008). */
   AUTH_HMAC_SECRET: string;
-  /** Static caller-token -> tenantId map for the dev auth verifier (M-006). */
-  CALLER_TOKENS?: string;
-  /** Extension per-user token(s), verified independently of caller auth. */
-  EXTENSION_TOKENS?: string;
+  /**
+   * Static caller-token -> tenantId map (JSON) for the dev auth verifier
+   * (M-006). Required, not optional: wrangler.jsonc lists it in
+   * `secrets.required`, which is also the .dev.vars allowlist, so a
+   * deployment without it cannot start. auth.ts still guards the empty
+   * string at runtime.
+   */
+  CALLER_TOKENS: string;
+  /** Extension per-user token(s) (JSON), verified independently of caller auth. Required via `secrets.required`, like CALLER_TOKENS. */
+  EXTENSION_TOKENS: string;
 }
 
 /**

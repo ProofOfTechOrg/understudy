@@ -12,6 +12,16 @@
 import type { Command, Event } from "@understudy/protocol";
 import type { SessionStatus } from "./types";
 
+/**
+ * send()'s delivery-failure vocabulary. A message prefix is the only failure
+ * signal that survives an RPC boundary (custom Error subclasses do not), so
+ * every throw site and every host mapping failures onto its transport (the
+ * Cloudflare Worker maps these to 503/504 in index.ts) shares these
+ * constants instead of free-typing the strings.
+ */
+export const SESSION_NOT_CONNECTED = "session not connected";
+export const COMMAND_TIMED_OUT = "command timed out";
+
 /** One outstanding `send(cmd)` call, awaiting its correlated Event. */
 export interface PendingCommand {
   resolve: (ev: Event) => void;
