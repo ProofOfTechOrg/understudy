@@ -30,6 +30,13 @@ jobs:
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
+      # dist/ is gitignored and @understudy/protocol resolves via dist (the
+      # npm-publish-correct layout), so the workspace libs must be built
+      # before anything that imports them typechecks or runs. Topological:
+      # protocol builds before connector.
+      - name: Build packages
+        run: pnpm --filter "./packages/*" build
+
       - name: Typecheck
         run: pnpm -r typecheck
 

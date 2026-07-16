@@ -39,9 +39,9 @@ M4 step. The agent loop and governance stay consumer-side, per Topology 1.
 
 ```sh
 pnpm install
-pnpm test        # protocol round-trip / validation tests
+pnpm build       # first on a fresh clone: @understudy/* resolve via gitignored dist/
 pnpm typecheck
-pnpm build
+pnpm test
 ```
 
 Requires Node ≥22 and pnpm ≥10.16 (see `package.json`). Dependencies are quarantined for
