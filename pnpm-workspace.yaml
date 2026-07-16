@@ -7,6 +7,13 @@ packages:
   # Supply-chain guard: quarantine freshly published versions for 7 days (minutes).
 minimumReleaseAge: 10080
 
+# First-party org packages are exempt from the quarantine: we consume our own
+# releases immediately (every published @proofoftech/breakwater version is
+# younger than the 7-day window, so packages/connector could not resolve it
+# at all otherwise).
+minimumReleaseAgeExclude:
+  - "@proofoftech/breakwater"
+
 # Dependency build-script approvals (pnpm 11 `allowBuilds` map). esbuild is a
 # trusted vitest/vite/WXT dependency that links its platform binary via an
 # install script.
