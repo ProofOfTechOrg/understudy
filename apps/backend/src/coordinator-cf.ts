@@ -9,6 +9,7 @@
  */
 
 import type { Command, Event } from "@understudy/protocol";
+import { COMMAND_TIMED_OUT, SESSION_NOT_CONNECTED } from "./coordinator";
 import type { PendingCommand, PendingMap, SessionCoordinator } from "./coordinator";
 import type { SessionStatus } from "./types";
 
@@ -22,6 +23,14 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 export interface CoordinatorHost {
   /** Writes a JSON frame to the live extension WebSocket. */
   sendToExtension(payload: string): void;
+  /**
+   * The delivery predicate: does a live, onConnect-authorized extension
+   * socket exist right now? This is the exact precondition sendToExtension
+   * relies on - NOT the persisted SessionState.status scalar, which is a
+   * lossy last-writer-wins echo of it (a late onClose from a replaced
+   * socket can stamp "detached" over a healthy reconnected session).
+   */
+  hasAuthorizedConnection(): boolean;
   /** Reads the persisted awaiting-commandId marker (SessionState.awaitingCommandIds). */
   getAwaitingCommandIds(): string[];
   /** Persists the awaiting-commandId marker via the DO's setState. */
@@ -64,10 +73,21 @@ export class CfSessionCoordinator implements SessionCoordinator {
    * always settles even if the WebSocket is gone.
    */
   send(cmd: Command): Promise<Event> {
+    // Fail fast instead of parking a promise that can only time out: with no
+    // deliverable socket, sendToExtension writes to nobody, so the 30s
+    // timeout (surfacing as an opaque 500) would be the guaranteed outcome -
+    // the M3 e2e's QA finding. The Worker maps this prefix to a 503. A
+    // socket that dies between this check and the write still ends in the
+    // timeout: fail-fast is best-effort, the timer stays the backstop.
+    if (!this.host.hasAuthorizedConnection()) {
+      return Promise.reject(
+        new Error(`${SESSION_NOT_CONNECTED}: no authorized extension connection`),
+      );
+    }
     return new Promise<Event>((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(
-          new Error(`command ${cmd.commandId} (${cmd.type}) timed out after ${this.timeoutMs}ms`),
+          new Error(`${COMMAND_TIMED_OUT}: ${cmd.commandId} (${cmd.type}) after ${this.timeoutMs}ms`),
         );
         this.pending.delete(cmd.commandId);
         this.dropAwaiting(cmd.commandId);

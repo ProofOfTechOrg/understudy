@@ -3,6 +3,7 @@ import type { AgentContext, Connection, ConnectionContext, WSMessage } from "age
 import { isWriteCommand, safeParseEvent } from "@understudy/protocol";
 import type { Command, Event } from "@understudy/protocol";
 import { scopeSession, verifyExtensionToken } from "./auth";
+import { SESSION_NOT_CONNECTED } from "./coordinator";
 import { CfSessionCoordinator } from "./coordinator-cf";
 import { resolveSecret } from "./secrets";
 import type { Env, SessionState, SessionStatus } from "./types";
@@ -35,6 +36,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
           if (this.isAuthorizedConnection(connection)) connection.send(payload);
         }
       },
+      hasAuthorizedConnection: () => this.hasAuthorizedConnection(),
       getAwaitingCommandIds: () => this.state.awaitingCommandIds,
       persistAwaitingCommandIds: (ids) => this.setState({ ...this.state, awaitingCommandIds: ids }),
       persistStatus: (status) => this.setState({ ...this.state, status }),
@@ -125,7 +127,14 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
-    this.setState({ ...this.state, status: "detached" });
+    // Only the LAST authorized socket's close detaches the session: a late
+    // close event from a replaced socket must not stamp "detached" over a
+    // healthy reconnect (the closing connection is excluded explicitly, in
+    // case the SDK has not yet reaped it from the connection set).
+    const stillLive = [...this.getConnections()].some(
+      (c) => c !== connection && this.isAuthorizedConnection(c),
+    );
+    if (!stillLive) this.setState({ ...this.state, status: "detached" });
   }
 
   async dispatch(command: Command, dryRun?: boolean): Promise<Event> {
@@ -136,26 +145,20 @@ export class SessionAgent extends Agent<Env, SessionState> {
       return this.coordinator.send(command);
     }
 
-    const ok = await this.checkRefResolves(this.commandRef(command));
-    return {
-      type: "action_result",
-      commandId: command.commandId,
-      ok,
-      ...(ok ? {} : { error: "dry-run: ref did not resolve" }),
-      simulated: true,
-    };
+    const probe = await this.checkRefResolves(this.commandRef(command));
+    return this.simulatedResult(command.commandId, probe);
   }
 
   async fillSecret(cmd: FillSecretCommand, dryRun?: boolean): Promise<Event> {
     if (dryRun) {
-      const ok = await this.checkRefResolves(cmd.ref);
-      return {
-        type: "action_result",
-        commandId: cmd.commandId,
-        ok,
-        ...(ok ? {} : { error: "dry-run: ref did not resolve" }),
-        simulated: true,
-      };
+      return this.simulatedResult(cmd.commandId, await this.checkRefResolves(cmd.ref));
+    }
+
+    // Gate BEFORE the vault: resolving a secret for a command that cannot
+    // dispatch would materialize plaintext (and emit a vault access) for
+    // nothing - fail-fast matters most exactly here (DL-004).
+    if (!this.hasAuthorizedConnection()) {
+      throw new Error(`${SESSION_NOT_CONNECTED}: no authorized extension connection`);
     }
 
     let secret: string;
@@ -198,15 +201,37 @@ export class SessionAgent extends Agent<Env, SessionState> {
   // (generation bump), so it can never contain the consumer's ref AND it
   // invalidates the consumer's outstanding refs, breaking the approved
   // command that follows the dry-run.
-  private async checkRefResolves(ref: string | undefined): Promise<boolean> {
-    if (ref === undefined) return true;
+  private async checkRefResolves(
+    ref: string | undefined,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (ref === undefined) return { ok: true };
 
     const ev = await this.coordinator.send({
       type: "resolve_ref",
       commandId: crypto.randomUUID(),
       ref,
     });
-    return ev.type === "action_result" && ev.ok;
+    if (ev.type !== "action_result") {
+      return { ok: false, reason: `unexpected probe response '${ev.type}'` };
+    }
+    if (ev.ok) return { ok: true };
+    // Surface the extension's own reason (e.g. "stale or unknown ref: s1e2")
+    // instead of collapsing every probe failure into one generic string.
+    return { ok: false, reason: ev.error ?? "ref did not resolve" };
+  }
+
+  /** The simulated action_result a dry-run returns in place of dispatching. */
+  private simulatedResult(
+    commandId: string,
+    probe: { ok: true } | { ok: false; reason: string },
+  ): Event {
+    return {
+      type: "action_result",
+      commandId,
+      ok: probe.ok,
+      ...(probe.ok ? {} : { error: `dry-run: ${probe.reason}` }),
+      simulated: true,
+    };
   }
 
   private commandRef(command: Command): string | undefined {
@@ -223,5 +248,15 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
   private isAuthorizedConnection(connection: Connection): boolean {
     return (connection.state as { authorized?: boolean } | null)?.authorized === true;
+  }
+
+  // The delivery predicate the coordinator's fail-fast gate consults: the
+  // same precondition sendToExtension relies on, NOT the persisted status
+  // scalar (which a late onClose from a replaced socket can leave stale).
+  private hasAuthorizedConnection(): boolean {
+    for (const connection of this.getConnections()) {
+      if (this.isAuthorizedConnection(connection)) return true;
+    }
+    return false;
   }
 }

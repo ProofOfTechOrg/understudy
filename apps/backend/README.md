@@ -23,9 +23,24 @@ from the `SessionAgent` class name); the Hono app claims everything else, includ
 Command flow: `POST /v1/sessions/:sessionId/commands` → `authenticate` (bearer
 caller token → `{actor, tenantId}`, 401 on failure) → `scopeSession` (verifies the
 sessionId's embedded tenant matches the caller's, 404 on mismatch) → `safeParseCommand`
-(400 on schema failure) → `stub.dispatch()` or, for `fill_secret`, `stub.fillSecret()`
+(400 on an unparseable body or schema failure) → `stub.dispatch()` or, for `fill_secret`, `stub.fillSecret()`
 → the correlated Event is returned as JSON. This order is load-bearing: an
 unauthenticated or cross-tenant request never reaches parsing or dispatch.
+
+Dispatch failures map to status codes by error-message prefix (the only signal
+that survives the DO RPC boundary; the constants live in `src/coordinator.ts`):
+**503** `{error: "extension not connected"}` when the session has no live,
+onConnect-authorized extension socket — the gate consults that delivery
+predicate directly (not the persisted `status` scalar, which a late close from
+a replaced socket can leave stale), fails fast instead of burning the 30s
+timeout, and answers non-2xx deliberately: a 200 `ok:false` Event would be
+cached by a consumer's idempotency store and replayed after reconnect;
+**504** `{error: "command timed out"}` when a connected extension never
+answered; anything else is a uniform JSON **500** via `app.onError`. A real
+`fill_secret` checks the same predicate *before* touching the vault, so no
+plaintext is ever resolved for a command that cannot dispatch. Exception:
+a ref-less dryRun write (e.g. navigate) still short-circuits to simulated
+`ok:true` without touching the wire — it was never a liveness signal.
 
 Inside the DO, `SessionAgent` holds a `CfSessionCoordinator` (the Cloudflare
 implementation of the portable `SessionCoordinator` interface). `send(cmd)` writes
@@ -143,8 +158,10 @@ the connection set during that window. Four things close this gap:
 
 ## Invariants
 
-- Every `Command` produces exactly one `Event` bearing its `commandId`; the
-  command route returns exactly that Event.
+- Every *successfully dispatched* `Command` produces exactly one `Event`
+  bearing its `commandId`, and the command route returns exactly that Event;
+  a command that cannot dispatch or never resolves maps to a non-2xx JSON
+  error instead (503/504/500 — see the failure mapping above).
 - `fill_secret` plaintext never enters `setState`, logs, the Event response, or an
   error string; the coordinator logs only `{commandId, type}`.
 - One Durable Object per `sessionId`; a sessionId whose embedded tenant disagrees
