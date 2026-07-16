@@ -14,6 +14,7 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `tsconfig.json` | TS config (workers-types, bundler resolution, strict) | Adjusting compiler options |
 | `vitest.config.ts` | Workers-pool test config (`@cloudflare/vitest-pool-workers`); imports `./test/tokens` | Adjusting test runner/pool config |
 | `.dev.vars.example` | Template for local `wrangler dev` secrets; matches `stub-consumer.mjs` defaults | Setting up local dev |
+| `.secrets.production.env` | Operator-local backup of the DEPLOYED worker's secrets (gitignored via `.secrets*`; absent in a fresh clone; the worker is canonical) | Recovering/rotating prod secrets — see README "Secrets" |
 | `src/index.ts` | Worker entry: Hono app (`/v1/sessions*`, `/health`) + `routeAgentRequest` with pre-accept WS/HTTP auth hooks (`gateAgentRequest`) + `DispatchOutcome`→status mapping; re-exports `SessionAgent` | Adding/changing a route, changing auth order, changing failure statuses |
 | `src/session.ts` | `SessionAgent` — the per-session Durable Object: WS auth, event routing, `dispatch`/`fillSecret` RPCs (typed `DispatchOutcome`, write-replay cache) | Changing session lifecycle, dryRun behavior, fill_secret dispatch, idempotent replay |
 | `src/coordinator.ts` | `SessionCoordinator` — portable command↔event correlation interface + failure-prefix constants, no Cloudflare imports | Understanding the portable seam, swapping the CF impl |

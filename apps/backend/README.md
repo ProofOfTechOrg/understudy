@@ -249,8 +249,34 @@ curl -s https://understudy-backend.gcharang.workers.dev/health   # {"ok":true}
 printf '%s' 'the-secret' | VAULT_MASTER_KEY=<key> node scripts/vault-put.mjs 'vault://tenant/ref'
 ```
 
-Rotation = re-run the corresponding `wrangler secret put` (tokens are plain
-JSON maps; add/remove entries and re-put). Rotating `VAULT_MASTER_KEY`
-requires re-sealing every stored vault value with `vault-put.mjs`.
 The extension connects to
 `wss://understudy-backend.gcharang.workers.dev/agents/session/<sessionId>?token=<extension-token>`.
+
+### Secrets
+
+All four are **required** — `wrangler deploy` refuses to ship without them
+(`wrangler.jsonc` `secrets.required`, which is also the `.dev.vars` allowlist
+for local dev). Cloudflare stores them encrypted and **never shows a value
+again** after `wrangler secret put`, so the deployed worker is the canonical
+copy and the only readable backup is the operator-local, gitignored
+`apps/backend/.secrets.production.env` (created out of band, never committed —
+`.secrets*` in the root `.gitignore`). Lose that file and a secret can only be
+*rotated*, not recovered.
+
+| secret | what it is | regenerate | rotation impact |
+|---|---|---|---|
+| `AUTH_HMAC_SECRET` | HMAC-SHA256 key signing minted sessionIds (stateless tenant scoping) | `openssl rand -hex 32` | invalidates every outstanding sessionId — consumers must re-mint |
+| `CALLER_TOKENS` | JSON map `bearer token → {actor, tenantId}`; a consumer sends the raw token as `Authorization: Bearer …` | token: `printf 'uk_caller_%s\n' "$(openssl rand -hex 24)"` | the affected consumer swaps its `UNDERSTUDY_TOKEN` |
+| `EXTENSION_TOKENS` | JSON map `WS token → tenantId`; the extension sends the raw token as `?token=…` | token: `printf 'uk_ext_%s\n' "$(openssl rand -hex 24)"` | that user pastes the new WS URL into the extension panel |
+| `VAULT_MASTER_KEY` | base64url 32-byte AES-256-GCM key envelope-encrypting every vault value | `openssl rand 32 \| basenc --base64url \| tr -d '='` | **every stored vault value must be re-sealed** (`vault-put.mjs`) — old envelopes become undecryptable |
+
+**When to rotate:** on suspected exposure of that specific secret, when
+offboarding a tenant/user (edit the relevant JSON map and re-put), or on a
+periodic schedule for the two keys. `CALLER_TOKENS`/`EXTENSION_TOKENS` are
+add/remove-an-entry edits — rotating one caller/extension does not disturb the
+others.
+
+**Re-push after editing the backup file** (from `apps/backend`) — one at a
+time with `wrangler secret put <NAME>`, or all four via the bulk endpoint (the
+`.secrets.production.env` header carries a ready-made env→JSON one-liner that
+pipes into `wrangler secret bulk`).
