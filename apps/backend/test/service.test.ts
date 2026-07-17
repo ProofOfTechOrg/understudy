@@ -285,7 +285,7 @@ describe("command round-trip via a live extension WebSocket", () => {
 describe("fill_secret", () => {
   it("resolves the vault secret and types it via the extension without leaking the plaintext", async () => {
     // #given a seeded vault secret and a connected fake extension
-    await seedVault("vault://pw", "hunter2");
+    await seedVault("vault://tenantA/pw", "hunter2");
     const sessionId = await openSession(CALLER_TOKEN_A);
     const socket = await connectFakeExtension(sessionId);
 
@@ -311,7 +311,7 @@ describe("fill_secret", () => {
         type: "fill_secret",
         commandId: "c2",
         ref: "s1e1",
-        secretRef: "vault://pw",
+        secretRef: "vault://tenantA/pw",
         submit: true,
       });
 
@@ -378,7 +378,7 @@ describe("fill_secret", () => {
         type: "fill_secret",
         commandId: "c3",
         ref: "s1e1",
-        secretRef: "vault://does-not-exist",
+        secretRef: "vault://tenantA/does-not-exist",
       });
 
       // #then it resolves ok:false with a scrubbed error (no secret material)
@@ -402,7 +402,7 @@ describe("fill_secret", () => {
     // #given a RAW (non-envelope) value written straight to KV, as a legacy
     // plaintext row or a value sealed under a rotated key would look at rest
     await (env.VAULT as unknown as { put(key: string, value: string): Promise<void> }).put(
-      "vault://legacy-raw",
+      "vault://tenantA/legacy-raw",
       "legacy-plaintext-not-an-envelope",
     );
     const sessionId = await openSession(CALLER_TOKEN_A);
@@ -415,7 +415,7 @@ describe("fill_secret", () => {
         type: "fill_secret",
         commandId: "c-legacy",
         ref: "s1e1",
-        secretRef: "vault://legacy-raw",
+        secretRef: "vault://tenantA/legacy-raw",
       });
 
       // #then EncryptedKvVault refuses to decrypt it -> the DO's catch returns
@@ -472,7 +472,7 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
   it("dryRun fill_secret performs only a ref check, resolving no secret and typing nothing", async () => {
     // #given a seeded vault secret that must remain untouched, and a connected
     // fake extension whose ref map resolves nothing
-    await seedVault("vault://dry-pw", "should-not-be-read");
+    await seedVault("vault://tenantA/dry-pw", "should-not-be-read");
     const sessionId = await openSession(CALLER_TOKEN_A);
     const socket = await connectFakeExtension(sessionId);
     const messages = answerResolveRefsWith(socket, []);
@@ -483,7 +483,7 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
       const res = await postCommand(
         sessionId,
         CALLER_TOKEN_A,
-        { type: "fill_secret", commandId: "c5", ref: "s1e1", secretRef: "vault://dry-pw" },
+        { type: "fill_secret", commandId: "c5", ref: "s1e1", secretRef: "vault://tenantA/dry-pw" },
         true,
       );
 
@@ -499,7 +499,7 @@ describe("dryRun (DL-011: fail-safe, never dispatches a mutation or resolves a s
       });
 
       // #then the vault was never read for that secretRef, and nothing was ever typed
-      expect(vaultGetSpy).not.toHaveBeenCalledWith("vault://dry-pw");
+      expect(vaultGetSpy).not.toHaveBeenCalledWith("vault://tenantA/dry-pw");
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(messages).toEqual([
         { type: "resolve_ref", commandId: expect.any(String), ref: "s1e1" },
@@ -755,7 +755,7 @@ describe("extension liveness fail-fast", () => {
 
   it("refuses a real fill_secret on a disconnected session WITHOUT touching the vault", async () => {
     // #given a seeded secret and a session with no extension attached
-    await seedVault("vault://gated-pw", "must-stay-unread");
+    await seedVault("vault://tenantA/gated-pw", "must-stay-unread");
     const sessionId = await openSession(CALLER_TOKEN_A);
     const vaultGetSpy = vi.spyOn(env.VAULT, "get");
 
@@ -765,7 +765,7 @@ describe("extension liveness fail-fast", () => {
         type: "fill_secret",
         commandId: "c-fill-no-ext",
         ref: "s1e1",
-        secretRef: "vault://gated-pw",
+        secretRef: "vault://tenantA/gated-pw",
       });
 
       // #then it is refused as 503 and the secret was NEVER resolved - no
@@ -1113,7 +1113,7 @@ describe("idempotent write replay (stable commandId contract)", () => {
 
   it("a retried fill_secret replays the recorded result without touching the vault again", async () => {
     // #given a fill_secret that completed once
-    await seedVault("vault://replay-pw", "hunter2-replay");
+    await seedVault("vault://tenantA/replay-pw", "hunter2-replay");
     const sessionId = await openSession(CALLER_TOKEN_A);
     const socket = await connectFakeExtension(sessionId);
 
@@ -1123,7 +1123,7 @@ describe("idempotent write replay (stable commandId contract)", () => {
         type: "fill_secret",
         commandId: "ik_case1:login:fill",
         ref: "s1e1",
-        secretRef: "vault://replay-pw",
+        secretRef: "vault://tenantA/replay-pw",
       });
       await incoming;
       socket.send(
@@ -1138,7 +1138,7 @@ describe("idempotent write replay (stable commandId contract)", () => {
           type: "fill_secret",
           commandId: "ik_case1:login:fill",
           ref: "s1e1",
-          secretRef: "vault://replay-pw",
+          secretRef: "vault://tenantA/replay-pw",
         });
 
         // #then the recorded result is replayed with zero vault access and
@@ -1230,4 +1230,286 @@ describe("idempotent write replay (stable commandId contract)", () => {
     socket.send(JSON.stringify({ type: "tabs_result", commandId: received.commandId, tabs: [] }));
     return resPromise;
   }
+});
+
+describe("two-tenant vault isolation (cross-tenant secretRef scoping, server-side)", () => {
+  // The command, status, and WS-upgrade isolation axes are already proven
+  // above ("refuses a cross-tenant sessionId as 404", the cross-tenant status
+  // 404, and the WS-gate "cross-tenant upgrade with 404"). This block covers
+  // the remaining axis: understudy owns ONE shared vault across tenants, so it -
+  // not a consumer's breakwater - must refuse tenantB resolving tenantA's
+  // secretRef, even from a session and extension that are legitimately tenantB's.
+
+  it("refuses a cross-tenant secretRef: no vault read, no plaintext on the wire", async () => {
+    // #given tenantA's secret seeded, and tenantB driving its OWN session with
+    // its OWN connected extension - every step legitimate except the ref
+    await seedVault("vault://tenantA/okta-pw", "tenantA-super-secret");
+    const sessionId = await openSession(CALLER_TOKEN_B);
+    const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_B);
+    const received = collectCommands(socket);
+    const rawFrames: string[] = [];
+    socket.addEventListener("message", (event: MessageEvent) => rawFrames.push(event.data as string));
+    const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+
+    try {
+      // #when tenantB fill_secrets tenantA's ref into a field on its own tab
+      const res = await postCommand(sessionId, CALLER_TOKEN_B, {
+        type: "fill_secret",
+        commandId: "x-tenant",
+        ref: "s1e1",
+        secretRef: "vault://tenantA/okta-pw",
+      });
+
+      // #then it collapses to the SAME scrubbed ok:false an absent secret gets -
+      // tenantB cannot tell "not yours" from "does not exist" (DL-008)
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        type: "action_result",
+        commandId: "x-tenant",
+        ok: false,
+        error: "fill_secret: secret could not be resolved",
+      });
+
+      // #then the vault was NEVER read - the tenant guard fires before
+      // resolution, so tenantA's plaintext never materializes (DL-004)
+      expect(vaultGetSpy).not.toHaveBeenCalled();
+
+      // #then nothing was ever dispatched to tenantB's extension: no `type`
+      // command carrying tenantA's secret reached the wire
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+      expect(rawFrames.some((frame) => frame.includes("tenantA-super-secret"))).toBe(false);
+    } finally {
+      vaultGetSpy.mockRestore();
+      socket.close(1000, "done");
+    }
+  });
+
+  it("still resolves a session's OWN-tenant secretRef - the guard scopes, it does not block", async () => {
+    // #given tenantB's own secret seeded and tenantB's session + extension
+    await seedVault("vault://tenantB/okta-pw", "tenantB-own-secret");
+    const sessionId = await openSession(CALLER_TOKEN_B);
+    const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_B);
+
+    try {
+      const incoming = waitForCommand(socket);
+
+      // #when tenantB fill_secrets its OWN ref
+      const commandRes = postCommand(sessionId, CALLER_TOKEN_B, {
+        type: "fill_secret",
+        commandId: "own-tenant",
+        ref: "s1e1",
+        secretRef: "vault://tenantB/okta-pw",
+        submit: true,
+      });
+
+      // #then the resolved secret is typed via tenantB's extension under the
+      // same commandId - own-tenant resolution is unaffected by the guard
+      expect(await incoming).toEqual({
+        type: "type",
+        commandId: "own-tenant",
+        ref: "s1e1",
+        text: "tenantB-own-secret",
+        submit: true,
+      });
+      socket.send(JSON.stringify({ type: "action_result", commandId: "own-tenant", ok: true }));
+
+      const res = await commandRes;
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ type: "action_result", commandId: "own-tenant", ok: true });
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("refuses an unscoped (tenant-less) secretRef even for the owning tenant - scoping is mandatory", async () => {
+    // #given a bare, tenant-less ref seeded (the sloppy vault://<name> shape
+    // the fix outlaws), referenced by its own tenant
+    await seedVault("vault://legacy-unscoped", "would-have-leaked");
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_A);
+    const received = collectCommands(socket);
+    const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+
+    try {
+      // #when the owning tenant references it WITHOUT the vault://<tenant>/ prefix
+      const res = await postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "fill_secret",
+        commandId: "unscoped",
+        ref: "s1e1",
+        secretRef: "vault://legacy-unscoped",
+      });
+
+      // #then it is refused (scrubbed) with no vault read and nothing typed:
+      // tenant scoping is enforced, not merely conventional
+      expect(await res.json()).toEqual({
+        type: "action_result",
+        commandId: "unscoped",
+        ok: false,
+        error: "fill_secret: secret could not be resolved",
+      });
+      expect(vaultGetSpy).not.toHaveBeenCalled();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+    } finally {
+      vaultGetSpy.mockRestore();
+      socket.close(1000, "done");
+    }
+  });
+
+  it("refuses a cross-tenant secretRef before replay - a reused commandId cannot serve a cached own-tenant result", async () => {
+    // #given tenantB completed a legitimate OWN-tenant fill under a commandId
+    // (caching an ok:true write result), and tenantA's secret is also seeded
+    await seedVault("vault://tenantB/own-pw", "tenantB-own");
+    await seedVault("vault://tenantA/okta-pw", "tenantA-super-secret");
+    const sessionId = await openSession(CALLER_TOKEN_B);
+    const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_B);
+
+    try {
+      const incoming = waitForCommand(socket);
+      const firstRes = postCommand(sessionId, CALLER_TOKEN_B, {
+        type: "fill_secret",
+        commandId: "ik_shared:fill",
+        ref: "s1e1",
+        secretRef: "vault://tenantB/own-pw",
+      });
+      await incoming;
+      socket.send(JSON.stringify({ type: "action_result", commandId: "ik_shared:fill", ok: true }));
+      expect(await (await firstRes).json()).toEqual({
+        type: "action_result",
+        commandId: "ik_shared:fill",
+        ok: true,
+      });
+
+      // #when the SAME commandId is retried with tenantA's cross-tenant ref
+      const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+      try {
+        const res = await postCommand(sessionId, CALLER_TOKEN_B, {
+          type: "fill_secret",
+          commandId: "ik_shared:fill",
+          ref: "s1e1",
+          secretRef: "vault://tenantA/okta-pw",
+        });
+
+        // #then the guard (which runs BEFORE replay) refuses it: the cached
+        // ok:true is NOT served, and tenantA's vault is never read
+        expect(await res.json()).toEqual({
+          type: "action_result",
+          commandId: "ik_shared:fill",
+          ok: false,
+          error: "fill_secret: secret could not be resolved",
+        });
+        expect(vaultGetSpy).not.toHaveBeenCalled();
+      } finally {
+        vaultGetSpy.mockRestore();
+      }
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("refuses confusable/edge-shape refs before any vault read - the trailing slash makes the prefix exact", async () => {
+    // #given a tenantA session + extension (own tenant is "tenantA")
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_A);
+    const received = collectCommands(socket);
+    const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+
+    try {
+      // #when refs that look tenant-adjacent but escape the `vault://tenantA/`
+      // prefix are posted: no trailing slash, and a longer confusable tenant
+      for (const secretRef of ["vault://tenantA", "vault://tenantAB/pw"]) {
+        const res = await postCommand(sessionId, CALLER_TOKEN_A, {
+          type: "fill_secret",
+          commandId: `edge-${secretRef}`,
+          ref: "s1e1",
+          secretRef,
+        });
+
+        // #then each is refused (scrubbed) and never reaches the vault
+        expect(await res.json()).toEqual({
+          type: "action_result",
+          commandId: `edge-${secretRef}`,
+          ok: false,
+          error: "fill_secret: secret could not be resolved",
+        });
+      }
+
+      expect(vaultGetSpy).not.toHaveBeenCalled();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+    } finally {
+      vaultGetSpy.mockRestore();
+      socket.close(1000, "done");
+    }
+  });
+
+  it("refuses a cross-tenant secretRef even with NO extension connected - the guard precedes the liveness gate", async () => {
+    // #given tenantB's session with NO extension attached (would 503 at the gate)
+    await seedVault("vault://tenantA/okta-pw", "tenantA-super-secret");
+    const sessionId = await openSession(CALLER_TOKEN_B);
+    const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+
+    try {
+      // #when tenantB posts a cross-tenant fill on the disconnected session
+      const res = await postCommand(sessionId, CALLER_TOKEN_B, {
+        type: "fill_secret",
+        commandId: "x-tenant-no-ext",
+        ref: "s1e1",
+        secretRef: "vault://tenantA/okta-pw",
+      });
+
+      // #then the tenant guard answers first: a scrubbed 200 ok:false, NOT the
+      // 503 the connection gate would give - and no vault read. The refusal is
+      // a pure function of (own tenant, ref), independent of liveness, so the
+      // 200-vs-503 status leaks no cross-tenant existence signal.
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        type: "action_result",
+        commandId: "x-tenant-no-ext",
+        ok: false,
+        error: "fill_secret: secret could not be resolved",
+      });
+      expect(vaultGetSpy).not.toHaveBeenCalled();
+    } finally {
+      vaultGetSpy.mockRestore();
+    }
+  });
+
+  it("dryRun previews the cross-tenant refusal - simulated ok:false, no probe, no vault read", async () => {
+    // #given tenantB's session + extension, with tenantA's secret seeded
+    await seedVault("vault://tenantA/okta-pw", "tenantA-super-secret");
+    const sessionId = await openSession(CALLER_TOKEN_B);
+    const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_B);
+    const received = collectCommands(socket);
+    const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+
+    try {
+      // #when tenantB DRY-RUNs a cross-tenant fill_secret (governance preview)
+      const res = await postCommand(
+        sessionId,
+        CALLER_TOKEN_B,
+        { type: "fill_secret", commandId: "x-dry", ref: "s1e1", secretRef: "vault://tenantA/okta-pw" },
+        true,
+      );
+
+      // #then the simulation honestly previews the refusal the real call would
+      // give (simulated ok:false), sends NO resolve_ref probe to the extension,
+      // and never reads the vault - dryRun and real agree on the tenant axis
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        type: "action_result",
+        commandId: "x-dry",
+        ok: false,
+        error: "dry-run: secret could not be resolved",
+        simulated: true,
+      });
+      expect(vaultGetSpy).not.toHaveBeenCalled();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+    } finally {
+      vaultGetSpy.mockRestore();
+      socket.close(1000, "done");
+    }
+  });
 });

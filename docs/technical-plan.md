@@ -438,8 +438,15 @@ auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer t
   replay (see above); onClose status stamping gated on authorization; **first real deploy** to
   `https://understudy-backend.gcharang.workers.dev` with real minted secrets (runbook in
   `apps/backend/README.md` "Deploy") — live smoke: health, 401, mint, fail-fast 503, WS-gate 401,
-  encrypted vault seed all verified. Still open under M5: two-tenant isolation e2e, dialog
-  handling breadth, session/GIF audit logging.
+  encrypted vault seed all verified. **Two-tenant isolation e2e LANDED
+  (2026-07-17):** closing it surfaced a real cross-tenant vault-read gap —
+  `fillSecret` resolved any caller-supplied `secretRef` with no tenant scoping, so
+  tenantB (driving its own session) could exfiltrate `vault://tenantA/…` plaintext.
+  Fixed server-side (`auth.ts::tenantOf` + a `vault://<tenantId>/…` namespace guard
+  in `fillSecret`, before any vault read; scrubbed `ok:false`, no existence oracle);
+  proven by `test/service.test.ts` "two-tenant vault isolation" (session/status/WS
+  axes were already covered). Still open under M5: dialog handling breadth,
+  session/GIF audit logging.
 - **M6 — Ops.** Rate/quotas at the service edge, observability, unattended-session seam scoping.
 
 ## Verification

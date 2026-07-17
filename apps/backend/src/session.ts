@@ -2,7 +2,7 @@ import { Agent } from "agents";
 import type { AgentContext, Connection, ConnectionContext, WSMessage } from "agents";
 import { isWriteCommand, safeParseEvent } from "@understudy/protocol";
 import type { Command, Event } from "@understudy/protocol";
-import { scopeSession, verifyExtensionToken } from "./auth";
+import { scopeSession, tenantOf, verifyExtensionToken } from "./auth";
 import {
   COMMAND_TIMED_OUT,
   DUPLICATE_COMMAND,
@@ -181,10 +181,37 @@ export class SessionAgent extends Agent<Env, SessionState> {
   async fillSecret(cmd: FillSecretCommand, dryRun?: boolean): Promise<DispatchOutcome> {
     try {
       if (dryRun === true) {
+        // A dry-run the real call would refuse for tenant scoping simulates
+        // that refusal (before the DOM ref probe), so a governance pre-approval
+        // preview is honest rather than reporting ok:true for a fill that can
+        // never dispatch. Still zero vault access and no wire traffic:
+        // secretRefInTenant only reads the signed sessionId (this.name).
+        if (!(await this.secretRefInTenant(cmd.secretRef))) {
+          return {
+            ok: true,
+            event: this.simulatedResult(cmd.commandId, {
+              ok: false,
+              reason: "secret could not be resolved",
+            }),
+          };
+        }
         return {
           ok: true,
           event: this.simulatedResult(cmd.commandId, await this.checkRefResolves(cmd.ref)),
         };
+      }
+
+      // Tenant scoping FIRST, before replay/gate/vault: a secretRef resolves
+      // only within this session's OWN tenant, derived from the HMAC-signed
+      // sessionId (this.name) - never a caller claim - so tenantB driving its
+      // own session can never read vault://tenantA/... understudy owns one
+      // shared vault across tenants, so this check lives here, not in a
+      // consumer's breakwater. A ref outside the tenant namespace collapses to
+      // the SAME scrubbed ok:false an absent secret returns: no vault read, no
+      // dispatch, and no oracle telling "not yours" from "does not exist"
+      // (DL-008).
+      if (!(await this.secretRefInTenant(cmd.secretRef))) {
+        return { ok: true, event: this.unresolvableSecretResult(cmd.commandId) };
       }
 
       // Replay BEFORE the connection gate and the vault: a retry of an
@@ -207,15 +234,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
       try {
         secret = await resolveSecret(createVault(this.env), cmd.secretRef);
       } catch {
-        return {
-          ok: true,
-          event: {
-            type: "action_result",
-            commandId: cmd.commandId,
-            ok: false,
-            error: "fill_secret: secret could not be resolved",
-          },
-        };
+        return { ok: true, event: this.unresolvableSecretResult(cmd.commandId) };
       }
 
       const event = await this.coordinator.send({
@@ -230,6 +249,37 @@ export class SessionAgent extends Agent<Env, SessionState> {
     } catch (err) {
       return this.dispatchFailure(err);
     }
+  }
+
+  /**
+   * Whether `secretRef` lives in this session's own tenant namespace. The
+   * tenant is the one HMAC-signed into the sessionId (this.name) - the same
+   * authoritative source onConnect scopes the socket against - so it cannot be
+   * forged by a caller. Vault keys are canonically `vault://<tenantId>/<name>`
+   * (README "Design decisions"). tenantOf only returns a `/`-free, non-empty
+   * tenant (auth.ts::isValidTenantId), so the trailing slash makes the prefix
+   * exact and unambiguous: tenant "acme" reaches neither "acme-corp"'s nor a
+   * hypothetical "acme/eu"'s keys.
+   */
+  private async secretRefInTenant(secretRef: string): Promise<boolean> {
+    const tenant = await tenantOf(this.name, this.env);
+    return tenant !== null && secretRef.startsWith(`vault://${tenant}/`);
+  }
+
+  /**
+   * The one scrubbed ok:false a fill_secret returns when the secret cannot be
+   * produced - whether the ref is outside the caller's tenant, absent, or
+   * undecryptable. Byte-identical across those causes on purpose: the caller
+   * (and an attacker) learns only "could not be resolved", never which
+   * (DL-008), and no secret material appears in it (DL-004).
+   */
+  private unresolvableSecretResult(commandId: string): Event {
+    return {
+      type: "action_result",
+      commandId,
+      ok: false,
+      error: "fill_secret: secret could not be resolved",
+    };
   }
 
   /**

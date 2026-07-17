@@ -27,10 +27,12 @@
  *
  * `type` and `click` target the first ref found in the snapshot's a11y tree
  * (a naive "first element" heuristic - fine for a demo/runbook, not real
- * ref-targeting logic). `fill_secret` deliberately uses a fake vault://
- * secretRef that no vault will ever resolve, so it is expected to return
- * ok:false - demonstrating the scrubbed-error path, not a broken script. A
- * stale/unresolvable ref for any command is likewise expected to return
+ * ref-targeting logic). `fill_secret` deliberately uses a fake, tenant-scoped
+ * secretRef (`vault://dev-tenant/…`) the vault has no value for, so it is
+ * expected to return ok:false - demonstrating the scrubbed-error path, not a
+ * broken script. (fillSecret enforces `vault://<tenantId>/…` scoping: a ref
+ * outside the caller's own tenant is refused with the same scrubbed ok:false.)
+ * A stale/unresolvable ref for any command is likewise expected to return
  * ok:false, not to fail the run.
  *
  * Env vars / flags (all optional; flags win, then env vars, then defaults):
@@ -139,8 +141,10 @@ async function main() {
     type: "fill_secret",
     commandId: "stub-4",
     ref: targetRef,
-    // Deliberately fake and unresolvable - see the header comment.
-    secretRef: "vault://stub-consumer-fake-secret",
+    // Deliberately fake and unresolvable - see the header comment. Scoped to
+    // the default dev tenant so it exercises the vault-miss path; a ref outside
+    // the caller's tenant is refused with the same scrubbed ok:false.
+    secretRef: "vault://dev-tenant/stub-consumer-fake-secret",
   });
 
   console.log("\ndone.");

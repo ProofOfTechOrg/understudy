@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import type { Env } from "../src/types";
+import { base64urlEncode } from "../src/base64url";
 import {
   authenticate,
+  isValidTenantId,
   mintSessionId,
   scopeSession,
+  tenantOf,
   verifyExtensionToken,
   type Actor,
 } from "../src/auth";
@@ -40,6 +43,26 @@ function tamperSessionId(sessionId: string, part: "payload" | "sig"): string {
   const payload = sessionId.slice(0, dot);
   const sig = sessionId.slice(dot + 1);
   return part === "payload" ? `${flipChar(payload)}.${sig}` : `${payload}.${flipChar(sig)}`;
+}
+
+/**
+ * Mirrors mintSessionId's signing but WITHOUT its isValidTenantId guard, to
+ * forge a genuinely valid-signature sessionId carrying a tenant mint would now
+ * refuse. This is the only way to reach tenantOf's shape re-check with a real
+ * signature (a legacy id from before the rule, or a hypothetical second signer)
+ * - a tampered id would fail the HMAC check first and never prove the re-check.
+ */
+async function forgeSessionId(tenantId: string, env: Env): Promise<string> {
+  const payloadBytes = new TextEncoder().encode(JSON.stringify({ t: tenantId, n: "0".repeat(32) }));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.AUTH_HMAC_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, payloadBytes);
+  return `${base64urlEncode(payloadBytes)}.${base64urlEncode(new Uint8Array(sig))}`;
 }
 
 describe("mintSessionId / scopeSession", () => {
@@ -85,6 +108,69 @@ describe("mintSessionId / scopeSession", () => {
     expect(first).not.toBe(second);
     expect(await scopeSession(first, "tenantA", env)).toBe("ok");
     expect(await scopeSession(second, "tenantA", env)).toBe("ok");
+  });
+
+  it.each(["acme/eu", "", "/", "a/b"])(
+    "refuses to mint a sessionId for an unsafe tenantId %j (empty or slash-bearing would straddle the vault namespace)",
+    async (badTenant) => {
+      const env = makeEnv();
+      await expect(mintSessionId(badTenant, env)).rejects.toThrow(/invalid tenantId/);
+    },
+  );
+});
+
+describe("isValidTenantId", () => {
+  it.each(["tenantA", "acme-corp", "a", "t_123"])("accepts a flat, non-empty slug %j", (t) => {
+    expect(isValidTenantId(t)).toBe(true);
+  });
+
+  it.each(["", "acme/eu", "/", "a/b/c"])(
+    "rejects an empty or slash-bearing tenantId %j - it must not straddle a vault://<tenant>/ prefix",
+    (t) => {
+      expect(isValidTenantId(t)).toBe(false);
+    },
+  );
+});
+
+describe("tenantOf", () => {
+  it("returns the tenant a sessionId was minted for (the authoritative source a DO scopes on)", async () => {
+    const env = makeEnv();
+    const sessionId = await mintSessionId("tenantA", env);
+    expect(await tenantOf(sessionId, env)).toBe("tenantA");
+  });
+
+  it("returns null for a tampered signature - a forged id yields no tenant", async () => {
+    const env = makeEnv();
+    const sessionId = await mintSessionId("tenantA", env);
+    expect(await tenantOf(tamperSessionId(sessionId, "sig"), env)).toBeNull();
+  });
+
+  it("returns null for a tampered payload", async () => {
+    const env = makeEnv();
+    const sessionId = await mintSessionId("tenantA", env);
+    expect(await tenantOf(tamperSessionId(sessionId, "payload"), env)).toBeNull();
+  });
+
+  it.each(["", "garbage", "a.b.c"])(
+    "returns null for a malformed sessionId %j without throwing",
+    async (malformed) => {
+      const env = makeEnv();
+      await expect(tenantOf(malformed, env)).resolves.toBeNull();
+    },
+  );
+
+  it("returns null for a VALIDLY-signed id carrying a slash-bearing tenant (the re-check mint cannot cover)", async () => {
+    // #given a genuinely HMAC-valid id whose tenant `mintSessionId` would refuse
+    // (forged around mint - stands in for a legacy id or an alternate signer)
+    const env = makeEnv();
+    const forged = await forgeSessionId("acme/eu", env);
+
+    // #then tenantOf rejects it via the isValidTenantId re-check, NOT an HMAC
+    // failure - proven by the control below, where the SAME forging path with a
+    // valid tenant is accepted (so the signature is genuinely good)
+    expect(await tenantOf(forged, env)).toBeNull();
+    expect(await scopeSession(forged, "acme/eu", env)).toBe("not-found");
+    expect(await tenantOf(await forgeSessionId("acme", env), env)).toBe("acme");
   });
 });
 
