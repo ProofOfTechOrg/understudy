@@ -1,6 +1,6 @@
 {
   "name": "@understudy/connector",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Reference @proofoftech/breakwater connectors for the understudy browser-execution service: observe / act / fill_credential, approval-gated via flowsafe grants",
   "main": "./dist/index.js",
