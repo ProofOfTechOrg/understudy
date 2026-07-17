@@ -251,7 +251,10 @@ The hard problem. Approach (matches Playwright / chrome-devtools-mcp):
 > **Milestone 0 confirmed this surface on 2026-07-13 — see "M0 findings".** `Target.getTargets` is
 > restricted under `chrome.debugger` (`"Not allowed"`); tab enumeration/switching is backed by the
 > WebExtensions `chrome.tabs.*` API (not CDP), and per-tab attach uses `chrome.debugger.attach({ tabId })`.
-> This was the one real technical risk of the CDP approach; it is now retired.
+> This was the one real technical risk of the CDP approach; it is now retired. The one sub-question it
+> deferred — cross-origin-iframe (OOPIF) auto-attach via `Target.setAutoAttach{ flatten: true }` — probed
+> **green on 2026-07-17 (Chrome 150)**: the iframe attached and was driven through its own `sessionId`
+> (see "M0 findings").
 
 ## M0 findings — CDP surface + a11y ref-model confirmed (2026-07-13)
 
@@ -286,16 +289,33 @@ feeds its LLM. D7 confirmed end-to-end.
   only their extension-side *implementation* is pinned here.
 - v1 scope is a single designated tab/session anyway (see "Out of scope").
 
-**One sub-question deferred at M0, probe SHIPPED at M5 (2026-07-17):** cross-origin /
+**One sub-question deferred at M0, probe RUN GREEN at M5 (2026-07-17):** cross-origin /
 out-of-process iframe (OOPIF) traversal via `Target.setAutoAttach{ flatten: true }` (a *different*
-`Target` method than the blocked `getTargets`, generally permitted under `chrome.debugger`).
-`apps/cdp-spike` now carries a focused **OOPIF probe** (side-panel button + bundled
+`Target` method than the blocked `getTargets`, and — now confirmed — permitted under `chrome.debugger`).
+`apps/cdp-spike` carries a focused **OOPIF probe** (side-panel button + bundled
 `oopif-test.html` cross-origin-iframe page + runbook in its README): it runs `setAutoAttach`,
 collects `Target.attachedToTarget` events, and drives each attached target through session-scoped
-`sendCommand({tabId, sessionId}, …)` (`Runtime.evaluate` + `Accessibility.getFullAXTree`). The
-probe is attended (~5 min, real Chromium ≥125) and has not been run yet; record its verdict here
-when it runs. Driver implementation in `apps/extension` stays gated on a green probe AND a
-consumer actually needing cross-origin-iframe targeting — the single-frame path is proven.
+`sendCommand({tabId, sessionId}, …)` (`Runtime.evaluate` + `Accessibility.getFullAXTree`).
+
+**Verdict: PASS — auto-attach works, session routing works; the deferred unknown is retired.** Run
+2026-07-17, attended, on **Chrome 150.0.7871.114 (64-bit)** (≥125), against the bundled `oopif-test.html`
+(a `file://` top frame embedding a cross-site `https://example.org` iframe). Probe summary verbatim:
+*"OOPIF auto-attach WORKS: 1 iframe target(s) attached and driven via session-scoped commands."* Evidence
+it drove the **iframe**, not the top frame:
+- `Target.setAutoAttach { flatten: true }` — **OK** (the target-discovery capability `getTargets` is blocked for is permitted here);
+- `Target.attachedToTarget` announced `iframe https://example.org/`;
+- `Runtime.evaluate` via the iframe's `sessionId` returned `https://example.org/` — **not** the
+  `file://…/oopif-test.html` top-frame URL;
+- `Accessibility.getFullAXTree` via that `sessionId` returned the iframe's **isolated** 15-node tree
+  (`heading:Example Domain, link:Learn more`), **without** the top frame's `top-frame button` — which the
+  top frame's own 34-node tree did contain. Same tab, two `sessionId`s, two isolated frames driven
+  independently: exactly the session routing the real driver needs.
+
+The same run re-confirmed the M0 baseline unchanged — 10/11 CDP commands OK, `Target.getTargets` still
+`{ code: -32000, message: "Not allowed" }` — so the restriction that motivated the deferral persists and
+`setAutoAttach` sidesteps it. **Cross-frame driver work in `apps/extension` is now unblocked, but stays
+gated on a consumer actually needing cross-origin-iframe targeting** — the single-frame path remains the
+proven default; nothing is built on OOPIF until a consumer requires it.
 
 ## Consumer integration — the governed connector (breakwater + flowsafe)
 
