@@ -8,7 +8,7 @@
  * state have exactly one definition each.
  */
 
-import type { Event, TabInfo } from "@understudy/protocol";
+import type { DialogRecord, Event, TabInfo } from "@understudy/protocol";
 import type { SessionAgent } from "./session";
 
 /**
@@ -17,6 +17,13 @@ import type { SessionAgent } from "./session";
  * re-declared, so a wire-shape change to hello is felt here automatically.
  */
 type HelloBrowserInfo = Pick<Extract<Event, { type: "hello" }>, "browser" | "extVersion">;
+
+/**
+ * A page dialog the extension handled, as recorded in DO state and surfaced via
+ * GET /v1/sessions/:id. Re-exported from the protocol (DialogRecordSchema) so
+ * the DO-state shape and the wire `dialog` Event share exactly one definition.
+ */
+export type { DialogRecord };
 
 /**
  * The credential-vault seam that secrets.ts (M-007) resolves fill_secret's
@@ -93,6 +100,18 @@ export interface SessionState {
    * the DL-004 construction (fill_secret results carry ok/error only).
    */
   completedWrites: { commandId: string; event: Event }[];
+  /**
+   * Recent page dialogs the extension handled (alert/confirm/prompt/
+   * beforeunload), oldest first, capped in session.ts. Surfaced to the consumer
+   * via GET /v1/sessions/:id so an agent/governance layer sees what a page said
+   * and how it was auto-answered. An after-the-fact record, not a response
+   * channel: dialogs are answered synchronously extension-side (an open dialog
+   * blocks the CDP channel), never by a consumer round-trip. BEST-EFFORT and
+   * capped: a report emitted while the WS is momentarily down is not replayed
+   * (the dialog is still answered; only its notification is lost), so this is an
+   * observability surface, not a guaranteed audit log.
+   */
+  dialogs: DialogRecord[];
 }
 
 /**

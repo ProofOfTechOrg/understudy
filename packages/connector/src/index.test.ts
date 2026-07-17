@@ -205,6 +205,43 @@ describe("observe (read - no grant, no idempotency)", () => {
       observeRead({ type: "get_tabs" }, { type: "action_result", commandId: "c1", ok: true }),
     ).rejects.toThrow(/unexpected event 'action_result' for read 'get_tabs'/);
   });
+
+  it("get_dialogs returns the recent dialogs from the session status", async () => {
+    const dialogs = [
+      {
+        tabId: 3,
+        dialogType: "confirm",
+        message: "Delete this item?",
+        url: "https://portal.example/items/1",
+        disposition: "dismiss",
+      },
+    ];
+    // get_dialogs reads a status object from GET /v1/sessions/:id, not a command Event
+    const out = await observeRead(
+      { type: "get_dialogs" },
+      { status: "connected", browser: null, tabs: [], currentUrl: null, dialogs },
+    );
+    expect(out).toEqual({ dialogs });
+  });
+
+  it("get_dialogs issues a bearer-authed GET to /v1/sessions/:id with no command body", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(eventResponse({ status: "pending", tabs: [], dialogs: [] }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { observe } = createBrowserConnectors(ENV, stores());
+
+    await callConnector(observe, { sessionId: "s-1", read: { type: "get_dialogs" } }, undefined);
+
+    const [url, init] = fetchSpy.mock.calls[0] as [
+      string,
+      { method?: string; headers: Record<string, string>; body?: unknown },
+    ];
+    expect(url).toBe("https://understudy.example.com/v1/sessions/s-1");
+    expect(init.method).toBe("GET");
+    expect(init.headers.authorization).toBe("Bearer caller-token-1");
+    expect(init.body).toBeUndefined();
+  });
 });
 
 describe("fill_credential (vaulted write)", () => {
@@ -285,6 +322,29 @@ describe("service bridge hardening", () => {
     await expect(
       callConnector(observe, { sessionId: "s-1", read: { type: "get_tabs" } }, undefined),
     ).rejects.toThrow();
+  });
+
+  it("get_dialogs throws status-only on an HTTP error - the status body is never echoed", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(eventResponse({ error: "unauthorized", detail: "S3CRET-DETAIL" }, 401)),
+    );
+    const { observe } = createBrowserConnectors(ENV, stores());
+
+    const failure = callConnector(observe, { sessionId: "s-1", read: { type: "get_dialogs" } }, undefined);
+    await expect(failure).rejects.toThrow(/understudy service 401 for session s-1/);
+    await expect(failure).rejects.not.toThrow(/S3CRET-DETAIL/);
+  });
+
+  it("get_dialogs rejects a status payload missing the dialogs array (older deploy) - fails loud", async () => {
+    // A 200 status without `dialogs` fails the schema rather than silently
+    // returning undefined, mirroring the command path's parseEvent discipline.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(eventResponse({ status: "connected", tabs: [] })));
+    const { observe } = createBrowserConnectors(ENV, stores());
+
+    await expect(
+      callConnector(observe, { sessionId: "s-1", read: { type: "get_dialogs" } }, undefined),
+    ).rejects.toThrow(/unparseable status for session s-1/);
   });
 
   it("denies the 61st act execution in a fixed rate window", async () => {

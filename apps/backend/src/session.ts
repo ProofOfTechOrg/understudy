@@ -21,6 +21,10 @@ type FillSecretCommand = Extract<Command, { type: "fill_secret" }>;
 // while covering far more retries than a consumer's per-case write count.
 const COMPLETED_WRITES_CAP = 100;
 
+// Bounds SessionState.dialogs (the recent-dialogs surface). Dialogs are far
+// rarer than writes; 50 recent covers any realistic burst a consumer polls for.
+const RECENT_DIALOGS_CAP = 50;
+
 export class SessionAgent extends Agent<Env, SessionState> {
   initialState: SessionState = {
     browser: null,
@@ -30,6 +34,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     awaitingCommandIds: [],
     status: "pending",
     completedWrites: [],
+    dialogs: [],
   };
 
   private readonly coordinator: CfSessionCoordinator;
@@ -134,6 +139,9 @@ export class SessionAgent extends Agent<Env, SessionState> {
         return;
       case "page_event":
         this.setState({ ...this.state, currentUrl: ev.url });
+        return;
+      case "dialog":
+        this.rememberDialog(ev);
         return;
     }
   }
@@ -328,17 +336,35 @@ export class SessionAgent extends Agent<Env, SessionState> {
     return this.state.completedWrites ?? [];
   }
 
+  /** Records a handled page dialog (capped) for the GET /v1/sessions/:id surface. */
+  private rememberDialog(ev: Extract<Event, { type: "dialog" }>): void {
+    // Strip only the wire discriminator: object-rest yields exactly DialogRecord
+    // (preserving defaultPrompt's presence/absence), so a new protocol dialog
+    // field persists automatically - no hand-copied field list to drift.
+    const { type: _type, ...record } = ev;
+    const next = [...this.dialogs(), record];
+    while (next.length > RECENT_DIALOGS_CAP) next.shift();
+    this.setState({ ...this.state, dialogs: next });
+  }
+
+  // Persisted before this field existed, a session's state can lack it.
+  private dialogs(): SessionState["dialogs"] {
+    return this.state.dialogs ?? [];
+  }
+
   async getStatus(): Promise<{
     status: SessionStatus;
     browser: SessionState["browser"];
     tabs: SessionState["tabs"];
     currentUrl: string | null;
+    dialogs: SessionState["dialogs"];
   }> {
     return {
       status: this.state.status,
       browser: this.state.browser,
       tabs: this.state.tabs,
       currentUrl: this.state.currentUrl,
+      dialogs: this.dialogs(),
     };
   }
 

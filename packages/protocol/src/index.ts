@@ -37,6 +37,34 @@ export type TabInfo = z.infer<typeof TabInfoSchema>;
 export const SnapshotModeSchema = z.enum(["a11y", "dom", "screenshot"]);
 export type SnapshotMode = z.infer<typeof SnapshotModeSchema>;
 
+// A JavaScript dialog the page raised (alert/confirm/prompt) or a
+// navigation-guard prompt (beforeunload). The extension handles each locally
+// and synchronously - an open dialog blocks the single CDP channel, so there
+// is no time to round-trip to the consumer for a decision - then reports what
+// happened via the `dialog` Event below.
+export const DialogTypeSchema = z.enum(["alert", "confirm", "prompt", "beforeunload"]);
+export type DialogType = z.infer<typeof DialogTypeSchema>;
+
+// How the extension answered the dialog: accept (OK / proceed) or dismiss
+// (Cancel / stay). The default policy is type-aware (see the extension's
+// dialogDisposition): alert/beforeunload accept, confirm/prompt dismiss.
+export const DialogDispositionSchema = z.enum(["accept", "dismiss"]);
+export type DialogDisposition = z.infer<typeof DialogDispositionSchema>;
+
+// The reportable payload of a handled dialog, minus the wire `type`
+// discriminator. Single-sourced here so the `dialog` Event member below, the
+// backend's DO-state record, and the connector's runtime validator all derive
+// from ONE definition - no hand-copied field lists to drift apart.
+export const DialogRecordSchema = z.object({
+  tabId: z.number(),
+  dialogType: DialogTypeSchema,
+  message: z.string(),
+  url: z.string(),
+  defaultPrompt: z.string().optional(),
+  disposition: DialogDispositionSchema,
+});
+export type DialogRecord = z.infer<typeof DialogRecordSchema>;
+
 // ── Commands: backend → extension ────────────────────────────────────────────
 // Every command carries a `commandId` used to correlate the async round-trip
 // (the coordinator parks a promise keyed by it; the matching event resolves it).
@@ -166,6 +194,13 @@ export const EventSchema = z.discriminatedUnion("type", [
     tabId: z.number(),
     url: z.string(),
   }),
+  // Unsolicited (like page_event): the extension emits one after it locally
+  // handles a page dialog, so the consumer learns what the page said and how it
+  // was answered. `defaultPrompt` is present only for `prompt` dialogs. This is
+  // BEST-EFFORT (like page_event): a report emitted while the WS is momentarily
+  // down (e.g. an MV3 service-worker reconnect) is not replayed - the dialog is
+  // still answered, only its notification is lost.
+  z.object({ type: z.literal("dialog"), ...DialogRecordSchema.shape }),
   z.object({ type: z.literal("pong") }),
 ]);
 export type Event = z.infer<typeof EventSchema>;

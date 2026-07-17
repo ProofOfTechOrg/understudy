@@ -207,6 +207,7 @@ describe("GET /v1/sessions/:sessionId", () => {
       browser: null,
       tabs: [],
       currentUrl: null,
+      dialogs: [],
     });
   });
 
@@ -1509,6 +1510,103 @@ describe("two-tenant vault isolation (cross-tenant secretRef scoping, server-sid
       expect(received).toEqual([]);
     } finally {
       vaultGetSpy.mockRestore();
+      socket.close(1000, "done");
+    }
+  });
+});
+
+describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", () => {
+  /** Bounded poll until the session has recorded at least `n` dialogs. */
+  async function waitForDialogs(sessionId: string, n: number): Promise<void> {
+    const stub = await getSessionStub(sessionId);
+    for (let i = 0; i < 100; i++) {
+      if ((await stub.getStatus()).dialogs.length >= n) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`session never accumulated ${n} dialog(s)`);
+  }
+
+  it("records a handled dialog and returns it verbatim in the session status", async () => {
+    // #given a connected fake extension
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_A);
+
+    try {
+      // #when the extension reports a dialog it handled locally (as the real
+      // one does right after answering it)
+      socket.send(
+        JSON.stringify({
+          type: "dialog",
+          tabId: 3,
+          dialogType: "confirm",
+          message: "Delete this item?",
+          url: "https://portal.example/items/1",
+          disposition: "dismiss",
+        }),
+      );
+
+      // #then it surfaces verbatim in the owning tenant's session status
+      await waitForDialogs(sessionId, 1);
+      const res = await exports.default.fetch(
+        authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A),
+      );
+      const status = (await res.json()) as { dialogs: unknown[] };
+      expect(status.dialogs).toEqual([
+        {
+          tabId: 3,
+          dialogType: "confirm",
+          message: "Delete this item?",
+          url: "https://portal.example/items/1",
+          disposition: "dismiss",
+        },
+      ]);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("keeps a prompt's defaultPrompt and preserves arrival order across dialogs", async () => {
+    // #given a connected fake extension
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_A);
+
+    try {
+      // #when two dialogs are reported in order (an alert then a prompt)
+      socket.send(
+        JSON.stringify({
+          type: "dialog",
+          tabId: 1,
+          dialogType: "alert",
+          message: "Saved",
+          url: "https://x/",
+          disposition: "accept",
+        }),
+      );
+      socket.send(
+        JSON.stringify({
+          type: "dialog",
+          tabId: 1,
+          dialogType: "prompt",
+          message: "Name?",
+          url: "https://x/",
+          defaultPrompt: "guest",
+          disposition: "dismiss",
+        }),
+      );
+
+      // #then both surface oldest-first; the prompt keeps its defaultPrompt and
+      // the alert (which had none) omits the field entirely
+      await waitForDialogs(sessionId, 2);
+      const res = await exports.default.fetch(
+        authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A),
+      );
+      const status = (await res.json()) as {
+        dialogs: Array<{ dialogType: string; defaultPrompt?: string }>;
+      };
+      expect(status.dialogs.map((d) => d.dialogType)).toEqual(["alert", "prompt"]);
+      expect(status.dialogs[1]).toMatchObject({ dialogType: "prompt", defaultPrompt: "guest" });
+      expect(status.dialogs[0]).not.toHaveProperty("defaultPrompt");
+    } finally {
       socket.close(1000, "done");
     }
   });

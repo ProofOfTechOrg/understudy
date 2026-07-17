@@ -282,3 +282,48 @@ describe("hello resync", () => {
     });
   });
 });
+
+describe("dialog recording (onMessage → SessionState.dialogs)", () => {
+  function dialogEvent(message: string): string {
+    return JSON.stringify({
+      type: "dialog",
+      tabId: 1,
+      dialogType: "alert",
+      message,
+      url: "https://x/",
+      disposition: "accept",
+    });
+  }
+
+  it("caps recent dialogs at 50, evicting oldest-first", async () => {
+    // #given a session that handled 51 dialogs
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      for (let i = 0; i < 51; i++) {
+        await instance.onMessage(FAKE_CONNECTION, dialogEvent(`d${i}`));
+      }
+    });
+
+    // #then only the most recent 50 remain, oldest (d0) evicted, order preserved
+    const status = await stub.getStatus();
+    expect(status.dialogs).toHaveLength(50);
+    expect(status.dialogs[0]?.message).toBe("d1");
+    expect(status.dialogs[49]?.message).toBe("d50");
+  });
+
+  it("ignores a dialog event from an unauthorized connection", async () => {
+    // #given a fresh session and a connection that never passed onConnect's auth
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    const { connection: unauthorized } = fakeConnection(null);
+
+    // #when that connection sends a dialog event
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      await instance.onMessage(unauthorized, dialogEvent("spoofed"));
+    });
+
+    // #then nothing is recorded - onMessage's auth gate drops it before the switch
+    expect((await stub.getStatus()).dialogs).toEqual([]);
+  });
+});

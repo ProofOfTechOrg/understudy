@@ -22,7 +22,7 @@ WXT + React MV3 extension driving protocol Commands into a real Chromium tab via
 | `src/driver/keymap.ts` | `parseKeys` — key-spec string → CDP `Input.dispatchKeyEvent` fields | Adding a named key or modifier alias |
 | `src/driver/keymap.test.ts` | Unit tests for `parseKeys` (modifiers, named keys, printable chars) | Verifying key-spec parsing |
 | `src/driver/cdp-events.ts` | `classifyCdpEvent` — raw CDP event → effects decision (`CdpDecision`) | Handling a new CDP event type, changing navigation/dialog handling |
-| `src/driver/cdp-events.test.ts` | Unit tests for `classifyCdpEvent` (main-frame filter, load URL, generation bumps, dialog dismiss) | Verifying CDP event classification |
+| `src/driver/cdp-events.test.ts` | Unit tests for `classifyCdpEvent` + `dialogDisposition` (main-frame filter, load URL, generation bumps, per-type dialog disposition) | Verifying CDP event classification |
 | `src/driver/cdp.ts` | `CdpSession` — FIFO-queued `chrome.debugger` channel; executors for every protocol Command (`snapshotA11y`, `screenshot`, `click`, `type`, `key`, `scroll`, `wait`, `navigate`, `resolveRefCheck`) | Adding/changing a command executor, debugging a CDP call |
 | `src/driver/cdp.test.ts` | Unit tests for `resolveRefCheck` — the dry-run probe's no-snapshot/no-generation-bump invariant | Changing resolveRefCheck or the ref/generation model |
 | `src/core/ws-client.ts` | `ReconnectingWs` — WebSocket with backoff reconnect and self-driven pong heartbeat | Changing reconnect/backoff/heartbeat behavior |

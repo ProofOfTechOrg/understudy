@@ -4,7 +4,7 @@ import { ReconnectingWs } from "../core/ws-client";
 import { WriteDedupe } from "../core/dedupe";
 import { routeCommand } from "../core/router";
 import { CdpSession } from "../driver/cdp";
-import { classifyCdpEvent } from "../driver/cdp-events";
+import { applyDialogDecision, classifyCdpEvent } from "../driver/cdp-events";
 import { errorMessage } from "../events";
 import { queryTabInfos } from "../tabs";
 import type {
@@ -230,10 +230,21 @@ async function onCdpEvent(
         url: decision.pageEvent.url,
       });
     }
-    if (decision.dismissDialog === true) {
-      // Auto-dismiss so a page dialog does not wedge the single CDP channel.
-      await active.send("Page.handleJavaScriptDialog", { accept: false });
-      log("auto-dismissed page dialog");
+    if (decision.dialog !== undefined) {
+      // Answer synchronously so a page dialog cannot wedge the single CDP
+      // channel, then report it to the consumer fire-and-forget (like
+      // page_event) - the consumer is never in the response path. The
+      // answer-before-report ordering lives in applyDialogDecision (tested).
+      await applyDialogDecision(
+        decision.dialog,
+        (accept) => active.send("Page.handleJavaScriptDialog", { accept }),
+        (event) => ws?.send({ type: "dialog", tabId: active.tabId, ...event }),
+      );
+      log(
+        `handled ${decision.dialog.event?.dialogType ?? "unknown"} dialog: ${
+          decision.dialog.accept ? "accept" : "dismiss"
+        }`,
+      );
     }
   } catch (cause) {
     log(`cdp event (${method}) failed: ${errorMessage(cause)}`, "error");

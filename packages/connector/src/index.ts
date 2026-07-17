@@ -35,6 +35,8 @@ import {
 import {
   A11yNodeSchema,
   type Command,
+  type DialogRecord,
+  DialogRecordSchema,
   type Event,
   parseCommand,
   parseEvent,
@@ -122,6 +124,10 @@ export const observeInput = z.object({
       for: z.enum(["load", "idle", "ms"]),
       value: z.number().optional(),
     }),
+    // Recent page dialogs the browser auto-handled - read from the session
+    // status (GET), not a command: dialogs are answered extension-side, this
+    // just reports what happened.
+    z.object({ type: z.literal("get_dialogs") }),
   ]),
 });
 export type ObserveInput = z.infer<typeof observeInput>;
@@ -132,6 +138,8 @@ export const observeOutput = z.object({
   /** Vision fallback (canvas / visual layout) - an evidence artifact. */
   screenshot: z.object({ mime: z.string(), b64: z.string() }).optional(),
   tabs: z.array(TabInfoSchema).optional(),
+  /** Recent page dialogs (get_dialogs), oldest first. */
+  dialogs: z.array(DialogRecordSchema).optional(),
   /** wait outcome. */
   ok: z.boolean().optional(),
   error: z.string().optional(),
@@ -227,6 +235,31 @@ async function callUnderstudy(
   return parseEvent(await res.json());
 }
 
+/**
+ * GET the session status through the same egress-guarded runtime.fetch and
+ * return the recent dialogs the service recorded. A pure read - no command, no
+ * idempotency key, no approval.
+ */
+async function getSessionStatus(
+  runtime: ConnectorRuntime,
+  env: BrowserConnectorEnv,
+  sessionId: string,
+): Promise<{ dialogs: DialogRecord[] }> {
+  const base = env.UNDERSTUDY_URL.replace(/\/$/, "");
+  const res = await runtime.fetch(`${base}/v1/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "GET",
+    headers: { authorization: `Bearer ${env.UNDERSTUDY_TOKEN}` },
+  });
+  if (!res.ok) {
+    throw new Error(`understudy service ${res.status} for session ${sessionId}`);
+  }
+  const parsed = z.object({ dialogs: z.array(DialogRecordSchema) }).safeParse(await res.json());
+  if (!parsed.success) {
+    throw new Error(`understudy service returned an unparseable status for session ${sessionId}`);
+  }
+  return { dialogs: parsed.data.dialogs };
+}
+
 // Writes pass a stable commandId derived from the breakwater idempotency
 // key; everything else gets a random UUID. breakwater replays a COMPLETED
 // key without re-running execute(), but a failed attempt (response lost or
@@ -285,7 +318,7 @@ export function createBrowserConnectors(
   const observe = createConnector({
     id: BROWSER_OBSERVE_CONNECTOR,
     description:
-      "Observe the browser session: a11y-tree/DOM/screenshot snapshot of the page (target elements by the returned refs), list open tabs, or wait for load/idle/ms. Read-only.",
+      "Observe the browser session: a11y-tree/DOM/screenshot snapshot of the page (target elements by the returned refs), list open tabs, read recent page dialogs the browser auto-handled, or wait for load/idle/ms. Read-only.",
     inputSchema: observeInput,
     outputSchema: observeOutput,
     permissions: { sideEffect: "read", egress },
@@ -293,6 +326,10 @@ export function createBrowserConnectors(
 
     execute: async (input, _ctx, runtime): Promise<ObserveOutput> => {
       const read = input.read;
+      // Dialogs come from the session status (GET), not a dispatched command.
+      if (read.type === "get_dialogs") {
+        return await getSessionStatus(runtime, env, input.sessionId);
+      }
       const ev = await callUnderstudy(runtime, env, input.sessionId, toCommand(read));
       switch (read.type) {
         case "snapshot":
