@@ -22,5 +22,7 @@ EXTENSION_TOKENS={"dev-ext-token":"dev-tenant"}
 # vault value (src/vault.ts). This dev value decodes to the literal
 # "dev-vault-master-key-0123456789!". Generate a real one with:
 #   node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
-# Seed dev secrets with: node scripts/vault-put.mjs 'vault://ref' --local
+# Seed dev secrets with (key MUST be vault://<tenantId>/<name>; fillSecret
+# refuses refs outside the session's own tenant, and the dev tenant is
+# "dev-tenant" above): node scripts/vault-put.mjs 'vault://dev-tenant/ref' --local
 VAULT_MASTER_KEY=ZGV2LXZhdWx0LW1hc3Rlci1rZXktMDEyMzQ1Njc4OSE

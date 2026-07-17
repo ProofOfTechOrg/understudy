@@ -54,11 +54,27 @@ export async function authenticate(req: Request, env: Env): Promise<Actor | null
 }
 
 /**
+ * A tenantId must be a flat, non-empty slug. The credential vault namespaces
+ * keys as `vault://<tenantId>/<name>` and SessionAgent.fillSecret isolates
+ * tenants with a `vault://<tenantId>/` prefix check, so a tenantId that is
+ * empty or contains `/` would let one tenant's prefix straddle another's
+ * namespace (tenant "acme" reaching "acme/eu"'s keys). Enforced at mint
+ * (fail-closed at session creation) and re-checked in tenantOf, so no signed
+ * id can carry an unsafe tenant into that prefix check.
+ */
+export function isValidTenantId(tenantId: string): boolean {
+  return tenantId.length > 0 && !tenantId.includes("/");
+}
+
+/**
  * Mints a sessionId with the owning tenant embedded and HMAC-signed, so
  * scopeSession can verify ownership statelessly - no lookup table maps
  * sessionId -> tenant; the id carries its own proof (DL-008).
  */
 export async function mintSessionId(tenantId: string, env: Env): Promise<string> {
+  if (!isValidTenantId(tenantId)) {
+    throw new Error("invalid tenantId: must be non-empty and contain no '/'");
+  }
   const nonce = toHex(crypto.getRandomValues(new Uint8Array(16)));
   const payloadBytes = new TextEncoder().encode(JSON.stringify({ t: tenantId, n: nonce }));
 
@@ -69,35 +85,51 @@ export async function mintSessionId(tenantId: string, env: Env): Promise<string>
 }
 
 /**
- * Verifies sessionId's HMAC signature and that its embedded tenant matches
- * tenantId. Every failure path - bad shape, bad signature, wrong tenant,
- * decode error - collapses to the same "not-found" the caller surfaces as
- * 404, so no response shape distinguishes "malformed id" from "someone
- * else's session" (DL-008: no existence oracle).
+ * Verifies sessionId's HMAC signature and returns the tenant embedded in it,
+ * or null for any malformed / forged / undecodable id. This is a session's
+ * AUTHORITATIVE tenant - it comes from the signed id itself, never a
+ * caller-supplied claim - so a Durable Object can trust `tenantOf(this.name)`
+ * to scope a resource it owns (e.g. the credential vault) to that session's
+ * owner. scopeSession is the boolean "does this id belong to tenantId?"
+ * wrapper over it.
  */
-export async function scopeSession(
-  sessionId: string,
-  tenantId: string,
-  env: Env,
-): Promise<"ok" | "not-found"> {
+export async function tenantOf(sessionId: string, env: Env): Promise<string | null> {
   try {
     const parts = sessionId.split(".");
-    if (parts.length !== 2) return "not-found";
+    if (parts.length !== 2) return null;
     const [payloadB64, sigB64] = parts;
-    if (!payloadB64 || !sigB64) return "not-found";
+    if (!payloadB64 || !sigB64) return null;
 
     const payloadBytes = base64urlDecode(payloadB64);
     const sigBytes = base64urlDecode(sigB64);
 
     const key = await importHmacKey(env.AUTH_HMAC_SECRET);
     const verified = await crypto.subtle.verify("HMAC", key, sigBytes, payloadBytes);
-    if (!verified) return "not-found";
+    if (!verified) return null;
 
     const payload = JSON.parse(new TextDecoder().decode(payloadBytes)) as { t?: unknown };
-    return payload.t === tenantId ? "ok" : "not-found";
+    // Re-check the shape a valid mint enforces: a signed id must never carry an
+    // empty or slash-bearing tenant into fillSecret's vault-namespace prefix
+    // check (defense in depth against a token minted before this rule existed).
+    return typeof payload.t === "string" && isValidTenantId(payload.t) ? payload.t : null;
   } catch {
-    return "not-found";
+    return null;
   }
+}
+
+/**
+ * Whether sessionId is a valid id minted for tenantId. Every failure path -
+ * bad shape, bad signature, wrong tenant, decode error - collapses to the
+ * same "not-found" the caller surfaces as 404, so no response shape
+ * distinguishes "malformed id" from "someone else's session" (DL-008: no
+ * existence oracle).
+ */
+export async function scopeSession(
+  sessionId: string,
+  tenantId: string,
+  env: Env,
+): Promise<"ok" | "not-found"> {
+  return (await tenantOf(sessionId, env)) === tenantId ? "ok" : "not-found";
 }
 
 /**

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   A11yNodeSchema,
   CommandSchema,
+  DialogRecordSchema,
   EventSchema,
   isWriteCommand,
   parseCommand,
@@ -154,6 +155,77 @@ describe("EventSchema", () => {
 
   it("rejects a tabs_result missing tabs", () => {
     expect(safeParseEvent({ type: "tabs_result", commandId: "c1" }).success).toBe(false);
+  });
+
+  it("round-trips a dialog event with a defaultPrompt", () => {
+    const ev = {
+      type: "dialog",
+      tabId: 7,
+      dialogType: "prompt",
+      message: "Enter your name",
+      url: "https://example.com/",
+      defaultPrompt: "guest",
+      disposition: "dismiss",
+    };
+    expect(EventSchema.parse(ev)).toEqual(ev);
+  });
+
+  it("round-trips a dialog event without a defaultPrompt (optional)", () => {
+    const ev = {
+      type: "dialog",
+      tabId: 7,
+      dialogType: "beforeunload",
+      message: "",
+      url: "https://example.com/",
+      disposition: "accept",
+    };
+    expect(EventSchema.parse(ev)).toEqual(ev);
+  });
+
+  it("rejects a dialog with an unknown dialogType", () => {
+    expect(
+      safeParseEvent({
+        type: "dialog",
+        tabId: 1,
+        dialogType: "notification",
+        message: "hi",
+        url: "https://x/",
+        disposition: "accept",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a dialog with an invalid disposition", () => {
+    expect(
+      safeParseEvent({
+        type: "dialog",
+        tabId: 1,
+        dialogType: "alert",
+        message: "hi",
+        url: "https://x/",
+        disposition: "ignore",
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe("DialogRecordSchema", () => {
+  it("is the dialog Event payload minus its `type`, pinned to the event member", () => {
+    const record = {
+      tabId: 2,
+      dialogType: "confirm",
+      message: "Sure?",
+      url: "https://x/",
+      disposition: "dismiss",
+    };
+    // Parses standalone (the DO-state record / connector validator shape)...
+    expect(DialogRecordSchema.parse(record)).toEqual(record);
+    // ...and adding the discriminator yields a valid dialog Event, so the record
+    // and the wire event cannot drift apart (they share one definition).
+    expect(EventSchema.parse({ type: "dialog", ...record })).toEqual({
+      type: "dialog",
+      ...record,
+    });
   });
 });
 

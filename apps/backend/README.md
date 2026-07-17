@@ -129,7 +129,16 @@ during that window. Four things close this gap:
   `{commandId, type}`, never the command body), and never written to `setState`,
   never included in the Event response, and never appears in an error string. It
   exists only transiently inside this one Durable Object, for the duration of the
-  one service→extension WS hop.
+  one service→extension WS hop. Resolution is **tenant-scoped**: `fillSecret`
+  derives the session's authoritative tenant from its HMAC-signed `sessionId`
+  (`this.name`, via `auth.ts::tenantOf` — never a caller claim) and refuses any
+  `secretRef` outside that tenant's `vault://<tenantId>/…` namespace *before* any
+  vault read, so a consumer authenticated as tenant B, driving its own session,
+  can never resolve tenant A's secret. A cross-tenant *or* tenant-less ref returns
+  the same scrubbed `ok:false` an absent secret does (no existence oracle). Because
+  understudy owns one shared vault across every tenant, this check lives server-side
+  here — it is not delegated to a consumer-side breakwater, which can only govern
+  that consumer's own agent, never isolate one tenant from another.
 - **`dryRun` is a service-API parameter (`{command, dryRun?}`), not a `Command`
   union field**: adding it to every Command variant would churn the shared,
   published protocol for a cross-cutting concern. On a dryRun WRITE command,
@@ -142,8 +151,11 @@ during that window. Four things close this gap:
   always refuse — and it invalidates every outstanding ref, breaking the
   approved command that follows the simulation (the original M3 dry-run bug,
   caught by the attended e2e). `fillSecret` does the same ref-only check on
-  dryRun and never calls `resolveSecret` or dispatches a `type` command. This
-  is fail-safe by construction: a governance simulation (called *before* an
+  dryRun and never calls `resolveSecret` or dispatches a `type` command; a
+  `secretRef` outside the session's own tenant short-circuits to a simulated
+  `ok:false` (the refusal the real call gives) before even the ref probe, so a
+  governance preview is honest on the tenant axis too and still reads no vault.
+  This is fail-safe by construction: a governance simulation (called *before* an
   approval grant exists) can never actually mutate the page or resolve a
   secret. A dry-run `ok` guarantees *resolvability* (the ref maps to a live
   node in the current generation) — not *executability* of the eventual
@@ -159,8 +171,11 @@ during that window. Four things close this gap:
   inside the DO via `createVault(env)`. Seed values with
   `scripts/vault-put.mjs` (same envelope, plain Node), never a raw
   `wrangler kv key put`; a legacy plaintext value fails closed at read time
-  ("not a recognized envelope"). A per-tenant external KMS remains a possible
-  future swap behind the same `VaultBinding.get` seam (`types.ts`).
+  ("not a recognized envelope"). A per-tenant external KMS (per-tenant
+  *encryption* at rest) remains a possible future swap behind the same
+  `VaultBinding.get` seam (`types.ts`); tenant *authorization* does not wait on
+  it — it is already enforced above the seam by the `vault://<tenantId>/…`
+  namespace check in the `fill_secret` bullet above.
 - **Hibernation cannot lose an in-flight command; only shutdown/restart can**:
   verified against the Cloudflare Durable Objects docs (2026-07-14) — hibernation
   requires no pending timer, no in-progress awaited fetch, no active WS use, and no
@@ -202,6 +217,11 @@ during that window. Four things close this gap:
 - `fill_secret` plaintext never enters `setState`, logs, the Event response, or an
   error string; the coordinator logs only `{commandId, type}`. A replayed
   `fill_secret` touches neither the vault nor the wire.
+- A `secretRef` resolves only within its session's own tenant: `fillSecret`
+  requires `vault://<tenantId>/…` (tenant derived from the signed sessionId) and
+  refuses a cross-tenant or tenant-less ref with the same scrubbed `ok:false` an
+  absent secret gets, before any vault read — no cross-tenant plaintext, no
+  existence oracle.
 - The vault at rest holds only `v1.<iv>.<ct>` AES-256-GCM envelopes; a value
   that does not decrypt under `VAULT_MASTER_KEY` is refused, never served.
 - One Durable Object per `sessionId`; a sessionId whose embedded tenant disagrees
@@ -214,7 +234,9 @@ during that window. Four things close this gap:
 - `SessionCoordinator` is the only Cloudflare-coupling seam; `coordinator.ts`
   itself imports nothing Cloudflare-specific.
 - `dryRun` never dispatches a mutating command and never resolves a secret; it
-  always returns a simulated `action_result` from a read-only ref check.
+  returns a simulated `action_result` from a read-only ref check - or, for a
+  `secretRef` outside the session's tenant, a simulated `ok:false` refusal that
+  matches what the real call would return, with no vault read.
 - An unauthorized WS upgrade is refused at the Worker edge (401/404) before
   the DO accepts it; any socket that still reaches the DO unauthorized can
   neither receive a command, have its inbound messages processed, nor change
@@ -245,8 +267,12 @@ openssl rand 32 | basenc --base64url | tr -d '=' | pnpm exec wrangler secret put
 pnpm exec wrangler deploy
 curl -s https://understudy-backend.gcharang.workers.dev/health   # {"ok":true}
 
-# Seed a vault secret (encrypts locally; KV never sees plaintext):
-printf '%s' 'the-secret' | VAULT_MASTER_KEY=<key> node scripts/vault-put.mjs 'vault://tenant/ref'
+# Seed a vault secret (encrypts locally; KV never sees plaintext). The key
+# MUST be vault://<tenantId>/<name> where <tenantId> matches the tenant in
+# CALLER_TOKENS/EXTENSION_TOKENS: fillSecret refuses any ref outside the
+# requesting session's own tenant namespace, so a tenant-less key (vault://ref)
+# is unreadable by design.
+printf '%s' 'the-secret' | VAULT_MASTER_KEY=<key> node scripts/vault-put.mjs 'vault://<tenantId>/ref'
 ```
 
 The extension connects to
