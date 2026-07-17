@@ -385,7 +385,9 @@ auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer t
    extension answers it locally and synchronously via `Page.handleJavaScriptDialog` with a type-aware
    disposition (alert/beforeunload accept, confirm/prompt dismiss) and reports it to the consumer as a
    **best-effort** `dialog` Event (recorded in DO state, read via `GET /v1/sessions/:id`; a report lost
-   during a WS drop is not replayed). **Residual risk**: while `chrome.debugger` is attached, a
+   during a WS drop is not replayed). Guaranteed-delivery-on-reconnect (an extension-side dialog buffer
+   replayed on reconnect, dedup'd by a dialog id server-side) was considered and **deliberately deferred
+   to M6** — the surface matches `page_event`'s existing lossiness. **Residual risk**: while `chrome.debugger` is attached, a
    `beforeunload` is auto-accepted so the automation's own navigation proceeds — a human co-driver's
    unsaved-changes guard is thereby proceeded through; `confirm`/`prompt` are dismissed, never auto-confirmed.
 
@@ -450,9 +452,14 @@ auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer t
   Fixed server-side (`auth.ts::tenantOf` + a `vault://<tenantId>/…` namespace guard
   in `fillSecret`, before any vault read; scrubbed `ok:false`, no existence oracle);
   proven by `test/service.test.ts` "two-tenant vault isolation" (session/status/WS
-  axes were already covered). Still open under M5: dialog handling breadth,
-  session/GIF audit logging.
-- **M6 — Ops.** Rate/quotas at the service edge, observability, unattended-session seam scoping.
+  axes were already covered). **Dialog handling breadth LANDED (2026-07-17):**
+  type-aware local disposition (alert/beforeunload accept, confirm/prompt dismiss — a `beforeunload`
+  dismiss was cancelling navigations) + a best-effort `dialog` Event surfaced via `GET /v1/sessions/:id`
+  (protocol 0.5.0, connector 0.3.0; residual #6). Still open under M5: session/GIF audit logging.
+  Deferred to M6: guaranteed dialog delivery (best-effort accepted for now).
+- **M6 — Ops.** Rate/quotas at the service edge, observability, unattended-session seam scoping,
+  guaranteed dialog delivery (extension-side dialog buffer + replay-on-reconnect + server-side dedup —
+  deferred from M5's best-effort `dialog` surface; see residual #6).
 
 ## Verification
 
