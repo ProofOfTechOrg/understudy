@@ -63,6 +63,15 @@ async function openSession(callerToken: string): Promise<string> {
   return body.sessionId;
 }
 
+async function openIdempotentSession(callerToken: string, idempotencyKey: string): Promise<Response> {
+  return exports.default.fetch(
+    authedRequest("/v1/sessions", callerToken, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+    }),
+  );
+}
+
 /** Opens the fake-extension WS at the real onConnect-authed route (DL-006 critical fact). */
 async function connectFakeExtension(sessionId: string, token = EXTENSION_TOKEN_A): Promise<WebSocket> {
   const res = await exports.default.fetch(
@@ -151,6 +160,26 @@ describe("GET /health", () => {
     const res = await exports.default.fetch(new Request(`${BASE}/health`));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
+  });
+});
+
+describe("POST /v1/sessions idempotency", () => {
+  it("replays the same tenant-scoped session for the same key", async () => {
+    const key = "d9428888-122b-4c26-a044-7096d6e845c5";
+
+    const first = await openIdempotentSession(CALLER_TOKEN_A, key);
+    const replay = await openIdempotentSession(CALLER_TOKEN_A, key);
+
+    expect(first.status).toBe(200);
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(await first.json());
+  });
+
+  it("rejects a malformed idempotency key", async () => {
+    const response = await openIdempotentSession(CALLER_TOKEN_A, "not-a-uuid");
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "idempotency-key must be a UUID" });
   });
 });
 
@@ -294,7 +323,9 @@ describe("fill_secret", () => {
     // messages alike) so the no-leak check below can assert the plaintext
     // appears on the wire exactly once - the one hop where it must travel.
     const rawFrames: string[] = [];
-    socket.addEventListener("message", (event: MessageEvent) => rawFrames.push(event.data as string));
+    socket.addEventListener("message", (event: MessageEvent) => {
+      rawFrames.push(event.data as string);
+    });
 
     const logSpies = [
       vi.spyOn(console, "log").mockImplementation(() => {}),
@@ -1249,7 +1280,9 @@ describe("two-tenant vault isolation (cross-tenant secretRef scoping, server-sid
     const socket = await connectFakeExtension(sessionId, EXTENSION_TOKEN_B);
     const received = collectCommands(socket);
     const rawFrames: string[] = [];
-    socket.addEventListener("message", (event: MessageEvent) => rawFrames.push(event.data as string));
+    socket.addEventListener("message", (event: MessageEvent) => {
+      rawFrames.push(event.data as string);
+    });
     const vaultGetSpy = vi.spyOn(env.VAULT, "get");
 
     try {

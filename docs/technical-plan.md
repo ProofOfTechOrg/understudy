@@ -447,14 +447,15 @@ auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer t
   reference breakwater connector (`@understudy/connector`, mirroring the smart-compliance example). A real
   consumer (metamind / smart-compliance) drives understudy end-to-end with a Mastra agent + flowsafe
   approvals. *Cross-repo; understudy's deliverable is the published contract + reference connector, not
-  the agent.* **Status (2026-07-16): `packages/connector` BUILT** — observe (snapshot/get_tabs/wait) /
+  the agent.* **Status (2026-07-17): PACKAGES PUBLISHED** — observe (snapshot/get_tabs/wait) /
   act (click/type/navigate/key/scroll/switch_tab, grant-gated) / fill_credential (vaulted), egress-pinned
-  `runtime.fetch`, caller bearer auth, 15 tests against the real breakwater wrapper (fail-closed grant,
-  idempotent replay, per-hop egress denial, dry-run). Both packages are publish-ready (MIT,
-  `files`-scoped tarballs, `publishConfig.access: public`) and the changesets + GitHub Actions release
-  flow is wired (`.github/workflows/release.yml`, single-branch master — first push publishes 0.3.0 /
-  0.1.0 with no changeset needed); publishing waits on the npm `understudy` org + `NPM_TOKEN` secret.
-  The consumer-side Mastra+flowsafe e2e remains open.
+  `runtime.fetch`, caller bearer auth, and tests against the real breakwater wrapper (fail-closed grant,
+  idempotent replay, per-hop egress denial, dry-run). `@understudy/protocol@0.5.0` and
+  `@understudy/connector@0.3.0` are published on npm with MIT-licensed, `files`-scoped tarballs and
+  npm provenance. The changesets + GitHub Actions release flow is wired in
+  `.github/workflows/release.yml`. Metamind contains the consumer-side Mastra workflow, flowsafe
+  approval, breakwater connector wiring, automated coverage, and attended runbook. The remaining
+  proof is an attended run with its Chromium extension connected.
 - **M5 — Substrate hardening. LARGELY LANDED (2026-07-17, the deferred-items sweep):**
   pre-accept WS/HTTP auth at the Worker edge (`onBeforeConnect`/`onBeforeRequest` — unauthorized
   upgrades are 401/404 before the DO accepts, in-DO gate kept as defense in depth); credential

@@ -19,14 +19,14 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `src/session.ts` | `SessionAgent` — the per-session Durable Object: WS auth, event routing, `dispatch`/`fillSecret` RPCs (typed `DispatchOutcome`, write-replay cache) | Changing session lifecycle, dryRun behavior, fill_secret dispatch, idempotent replay |
 | `src/coordinator.ts` | `SessionCoordinator` — portable command↔event correlation interface + failure-prefix constants, no Cloudflare imports | Understanding the portable seam, swapping the CF impl |
 | `src/coordinator-cf.ts` | `CfSessionCoordinator` — CF impl: pending map (+ duplicate-in-flight guard) + persisted awaiting-marker + hibernation reconciliation | Debugging a stuck/timed-out command, hibernation edge cases |
-| `src/auth.ts` | Caller bearer-token auth, sessionId mint/scope (HMAC), extension token verify | Changing auth, adding a token type, debugging 401/404 |
+| `src/auth.ts` | Caller bearer-token auth, fresh/idempotent sessionId minting, HMAC tenant scope, extension-token verification | Changing auth, session creation, token types, or 401/404 behavior |
 | `src/secrets.ts` | `resolveSecret` — vault lookup only, no dispatch | Changing the vault backend, debugging secret resolution failures |
 | `src/vault.ts` | AES-256-GCM envelope codec + `EncryptedKvVault`/`createVault` — KV holds ciphertext only | Changing the envelope format/key handling (mirror `scripts/vault-put.mjs`) |
 | `src/base64url.ts` | base64url codec shared by auth.ts and vault.ts | Rarely — codec changes |
 | `src/types.ts` | Shared `Env`, `SessionState` (incl. `completedWrites`), `SessionStatus`, `VaultBinding`, `DispatchOutcome` | Adding a binding, changing DO state shape, changing the RPC outcome union |
 | `scripts/stub-consumer.mjs` | Throwaway Node runbook harness (not a workspace member) driving the API against a real extension | Running the attended M3 end-to-end verification |
 | `scripts/vault-put.mjs` | Seeds one vault secret as an envelope via `wrangler kv key put` (plaintext from stdin; `--local` for dev) | Seeding/rotating vault values (never raw `kv key put`) |
-| `test/service.test.ts` | Hono route tests: auth, tenant scoping, dryRun, fill_secret routing, pre-accept WS gate, idempotent write replay | Verifying/extending the command API |
+| `test/service.test.ts` | Hono route tests: auth, tenant scoping, idempotent session minting, dryRun, fill_secret routing, pre-accept WS gate, write replay | Verifying/extending the command API |
 | `test/session.test.ts` | `SessionAgent`/coordinator tests: in-DO WS auth (defense in depth), onClose stamping, resolve correlation, hibernation-resume | Verifying/extending DO behavior |
 | `test/auth.test.ts` | Auth module unit tests | Verifying/extending auth.ts |
 | `test/coordinator.test.ts` | Coordinator unit tests (timeout, duplicate guard, abandon, no-leak logging) | Verifying/extending coordinator-cf.ts |

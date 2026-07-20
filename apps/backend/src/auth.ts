@@ -3,7 +3,8 @@
  *
  * Three independent verification paths: authenticate() maps a caller's
  * bearer token to an {actor, tenantId} (who is calling the command API);
- * mintSessionId/scopeSession bind a sessionId to its owning tenant so a
+ * mintSessionId/scopeSession bind a fresh or idempotently replayed sessionId
+ * to its owning tenant so a
  * cross-tenant request is refused with 404, never 403 - a 403 would confirm
  * the session exists for someone who does not own it, an existence oracle
  * (DL-008); verifyExtensionToken authenticates the extension's own WebSocket
@@ -69,13 +70,34 @@ export function isValidTenantId(tenantId: string): boolean {
 /**
  * Mints a sessionId with the owning tenant embedded and HMAC-signed, so
  * scopeSession can verify ownership statelessly - no lookup table maps
- * sessionId -> tenant; the id carries its own proof (DL-008).
+ * sessionId -> tenant; the id carries its own proof (DL-008). An idempotency
+ * UUID is tenant-salted and hashed into the nonce so concurrent consumer
+ * retries converge without exposing the caller's key in the returned id.
  */
-export async function mintSessionId(tenantId: string, env: Env): Promise<string> {
+export const SESSION_IDEMPOTENCY_KEY_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export async function mintSessionId(
+  tenantId: string,
+  env: Env,
+  idempotencyKey?: string,
+): Promise<string> {
   if (!isValidTenantId(tenantId)) {
     throw new Error("invalid tenantId: must be non-empty and contain no '/'");
   }
-  const nonce = toHex(crypto.getRandomValues(new Uint8Array(16)));
+  if (idempotencyKey && !SESSION_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    throw new Error("invalid idempotency key: must be a UUID");
+  }
+  const nonce = idempotencyKey
+    ? toHex(
+        new Uint8Array(
+          await crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(`${tenantId}\0${idempotencyKey.toLowerCase()}`),
+          ),
+        ),
+      ).slice(0, 32)
+    : toHex(crypto.getRandomValues(new Uint8Array(16)));
   const payloadBytes = new TextEncoder().encode(JSON.stringify({ t: tenantId, n: nonce }));
 
   const key = await importHmacKey(env.AUTH_HMAC_SECRET);
