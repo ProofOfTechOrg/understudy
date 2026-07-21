@@ -110,6 +110,27 @@ describe("mintSessionId / scopeSession", () => {
     expect(await scopeSession(second, "tenantA", env)).toBe("ok");
   });
 
+  it("mints one stable session per tenant and idempotency key", async () => {
+    const env = makeEnv();
+    const key = "d9428888-122b-4c26-a044-7096d6e845c5";
+
+    const first = await mintSessionId("tenantA", env, key);
+    const replay = await mintSessionId("tenantA", env, key);
+    const otherTenant = await mintSessionId("tenantB", env, key);
+
+    expect(replay).toBe(first);
+    expect(otherTenant).not.toBe(first);
+  });
+
+  it.each(["", "   ", "not-a-uuid"])(
+    "rejects malformed session idempotency key %j",
+    async (idempotencyKey) => {
+      await expect(mintSessionId("tenantA", makeEnv(), idempotencyKey)).rejects.toThrow(
+        /invalid idempotency key/,
+      );
+    },
+  );
+
   it.each(["acme/eu", "", "/", "a/b"])(
     "refuses to mint a sessionId for an unsafe tenantId %j (empty or slash-bearing would straddle the vault namespace)",
     async (badTenant) => {

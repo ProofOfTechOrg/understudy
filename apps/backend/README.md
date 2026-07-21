@@ -120,6 +120,11 @@ during that window. Four things close this gap:
 - **sessionIds are minted, not looked up**: `mintSessionId` HMAC-signs a payload
   containing the tenant; `scopeSession` verifies the signature and payload rather
   than querying a table. This makes tenant-ownership verification stateless.
+  `POST /v1/sessions` also accepts an optional `Idempotency-Key` UUID. The UUID is
+  hashed with the authenticated tenant before signing, so retries and concurrent
+  requests from one consumer converge on the same tenant-scoped session without
+  exposing the caller's key in the session id. Omitting the header preserves the
+  fresh-session behavior.
 - **`fill_secret` resolves service-side, DO-scoped**: the agent (consumer-side)
   only ever sees an opaque `secretRef`. `secrets.ts::resolveSecret` performs vault
   lookup only — it imports neither `session.ts` nor the coordinator, so it cannot

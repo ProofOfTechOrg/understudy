@@ -13,7 +13,13 @@
 import { Hono } from "hono";
 import { getAgentByName, routeAgentRequest } from "agents";
 import { safeParseCommand } from "@understudy/protocol";
-import { authenticate, mintSessionId, scopeSession, verifyExtensionToken } from "./auth";
+import {
+  authenticate,
+  mintSessionId,
+  scopeSession,
+  SESSION_IDEMPOTENCY_KEY_PATTERN,
+  verifyExtensionToken,
+} from "./auth";
 import type { DispatchOutcome, Env } from "./types";
 import type { SessionAgent } from "./session";
 
@@ -31,7 +37,14 @@ app.post("/v1/sessions", async (c) => {
   const actor = await authenticate(c.req.raw, c.env);
   if (!actor) return c.json({ error: "unauthorized" }, 401);
 
-  const sessionId = await mintSessionId(actor.tenantId, c.env);
+  const idempotencyKey = c.req.header("idempotency-key")?.trim();
+  if (
+    idempotencyKey !== undefined &&
+    !SESSION_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)
+  ) {
+    return c.json({ error: "idempotency-key must be a UUID" }, 400);
+  }
+  const sessionId = await mintSessionId(actor.tenantId, c.env, idempotencyKey);
   return c.json({ sessionId });
 });
 

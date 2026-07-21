@@ -28,12 +28,11 @@ drive it over HTTP (Topology 1).
   no LLM and embeds no agent framework — the brain and governance (breakwater/flowsafe) live in
   the consumers. See its README.
 
-M4 status: both packages are publish-ready (`@understudy/protocol` 0.3.0,
-`@understudy/connector` 0.1.0 — MIT, `files`-scoped tarballs, `publishConfig.access:
-public`) and the CI release flow is in place (see Release below); publishing waits only on
-the npm `understudy` org + `NPM_TOKEN` secret. The cross-repo consumer e2e (a metamind /
-smart-compliance Mastra agent + flowsafe approvals driving understudy) is the remaining
-M4 step. The agent loop and governance stay consumer-side, per Topology 1.
+M4 status: `@understudy/protocol@0.5.0` and `@understudy/connector@0.3.0` are
+published on npm. Metamind contains the cross-repository Mastra workflow,
+flowsafe approval gate, breakwater browser connectors, and attended runbook.
+The remaining M4 step is running that proof with a connected Chromium
+extension. The agent loop and governance stay in the consumer, per Topology 1.
 
 ## Develop
 
@@ -50,13 +49,12 @@ freshly-published malicious versions; first-party `@proofoftech/*` packages are 
 
 ## Release (npm)
 
-Changesets + GitHub Actions, single-branch (see `.changeset/README.md`): a PR touching a
-published package adds a changeset (`pnpm changeset`); on push to `master`,
-`.github/workflows/release.yml` opens/updates the "Version Packages" PR — or, when nothing
-is pending, publishes any package version not yet on npm (tags + GitHub releases, with
-provenance). Requires the `NPM_TOKEN` repo secret with publish rights on the `@understudy`
-scope. The first publish (`@understudy/protocol` 0.3.0, `@understudy/connector` 0.1.0)
-needs no changeset — those versions are already set and unpublished.
+Changesets and GitHub Actions manage releases from `master`; see
+`.changeset/README.md`. A pull request that changes a published package adds a
+changeset with `pnpm changeset`. The release workflow opens or updates the
+“Version Packages” pull request, then publishes the approved versions with npm
+provenance. The repository secret `NPM_TOKEN` needs publish access to the
+`@understudy` scope.
 
 The M0 harness needs no build — load `apps/cdp-spike` unpacked in a Chromium browser
 (`apps/cdp-spike/README.md`).
