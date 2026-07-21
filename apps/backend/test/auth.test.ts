@@ -122,11 +122,14 @@ describe("mintSessionId / scopeSession", () => {
     expect(otherTenant).not.toBe(first);
   });
 
-  it("rejects malformed session idempotency keys", async () => {
-    await expect(mintSessionId("tenantA", makeEnv(), "not-a-uuid")).rejects.toThrow(
-      /invalid idempotency key/,
-    );
-  });
+  it.each(["", "   ", "not-a-uuid"])(
+    "rejects malformed session idempotency key %j",
+    async (idempotencyKey) => {
+      await expect(mintSessionId("tenantA", makeEnv(), idempotencyKey)).rejects.toThrow(
+        /invalid idempotency key/,
+      );
+    },
+  );
 
   it.each(["acme/eu", "", "/", "a/b"])(
     "refuses to mint a sessionId for an unsafe tenantId %j (empty or slash-bearing would straddle the vault namespace)",

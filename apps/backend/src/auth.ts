@@ -85,19 +85,23 @@ export async function mintSessionId(
   if (!isValidTenantId(tenantId)) {
     throw new Error("invalid tenantId: must be non-empty and contain no '/'");
   }
-  if (idempotencyKey && !SESSION_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+  if (
+    idempotencyKey !== undefined &&
+    !SESSION_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)
+  ) {
     throw new Error("invalid idempotency key: must be a UUID");
   }
-  const nonce = idempotencyKey
-    ? toHex(
-        new Uint8Array(
-          await crypto.subtle.digest(
-            "SHA-256",
-            new TextEncoder().encode(`${tenantId}\0${idempotencyKey.toLowerCase()}`),
+  const nonce =
+    idempotencyKey !== undefined
+      ? toHex(
+          new Uint8Array(
+            await crypto.subtle.digest(
+              "SHA-256",
+              new TextEncoder().encode(`${tenantId}\0${idempotencyKey.toLowerCase()}`),
+            ),
           ),
-        ),
-      ).slice(0, 32)
-    : toHex(crypto.getRandomValues(new Uint8Array(16)));
+        ).slice(0, 32)
+      : toHex(crypto.getRandomValues(new Uint8Array(16)));
   const payloadBytes = new TextEncoder().encode(JSON.stringify({ t: tenantId, n: nonce }));
 
   const key = await importHmacKey(env.AUTH_HMAC_SECRET);

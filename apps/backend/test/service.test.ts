@@ -175,12 +175,15 @@ describe("POST /v1/sessions idempotency", () => {
     expect(await replay.json()).toEqual(await first.json());
   });
 
-  it("rejects a malformed idempotency key", async () => {
-    const response = await openIdempotentSession(CALLER_TOKEN_A, "not-a-uuid");
+  it.each(["", "   ", "not-a-uuid"])(
+    "rejects malformed idempotency key %j",
+    async (idempotencyKey) => {
+      const response = await openIdempotentSession(CALLER_TOKEN_A, idempotencyKey);
 
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({ error: "idempotency-key must be a UUID" });
-  });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "idempotency-key must be a UUID" });
+    },
+  );
 });
 
 describe("auth and tenant scoping", () => {

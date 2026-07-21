@@ -38,7 +38,10 @@ app.post("/v1/sessions", async (c) => {
   if (!actor) return c.json({ error: "unauthorized" }, 401);
 
   const idempotencyKey = c.req.header("idempotency-key")?.trim();
-  if (idempotencyKey && !SESSION_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+  if (
+    idempotencyKey !== undefined &&
+    !SESSION_IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)
+  ) {
     return c.json({ error: "idempotency-key must be a UUID" }, 400);
   }
   const sessionId = await mintSessionId(actor.tenantId, c.env, idempotencyKey);
