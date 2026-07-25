@@ -30,7 +30,13 @@ describe("CfSessionCoordinator", () => {
     const promise = coordinator.send(cmd);
     expect(host.getAwaitingCommandIds()).toEqual(["c1"]);
     expect(host.sent).toEqual([JSON.stringify(cmd)]);
-    const event: Event = { type: "snapshot_result", commandId: "c1", tree: [] };
+    const event: Event = {
+      type: "snapshot_result",
+      commandId: "c1",
+      tree: [],
+      tabId: 7,
+      url: "https://example.com/",
+    };
     coordinator.resolvePending(event);
 
     // #then the promise resolves with that event and the marker is cleared
@@ -78,6 +84,48 @@ describe("CfSessionCoordinator", () => {
     );
     expect(host.getAwaitingCommandIds()).toEqual([]);
     expect(host.sent).toEqual([]);
+  });
+
+  it("rolls back all pending bookkeeping when the authoritative socket throws during send", async () => {
+    // #given liveness passed, but the authoritative socket closes in the
+    // checked-to-send window and its synchronous send throws
+    vi.useFakeTimers();
+    try {
+      const host = createFakeHost();
+      host.sendToExtension = () => {
+        throw new Error("WebSocket is not open");
+      };
+      const coordinator = new CfSessionCoordinator(host);
+      const cmd: Command = { type: "get_tabs", commandId: "c-send-race" };
+
+      // #when the coordinator attempts delivery
+      const err = await coordinator.send(cmd).catch((e: unknown) => e);
+
+      // #then it maps to the existing not-connected family and immediately
+      // clears the timer, in-memory pending entry, and persisted marker
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe(
+        "session not connected: authoritative extension connection unavailable during send",
+      );
+      expect(host.getAwaitingCommandIds()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+
+      // #then the same commandId can dispatch after reconnect; no stale
+      // pending-map entry trips the duplicate-in-flight guard
+      host.sendToExtension = (payload: string) => {
+        host.sent.push(payload);
+      };
+      const retry = coordinator.send(cmd);
+      expect(host.sent).toEqual([JSON.stringify(cmd)]);
+      coordinator.resolvePending({ type: "tabs_result", commandId: cmd.commandId, tabs: [] });
+      await expect(retry).resolves.toEqual({
+        type: "tabs_result",
+        commandId: cmd.commandId,
+        tabs: [],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("no-ops on an unknown commandId without throwing or touching the marker", () => {

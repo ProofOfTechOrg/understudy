@@ -2,19 +2,27 @@ import { describe, it, expect, vi } from "vitest";
 import { applyDialogDecision, classifyCdpEvent, dialogDisposition } from "./cdp-events";
 import type { DialogEventFields } from "./cdp-events";
 
-const ctx = { currentUrl: "https://example.com/current" };
+const ctx = { currentUrl: "https://example.com/current", mainFrameId: "F1" };
 
 describe("classifyCdpEvent", () => {
   it("bumps generation, sets newUrl, and emits a navigated pageEvent for the main frame", () => {
     const decision = classifyCdpEvent(
       "Page.frameNavigated",
-      { frame: { id: "F1", url: "https://example.com/next" } },
+      {
+        frame: {
+          id: "F1",
+          url: "https://example.com/next",
+          urlFragment: "#details",
+        },
+      },
       ctx,
     );
     expect(decision).toEqual({
-      newUrl: "https://example.com/next",
+      newMainFrameId: "F1",
+      newUrl: "https://example.com/next#details",
       bumpGeneration: true,
-      pageEvent: { kind: "navigated", url: "https://example.com/next" },
+      loadStarted: true,
+      pageEvent: { kind: "navigated", url: "https://example.com/next#details" },
     });
   });
 
@@ -22,6 +30,39 @@ describe("classifyCdpEvent", () => {
     const decision = classifyCdpEvent(
       "Page.frameNavigated",
       { frame: { id: "F2", parentId: "F1", url: "https://ads.example/iframe" } },
+      ctx,
+    );
+    expect(decision).toEqual({});
+  });
+
+  it("tracks a same-document navigation for the main frame without starting a load", () => {
+    const decision = classifyCdpEvent(
+      "Page.navigatedWithinDocument",
+      {
+        frameId: "F1",
+        url: "https://example.com/current#details",
+        navigationType: "fragment",
+      },
+      ctx,
+    );
+    expect(decision).toEqual({
+      newUrl: "https://example.com/current#details",
+      bumpGeneration: true,
+      pageEvent: {
+        kind: "navigated",
+        url: "https://example.com/current#details",
+      },
+    });
+  });
+
+  it("ignores a same-document navigation from a subframe", () => {
+    const decision = classifyCdpEvent(
+      "Page.navigatedWithinDocument",
+      {
+        frameId: "F2",
+        url: "https://frame.example/#details",
+        navigationType: "fragment",
+      },
       ctx,
     );
     expect(decision).toEqual({});

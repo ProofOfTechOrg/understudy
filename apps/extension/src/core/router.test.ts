@@ -5,6 +5,7 @@ import type { CdpSession } from "../driver/cdp";
 import { routeCommand } from "./router";
 
 interface MockSession {
+  tabId: number;
   snapshotA11y: Mock;
   screenshot: Mock;
   click: Mock;
@@ -18,6 +19,7 @@ interface MockSession {
 
 function createMockSession(): MockSession {
   return {
+    tabId: 7,
     snapshotA11y: vi.fn(),
     screenshot: vi.fn(),
     click: vi.fn(),
@@ -48,7 +50,13 @@ afterEach(() => {
 describe("routeCommand", () => {
   it("routes snapshot mode a11y to session.snapshotA11y and returns its event", async () => {
     const mock = createMockSession();
-    const event: Event = { type: "snapshot_result", commandId: "c-a11y", tree: [] };
+    const event: Event = {
+      type: "snapshot_result",
+      commandId: "c-a11y",
+      tree: [],
+      tabId: 7,
+      url: "https://example.com/",
+    };
     mock.snapshotA11y.mockResolvedValue(event);
     const cmd: Command = { type: "snapshot", commandId: "c-a11y", mode: "a11y" };
 
@@ -60,7 +68,14 @@ describe("routeCommand", () => {
 
   it("routes snapshot mode screenshot to session.screenshot and returns its event", async () => {
     const mock = createMockSession();
-    const event: Event = { type: "screenshot_result", commandId: "c-shot", mime: "image/png", b64: "QQ==" };
+    const event: Event = {
+      type: "screenshot_result",
+      commandId: "c-shot",
+      mime: "image/png",
+      b64: "QQ==",
+      tabId: 7,
+      url: "https://example.com/",
+    };
     mock.screenshot.mockResolvedValue(event);
     const cmd: Command = { type: "snapshot", commandId: "c-shot", mode: "screenshot" };
 
@@ -68,6 +83,21 @@ describe("routeCommand", () => {
 
     expect(mock.screenshot).toHaveBeenCalledWith("c-shot");
     expect(result).toEqual(event);
+  });
+
+  it("rejects a snapshot requested for a tab other than the attached CDP session", async () => {
+    const mock = createMockSession();
+    const cmd: Command = { type: "snapshot", commandId: "c-mismatch", mode: "a11y", tabId: 8 };
+
+    const result = await routeCommand(cmd, asSession(mock));
+
+    expect(result).toEqual({
+      type: "action_result",
+      commandId: "c-mismatch",
+      ok: false,
+      error: "attached CDP session is tab 7, not requested tab 8",
+    });
+    expect(mock.snapshotA11y).not.toHaveBeenCalled();
   });
 
   it("returns action_result unsupported for snapshot mode dom without touching the session", async () => {
@@ -96,6 +126,26 @@ describe("routeCommand", () => {
 
     expect(mock.navigate).toHaveBeenCalledWith("c-nav", "https://example.com/");
     expect(result).toEqual(event);
+  });
+
+  it("rejects navigate when its requested tab differs from the attached CDP session", async () => {
+    const mock = createMockSession();
+    const cmd: Command = {
+      type: "navigate",
+      commandId: "c-nav-mismatch",
+      url: "https://example.com/",
+      tabId: 8,
+    };
+
+    const result = await routeCommand(cmd, asSession(mock));
+
+    expect(result).toEqual({
+      type: "action_result",
+      commandId: "c-nav-mismatch",
+      ok: false,
+      error: "attached CDP session is tab 7, not requested tab 8",
+    });
+    expect(mock.navigate).not.toHaveBeenCalled();
   });
 
   it("routes click to session.click with the ref", async () => {

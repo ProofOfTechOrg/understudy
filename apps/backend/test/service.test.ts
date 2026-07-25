@@ -117,6 +117,23 @@ function waitForCommand(socket: WebSocket): Promise<Command> {
   });
 }
 
+function waitForSocketClose(socket: WebSocket): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error("timed out waiting for WebSocket close")),
+      10_000,
+    );
+    socket.addEventListener("close", (event: CloseEvent) => {
+      clearTimeout(timeout);
+      resolve({ code: event.code, reason: event.reason });
+    });
+    socket.addEventListener("error", () => {
+      clearTimeout(timeout);
+      reject(new Error("WebSocket error while waiting for close"));
+    });
+  });
+}
+
 /** Collects every real dispatched Command received on `socket` (framework messages excluded). */
 function collectCommands(socket: WebSocket): Command[] {
   const commands: Command[] = [];
@@ -301,14 +318,28 @@ describe("command round-trip via a live extension WebSocket", () => {
 
       // #then the extension receives the forwarded command
       expect(await incoming).toEqual({ type: "snapshot", commandId: "c1", mode: "a11y" });
-      socket.send(JSON.stringify({ type: "snapshot_result", commandId: "c1", tree: [] }));
+      socket.send(
+        JSON.stringify({
+          type: "snapshot_result",
+          commandId: "c1",
+          tree: [],
+          tabId: 7,
+          url: "https://example.com/",
+        }),
+      );
 
       // #then the POST resolves with that one schema-valid Event
       const res = await commandRes;
       expect(res.status).toBe(200);
       const event = await res.json();
       expect(safeParseEvent(event).success).toBe(true);
-      expect(event).toEqual({ type: "snapshot_result", commandId: "c1", tree: [] });
+      expect(event).toEqual({
+        type: "snapshot_result",
+        commandId: "c1",
+        tree: [],
+        tabId: 7,
+        url: "https://example.com/",
+      });
     } finally {
       socket.close(1000, "done");
     }
@@ -847,43 +878,64 @@ describe("extension liveness fail-fast", () => {
     }
   });
 
-  it("stays connected while any authorized socket survives - a replaced socket's close is not a detach", async () => {
-    // #given two authorized sockets on one session
+  it("routes an overlap dispatch only through the replacement and closes the old socket", async () => {
+    // #given one live extension and collectors installed before its
+    // replacement connects
     const sessionId = await openSession(CALLER_TOKEN_A);
     const old = await connectFakeExtension(sessionId);
+    const oldCommands = collectCommands(old);
+    const oldClosed = waitForSocketClose(old);
+
+    // #when a newer extension authenticates and a command dispatches while
+    // the old client is still observing the close handshake
     const replacement = await connectFakeExtension(sessionId);
 
     try {
-      // #when the old socket closes late (after its replacement is live)
-      old.close(1000, "replaced");
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      const incoming = waitForCommand(replacement);
+      const response = postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "get_tabs",
+        commandId: "l5",
+      });
 
-      // #then the session is NOT stamped detached and commands still flow
+      // #then only the authoritative replacement receives and answers it
+      expect(await incoming).toEqual({ type: "get_tabs", commandId: "l5" });
+      replacement.send(
+        JSON.stringify({ type: "tabs_result", commandId: "l5", tabs: [] }),
+      );
+      expect((await response).status).toBe(200);
+
+      // #then the predecessor receives no command and is closed with the
+      // replacement-specific application code/reason
+      expect(await oldClosed).toEqual({
+        code: 4001,
+        reason: "replaced by newer extension connection",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(oldCommands).toEqual([]);
+
+      // #then its close did not detach the authoritative replacement
       const stub = await getSessionStub(sessionId);
       expect((await stub.getStatus()).status).toBe("connected");
-      expect((await roundTrip(replacement, sessionId, "l5")).status).toBe(200);
     } finally {
       replacement.close(1000, "done");
     }
   });
 
-  it("detaches once the LAST authorized socket closes, after a replacement briefly coexisted", async () => {
-    // #given two authorized sockets, the old one replaced by a newer one
+  it("detaches when the authoritative replacement closes after evicting its predecessor", async () => {
+    // #given a newer socket that has replaced and closed the old authority
     const sessionId = await openSession(CALLER_TOKEN_A);
     const old = await connectFakeExtension(sessionId);
+    const oldClosed = waitForSocketClose(old);
     const replacement = await connectFakeExtension(sessionId);
-
-    // #when the old one closes first - the replacement keeps the session live
-    old.close(1000, "replaced");
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect((await oldClosed).code).toBe(4001);
     const stub = await getSessionStub(sessionId);
     expect((await stub.getStatus()).status).toBe("connected");
 
-    // #when the replacement then also closes - now nothing authorized remains
+    // #when the authoritative replacement closes
     replacement.close(1000, "gone");
     await waitForStatus(sessionId, "detached");
 
-    // #then the session finally detaches (the full replaced-then-both-closed order)
+    // #then the session detaches
     expect((await stub.getStatus()).status).toBe("detached");
   });
 });

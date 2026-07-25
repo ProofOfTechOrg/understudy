@@ -12,7 +12,9 @@ export type DialogEventFields = Omit<DialogRecord, "tabId">;
 // can branch on `decision.bumpGeneration` / `decision.pageEvent` / etc.
 export interface CdpDecision {
   bumpGeneration?: boolean;
+  loadStarted?: boolean;
   pageEvent?: { kind: "navigated" | "load"; url: string };
+  newMainFrameId?: string;
   newUrl?: string;
   // A page dialog to answer locally, and optionally report. `accept` is how to
   // answer Page.handleJavaScriptDialog and is ALWAYS set when present, so an
@@ -51,6 +53,15 @@ function asFrameNavigated(params: unknown): Protocol.Page.FrameNavigatedEvent | 
   return params as Protocol.Page.FrameNavigatedEvent;
 }
 
+function asNavigatedWithinDocument(
+  params: unknown,
+): Protocol.Page.NavigatedWithinDocumentEvent | null {
+  if (typeof params !== "object" || params === null) return null;
+  const event = params as { frameId?: unknown; url?: unknown };
+  if (typeof event.frameId !== "string" || typeof event.url !== "string") return null;
+  return params as Protocol.Page.NavigatedWithinDocumentEvent;
+}
+
 // Narrow a raw Page.javascriptDialogOpening payload to a KNOWN dialog type, or
 // null otherwise. DialogTypeSchema is the protocol's source of truth for the
 // four types we model; anything else (not expected from chrome.debugger) is
@@ -74,15 +85,30 @@ function asDialogOpening(params: unknown): Omit<DialogEventFields, "disposition"
 export function classifyCdpEvent(
   method: string,
   params: unknown,
-  ctx: { currentUrl: string },
+  ctx: { currentUrl: string; mainFrameId: string },
 ): CdpDecision {
   switch (method) {
     case "Page.frameNavigated": {
       const evt = asFrameNavigated(params);
       // Main frame only: a subframe navigation carries a parentId and is ignored.
       if (evt === null || evt.frame.parentId !== undefined) return {};
-      const url = evt.frame.url;
-      return { newUrl: url, bumpGeneration: true, pageEvent: { kind: "navigated", url } };
+      const url = `${evt.frame.url}${evt.frame.urlFragment ?? ""}`;
+      return {
+        newMainFrameId: evt.frame.id,
+        newUrl: url,
+        bumpGeneration: true,
+        loadStarted: true,
+        pageEvent: { kind: "navigated", url },
+      };
+    }
+    case "Page.navigatedWithinDocument": {
+      const evt = asNavigatedWithinDocument(params);
+      if (evt === null || evt.frameId !== ctx.mainFrameId) return {};
+      return {
+        newUrl: evt.url,
+        bumpGeneration: true,
+        pageEvent: { kind: "navigated", url: evt.url },
+      };
     }
     case "Page.loadEventFired":
       // The load event carries no URL; use the generation-tracked current URL.

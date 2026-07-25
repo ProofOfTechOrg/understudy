@@ -57,7 +57,7 @@ function sentRequest(spy: ReturnType<typeof vi.fn>, call = 0): { url: string; bo
   return { url, body: JSON.parse(init.body), headers: init.headers };
 }
 
-const CLICK = { sessionId: "s-1", action: { type: "click", ref: "s1e2" } } as const;
+const CLICK = { sessionId: "s-1", action: { type: "click", ref: "opaque-ref" } } as const;
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -90,7 +90,7 @@ describe("grant gate (fail closed)", () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal("fetch", fetchSpy);
     const { act } = createBrowserConnectors(ENV, stores());
-    const missingSession = { action: { type: "click", ref: "s1e2" } } as unknown as typeof CLICK;
+    const missingSession = { action: { type: "click", ref: "opaque-ref" } } as unknown as typeof CLICK;
 
     await expect(
       callBrowserWrite(act, missingSession, grantFor(BROWSER_ACT_CONNECTOR), "k1"),
@@ -130,7 +130,7 @@ describe("act", () => {
       // random: a retry after a lost/unparseable response re-runs execute()
       // under the same key, and only a stable id lets the service replay the
       // recorded Event instead of executing the write twice.
-      command: { type: "click", ref: "s1e2", commandId: "ik_case1:step1:click" },
+      command: { type: "click", ref: "opaque-ref", commandId: "ik_case1:step1:click" },
     });
   });
 
@@ -162,20 +162,52 @@ describe("observe (read - no grant, no idempotency)", () => {
   }
 
   it("snapshot returns the a11y tree", async () => {
-    const tree = [{ ref: "s1e1", role: "button", name: "Go" }];
+    const tree = [{ ref: "opaque-tree-ref", role: "button", name: "Go" }];
     const out = await observeRead(
       { type: "snapshot", mode: "a11y" },
-      { type: "snapshot_result", commandId: "c1", tree },
+      {
+        type: "snapshot_result",
+        commandId: "c1",
+        tree,
+        tabId: 7,
+        url: "https://x/",
+      },
     );
-    expect(out).toEqual({ tree });
+    expect(out).toEqual({ tree, target: { tabId: 7, url: "https://x/" } });
   });
 
   it("snapshot in screenshot mode returns the image artifact", async () => {
     const out = await observeRead(
       { type: "snapshot", mode: "screenshot" },
-      { type: "screenshot_result", commandId: "c1", mime: "image/png", b64: "aGk=" },
+      {
+        type: "screenshot_result",
+        commandId: "c1",
+        mime: "image/png",
+        b64: "aGk=",
+        tabId: 7,
+        url: "https://x/",
+      },
     );
-    expect(out).toEqual({ screenshot: { mime: "image/png", b64: "aGk=" } });
+    expect(out).toEqual({
+      screenshot: { mime: "image/png", b64: "aGk=" },
+      target: { tabId: 7, url: "https://x/" },
+    });
+  });
+
+  it("snapshot preserves a target-mismatch failure as structured output", async () => {
+    const out = await observeRead(
+      { type: "snapshot", mode: "a11y", tabId: 8 },
+      {
+        type: "action_result",
+        commandId: "c1",
+        ok: false,
+        error: "attached CDP session is tab 7, not requested tab 8",
+      },
+    );
+    expect(out).toEqual({
+      ok: false,
+      error: "attached CDP session is tab 7, not requested tab 8",
+    });
   });
 
   it("get_tabs returns the tab list", async () => {
@@ -245,7 +277,11 @@ describe("observe (read - no grant, no idempotency)", () => {
 });
 
 describe("fill_credential (vaulted write)", () => {
-  const INPUT = { sessionId: "s-1", ref: "s1e9", secretRef: "vault://acme/portal/password" };
+  const INPUT = {
+    sessionId: "s-1",
+    ref: "opaque-ref",
+    secretRef: "vault://acme/portal/password",
+  };
 
   it("passes the opaque secretRef through - the wire carries no plaintext field", async () => {
     const fetchSpy = vi.fn().mockResolvedValue(
@@ -264,7 +300,11 @@ describe("fill_credential (vaulted write)", () => {
     expect(out).toEqual({ ok: true, filled: true, error: undefined });
     const { body } = sentRequest(fetchSpy);
     expect(body).toMatchObject({
-      command: { type: "fill_secret", ref: "s1e9", secretRef: "vault://acme/portal/password" },
+      command: {
+        type: "fill_secret",
+        ref: "opaque-ref",
+        secretRef: "vault://acme/portal/password",
+      },
     });
     expect(Object.keys((body as { command: Record<string, unknown> }).command).sort()).toEqual([
       "commandId",
@@ -468,7 +508,7 @@ describe("write-classification sync with @understudy/protocol", () => {
     // #when it executes
     await callBrowserWrite(
       fillCredential,
-      { sessionId: "s-1", ref: "s1e9", secretRef: "vault://x" },
+      { sessionId: "s-1", ref: "opaque-ref", secretRef: "vault://x" },
       grantFor(BROWSER_FILL_CREDENTIAL_CONNECTOR),
       "case1:login:fill",
     );

@@ -33,6 +33,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     generation: 0,
     awaitingCommandIds: [],
     status: "pending",
+    activeConnectionId: null,
     completedWrites: [],
     dialogs: [],
   };
@@ -42,16 +43,12 @@ export class SessionAgent extends Agent<Env, SessionState> {
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
     this.coordinator = new CfSessionCoordinator({
-      // getConnections() is hibernation-safe like broadcast(), but filtered to
-      // connections onConnect has marked authorized: the SDK accepts a socket
-      // (and admits it to the connection set) before onConnect's async auth
-      // check resolves, so an unverified or wrong-tenant socket can sit here
-      // during that gap - sending to it directly would hand it a plaintext
-      // command.
       sendToExtension: (payload) => {
-        for (const connection of this.getConnections()) {
-          if (this.isAuthorizedConnection(connection)) connection.send(payload);
+        const connection = this.authoritativeConnection();
+        if (connection === undefined) {
+          throw new Error("authoritative extension connection disappeared before send");
         }
+        connection.send(payload);
       },
       hasAuthorizedConnection: () => this.hasAuthorizedConnection(),
       getAwaitingCommandIds: () => this.state.awaitingCommandIds,
@@ -72,8 +69,28 @@ export class SessionAgent extends Agent<Env, SessionState> {
       connection.close(1008, "tenant mismatch");
       return;
     }
+    this.makeConnectionAuthoritative(connection);
+  }
+
+  private makeConnectionAuthoritative(connection: Connection): void {
     connection.setState({ authorized: true });
-    this.setState({ ...this.state, status: "connected" });
+    this.setState({
+      ...this.state,
+      activeConnectionId: connection.id,
+      status: "connected",
+    });
+
+    for (const previous of this.getConnections()) {
+      if (previous.id === connection.id || !this.isAuthorizedConnection(previous)) continue;
+      previous.setState({ authorized: false });
+      try {
+        previous.close(4001, "replaced by newer extension connection");
+      } catch {
+        // Authority already moved and the predecessor is demoted. A socket
+        // that raced to CLOSED must not make the successful replacement's
+        // onConnect reject.
+      }
+    }
   }
 
   /**
@@ -105,7 +122,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   async onMessage(connection: Connection, message: WSMessage): Promise<void> {
-    if (!this.isAuthorizedConnection(connection)) return;
+    if (!this.isAuthoritativeConnection(connection)) return;
     if (typeof message !== "string") return;
 
     let parsed: unknown;
@@ -147,19 +164,24 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
-    // A socket that never passed onConnect's auth check never contributed
-    // to the session's status, so its close must not change it either - a
-    // rejected/never-authorized socket closing on a fresh session would
-    // otherwise stamp "pending" over with "detached".
     if (!this.isAuthorizedConnection(connection)) return;
-    // Only the LAST authorized socket's close detaches the session: a late
-    // close event from a replaced socket must not stamp "detached" over a
-    // healthy reconnect (the closing connection is excluded explicitly, in
-    // case the SDK has not yet reaped it from the connection set).
-    const stillLive = [...this.getConnections()].some(
-      (c) => c !== connection && this.isAuthorizedConnection(c),
-    );
-    if (!stillLive) this.setState({ ...this.state, status: "detached" });
+
+    const activeConnectionId = this.persistedActiveConnectionId();
+    if (activeConnectionId === undefined) {
+      const anotherAuthorizedConnection = [...this.getConnections()].some(
+        (candidate) =>
+          candidate.id !== connection.id && this.isAuthorizedConnection(candidate),
+      );
+      if (anotherAuthorizedConnection) return;
+    } else if (activeConnectionId !== connection.id) {
+      return;
+    }
+
+    this.setState({
+      ...this.state,
+      activeConnectionId: null,
+      status: "detached",
+    });
   }
 
   async dispatch(command: Command, dryRun?: boolean): Promise<DispatchOutcome> {
@@ -426,14 +448,56 @@ export class SessionAgent extends Agent<Env, SessionState> {
     return (connection.state as { authorized?: boolean } | null)?.authorized === true;
   }
 
-  // The delivery predicate the coordinator's fail-fast gate consults: the
-  // same precondition sendToExtension relies on, NOT the persisted status
-  // scalar (onClose guards the stamping races, but the scalar remains an
-  // eventually-consistent echo, not the delivery truth).
   private hasAuthorizedConnection(): boolean {
-    for (const connection of this.getConnections()) {
-      if (this.isAuthorizedConnection(connection)) return true;
+    return this.authoritativeConnection() !== undefined;
+  }
+
+  private isAuthoritativeConnection(connection: Connection): boolean {
+    if (!this.isAuthorizedConnection(connection)) return false;
+
+    const activeConnectionId = this.persistedActiveConnectionId();
+    if (activeConnectionId !== undefined) {
+      return activeConnectionId !== null && connection.id === activeConnectionId;
     }
-    return false;
+
+    return this.authoritativeConnection()?.id === connection.id;
+  }
+
+  /**
+   * Returns the one live socket Commands may be sent to. A state persisted
+   * before activeConnectionId existed is migrated only when its connection
+   * set has exactly one authorized socket; zero or multiple candidates fail
+   * closed rather than reviving the old broadcast behavior.
+   */
+  private authoritativeConnection(): Connection | undefined {
+    const activeConnectionId = this.persistedActiveConnectionId();
+    if (activeConnectionId === null) return undefined;
+
+    const authorized = [...this.getConnections()].filter((connection) =>
+      this.isAuthorizedConnection(connection),
+    );
+    if (activeConnectionId !== undefined) {
+      return authorized.find((connection) => connection.id === activeConnectionId);
+    }
+    if (authorized.length !== 1) return undefined;
+
+    const [connection] = authorized;
+    if (connection === undefined) return undefined;
+    this.setState({
+      ...this.state,
+      activeConnectionId: connection.id,
+      status: "connected",
+    });
+    return connection;
+  }
+
+  // Persisted before this field existed, a session's state can lack it;
+  // initialState only seeds brand-new DOs.
+  private persistedActiveConnectionId(): string | null | undefined {
+    return (
+      this.state as SessionState & {
+        activeConnectionId?: string | null;
+      }
+    ).activeConnectionId;
   }
 }

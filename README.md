@@ -28,7 +28,7 @@ drive it over HTTP (Topology 1).
   no LLM and embeds no agent framework — the brain and governance (breakwater/flowsafe) live in
   the consumers. See its README.
 
-M4 status: `@understudy/protocol@0.5.0` and `@understudy/connector@0.3.0` are
+M4 status: `@understudy/protocol@0.6.0` and `@understudy/connector@0.4.0` are
 published on npm. Metamind contains the cross-repository Mastra workflow,
 flowsafe approval gate, breakwater browser connectors, and attended runbook.
 The remaining M4 step is running that proof with a connected Chromium

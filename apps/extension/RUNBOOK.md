@@ -11,7 +11,7 @@ what M3 replaces (and a reference for M3's `onMessage`).
 
 ## Baseline / environment
 
-- Branch `master`, base commit `4a9a946` (`git rev-parse HEAD` to confirm).
+- Branch `master`, base commit `4a48b94` (`git rev-parse HEAD` to confirm).
 - **Node ≥ 22, pnpm 11.5.2** (repo `packageManager`). This machine: Node 24, pnpm 11.5.2.
 - **Real Chromium via `wxt build` + Load unpacked — NOT `wxt dev`.** `wxt dev`
   starts a throwaway profile with no logins, which defeats the whole point
@@ -90,13 +90,17 @@ press Enter. `commandId` is auto-filled — you do not type it. Blank lines and
 lines starting with `#` are ignored. After each send the stub echoes `> sent …`
 and then prints the extension's reply.
 
-> Tip: replace `<ref>` with a real ref (e.g. `s1e7`) copied from the most recent
-> `snapshot_result` output. Refs are generation-namespaced — a ref is only valid
-> for the snapshot generation that produced it.
+> Tip: replace `<ref>` with the opaque ref copied verbatim from the most recent
+> `snapshot_result` output. Do not parse or construct refs: each is a capability
+> bound to the extension WebSocket session, CDP attachment, and snapshot
+> generation that produced it.
 
 ```jsonc
-# read the page — prints a nested node tree; copy a textbox/searchbox/button ref
+# read the page — first confirm tabId + exact URL, then copy a textbox/searchbox/button ref
 {"type":"snapshot","mode":"a11y"}
+
+# capture the same exact target as an image
+{"type":"snapshot","mode":"screenshot"}
 
 # type into a field you copied a ref for (submit:false = don't press Enter)
 {"type":"type","ref":"<ref>","text":"hello","submit":false}
@@ -127,11 +131,12 @@ Expected replies (watch the stub terminal):
 
 | Line | Expected stub output | Visible in Chromium |
 |---|---|---|
-| `snapshot` a11y | `snapshot_result` with a node count + the first ~15 `{ref role "name"}` indented | — |
+| `snapshot` a11y | `snapshot_result` with the attached `tabId`, exact bracketed URL (including any fragment), node count, and first ~15 `{ref role "name"}` indented. Confirm the target matches the panel/current tab before using a ref. | — |
+| `snapshot` screenshot | `screenshot_result` with the same attached `tabId`, exact bracketed URL, MIME type, and payload length | — |
 | `type` | `action_result … ok=true` | the text appears in the field |
 | `click` | `action_result … ok=true` | the element is clicked |
 | `navigate` | `action_result … ok=true url=…` **and** a `page_event navigated …` | the tab navigates |
-| stale `click` | `action_result … ok=false error=…` (generation mismatch — no input dispatched) | nothing happens |
+| stale `click` | `action_result … ok=false error=…` (stale/unknown capability — no input dispatched) | nothing happens |
 | `get_tabs` | `tabs_result` listing the open tabs (tabId/title/url) | — |
 | `switch_tab` | `action_result … ok=true` | the other tab becomes active |
 | `snapshot` dom | `action_result … ok=false error="dom snapshot unsupported"` | — |
@@ -173,10 +178,11 @@ and the command returns its normal result.
 
 **Zero `EVENT SCHEMA VIOLATION` logs across the entire session.**
 
-Every event the extension emitted — `hello`, `snapshot_result`, `action_result`,
-`page_event`, `tabs_result`, `pong` — passed `safeParseEvent` against the real
-protocol schemas on the real WS wire. Combined with the visible page effects in
-step 6, the stale-ref rejection, `get_tabs`, idle survival (step 7), and
+Every event the extension emitted — `hello`, `snapshot_result`,
+`screenshot_result`, `action_result`, `page_event`, `dialog`, `tabs_result`,
+`pong` — passed `safeParseEvent` against the real protocol schemas on the real WS wire.
+Combined with explicit snapshot target confirmation, the visible page effects
+in step 6, the stale-ref rejection, `get_tabs`, idle survival (step 7), and
 eviction reconcile (step 8), that is M2 proven end-to-end.
 
 If a violation *does* print, it is loud and boxed and includes the raw event plus

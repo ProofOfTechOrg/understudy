@@ -7,9 +7,16 @@ async function withSession(
   session: CdpSession | null,
   commandId: string,
   run: (session: CdpSession) => Promise<Event>,
+  expectedTabId?: number,
 ): Promise<Event> {
   if (session === null) {
     return actionError(commandId, "no active CDP session");
+  }
+  if (expectedTabId !== undefined && expectedTabId !== session.tabId) {
+    return actionError(
+      commandId,
+      `attached CDP session is tab ${session.tabId}, not requested tab ${expectedTabId}`,
+    );
   }
   return run(session);
 }
@@ -31,17 +38,29 @@ export async function routeCommand(cmd: Command, session: CdpSession | null): Pr
         if (cmd.mode === "dom") {
           return actionError(cmd.commandId, "dom snapshot unsupported");
         }
-        if (session === null) {
-          return actionError(cmd.commandId, "no active CDP session");
-        }
         if (cmd.mode === "a11y") {
-          return await session.snapshotA11y(cmd.commandId);
+          return await withSession(
+            session,
+            cmd.commandId,
+            (s) => s.snapshotA11y(cmd.commandId),
+            cmd.tabId,
+          );
         }
-        return await session.screenshot(cmd.commandId);
+        return await withSession(
+          session,
+          cmd.commandId,
+          (s) => s.screenshot(cmd.commandId),
+          cmd.tabId,
+        );
       }
       case "navigate": {
         const { url } = cmd;
-        return await withSession(session, cmd.commandId, (s) => s.navigate(cmd.commandId, url));
+        return await withSession(
+          session,
+          cmd.commandId,
+          (s) => s.navigate(cmd.commandId, url),
+          cmd.tabId,
+        );
       }
       case "click": {
         const { ref } = cmd;

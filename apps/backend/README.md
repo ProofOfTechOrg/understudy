@@ -35,7 +35,7 @@ route (internally the coordinator still rejects with the `src/coordinator.ts`
 prefix constants; `SessionAgent.dispatchFailure` maps them in-isolate). The
 route maps reasons to statuses:
 **503** `{error: "extension not connected"}` when the session has no live,
-onConnect-authorized extension socket — the gate consults that delivery
+authoritative onConnect-authorized extension socket — the gate consults that delivery
 predicate directly (not the persisted `status` scalar), fails fast instead of
 burning the 30s timeout, and answers non-2xx deliberately: a 200 `ok:false`
 Event would be cached by a consumer's idempotency store and replayed after
@@ -86,17 +86,22 @@ all.
 The in-DO gate remains as defense in depth for any path that reaches the DO
 without that router: `onConnect` runs the same async checks
 (`verifyExtensionToken` + `scopeSession`) before marking a connection
-`connection.setState({ authorized: true })`, closing with 1008 otherwise.
+`connection.setState({ authorized: true })`, closing with 1008 otherwise. Once
+authenticated, the newest socket becomes the session's sole authority through
+persisted `SessionState.activeConnectionId`; prior authorized sockets are
+demoted and closed with 4001 (`"replaced by newer extension connection"`).
 The Agents SDK accepts a socket — and admits it to the connection set
 `getConnections()` returns — before that async check resolves, so an
 unauthenticated or wrong-tenant socket could sit in the connection set
 during that window. Four things close this gap:
 
-- `sendToExtension` (the coordinator's outbound path) iterates
-  `getConnections()` but filters to `isAuthorizedConnection`, so a command is
-  never written to a socket still pending auth.
-- `onMessage` returns immediately for any connection that isn't yet authorized,
-  so an unauthenticated socket cannot inject events.
+- `sendToExtension` (the coordinator's outbound path) resolves exactly the
+  authorized socket named by `activeConnectionId`, so a command is never
+  broadcast, sent to a socket still pending auth, or duplicated during a
+  reconnect overlap.
+- `onMessage` returns immediately unless its sender is that same authoritative,
+  authorized socket, so neither an unauthenticated nor a replaced socket can
+  inject events or resolve another socket's command.
 - `shouldSendProtocolMessages` returns `false` unconditionally, suppressing the
   SDK's own connect-time protocol frames — the extension speaks only the
   `@understudy/protocol` wire shape and already discards anything else, so this
@@ -105,6 +110,13 @@ during that window. Four things close this gap:
   the SDK's generic client→server `cf_agent_state` sync path reaches this hook for
   any accepted connection, including one still awaiting auth, and this DO's state
   is server-driven only.
+
+Persisted sessions created before `activeConnectionId` existed migrate lazily
+only when exactly one authorized socket is live. Multiple legacy candidates are
+ambiguous and fail closed until a newly authenticated socket claims authority;
+the service never falls back to the former broadcast behavior. Closing a
+replaced socket cannot detach its replacement because `onClose` clears status
+only when the closing connection owns the persisted authority.
 
 ## Design decisions
 
@@ -232,6 +244,10 @@ during that window. Four things close this gap:
 - One Durable Object per `sessionId`; a sessionId whose embedded tenant disagrees
   with the authenticated caller is refused with 404, never 403 — on the /v1
   API and on the agent WS/HTTP path alike.
+- Exactly one authenticated extension socket is authoritative per session.
+  Commands and Events use only its persisted `activeConnectionId`; a newer
+  authenticated socket atomically replaces and closes prior sockets, and a
+  late predecessor close cannot detach the replacement.
 - A mid-command DO hibernation cannot happen (see above); an interrupting
   shutdown/restart is bounded by the per-command timeout, and the persisted
   awaiting-marker reconciles any orphaned late result rather than mis-resolving it.

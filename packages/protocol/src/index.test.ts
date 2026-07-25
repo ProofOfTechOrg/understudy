@@ -41,7 +41,7 @@ describe("CommandSchema", () => {
     const cmd = {
       type: "fill_secret",
       commandId: "c1",
-      ref: "s1e2",
+      ref: "opaque-ref",
       secretRef: "vault://x",
       submit: true,
     };
@@ -50,12 +50,12 @@ describe("CommandSchema", () => {
 
   it("rejects fill_secret missing secretRef", () => {
     expect(
-      safeParseCommand({ type: "fill_secret", commandId: "c1", ref: "s1e2" }).success,
+      safeParseCommand({ type: "fill_secret", commandId: "c1", ref: "opaque-ref" }).success,
     ).toBe(false);
   });
 
   it("parses a valid resolve_ref command", () => {
-    const cmd = { type: "resolve_ref", commandId: "c1", ref: "s1e2" };
+    const cmd = { type: "resolve_ref", commandId: "c1", ref: "opaque-ref" };
     expect(parseCommand(cmd)).toEqual(cmd);
   });
 
@@ -76,14 +76,14 @@ describe("isWriteCommand", () => {
     const fillSecret: Command = {
       type: "fill_secret",
       commandId: "c1",
-      ref: "s1e2",
+      ref: "opaque-ref",
       secretRef: "vault://x",
     };
     expect(isWriteCommand(fillSecret)).toBe(true);
   });
 
   it("classifies resolve_ref as a read - the dry-run probe must run freely", () => {
-    const probe: Command = { type: "resolve_ref", commandId: "c1", ref: "s1e2" };
+    const probe: Command = { type: "resolve_ref", commandId: "c1", ref: "opaque-ref" };
     expect(isWriteCommand(probe)).toBe(false);
   });
 
@@ -125,6 +125,35 @@ describe("isWriteCommand", () => {
 });
 
 describe("EventSchema", () => {
+  it("round-trips an accessibility snapshot with its attached target identity", () => {
+    const ev = {
+      type: "snapshot_result",
+      commandId: "c1",
+      tree: [],
+      tabId: 7,
+      url: "https://example.com/",
+    };
+    expect(EventSchema.parse(ev)).toEqual(ev);
+  });
+
+  it("rejects a snapshot result without its attached target identity", () => {
+    expect(
+      safeParseEvent({ type: "snapshot_result", commandId: "c1", tree: [] }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a snapshot result with an invalid attached tab id", () => {
+    expect(
+      safeParseEvent({
+        type: "snapshot_result",
+        commandId: "c1",
+        tree: [],
+        tabId: -1,
+        url: "https://example.com/",
+      }).success,
+    ).toBe(false);
+  });
+
   it("round-trips an action_result", () => {
     const ev = { type: "action_result", commandId: "c1", ok: true, url: "https://example.com/" };
     expect(EventSchema.parse(ev)).toEqual(ev);
