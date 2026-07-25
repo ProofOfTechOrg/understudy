@@ -17,8 +17,9 @@
 //
 // `modifiers` is the CDP bitmask Alt=1, Ctrl=2, Meta=4, Shift=8. `text` is set
 // only for a printable key with no command modifier (Ctrl/Alt/Meta) held — a
-// shifted letter yields its uppercase text; named and control-combo keys carry
-// none.
+// shifted letter yields its uppercase text. Enter carries the carriage return
+// Chromium needs for its default action; other named keys and control-combo
+// keys carry none.
 
 export interface ParsedKey {
   modifiers: number;
@@ -50,11 +51,12 @@ interface NamedKey {
   key: string;
   code: string;
   windowsVirtualKeyCode: number;
+  text?: string;
 }
 
 const NAMED_KEYS: Record<string, NamedKey> = {
-  enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 },
-  return: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 },
+  enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
+  return: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
   tab: { key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 },
   escape: { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 },
   esc: { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 },
@@ -89,14 +91,17 @@ export function parseKeys(spec: string): ParsedKey {
     modifiers |= bit;
   }
 
+  const hasCommandModifier = (modifiers & (MOD_ALT | MOD_CTRL | MOD_META)) !== 0;
   const named = NAMED_KEYS[keyToken.toLowerCase()];
   if (named !== undefined) {
-    return {
+    const result: ParsedKey = {
       modifiers,
       key: named.key,
       code: named.code,
       windowsVirtualKeyCode: named.windowsVirtualKeyCode,
     };
+    if (named.text !== undefined && !hasCommandModifier) result.text = named.text;
+    return result;
   }
 
   if (keyToken.length !== 1) {
@@ -122,7 +127,6 @@ export function parseKeys(spec: string): ParsedKey {
 
   // Command modifiers (Alt/Ctrl/Meta) turn the keystroke into a shortcut rather
   // than text input, so only a plain (optionally Shift-ed) printable carries text.
-  const hasCommandModifier = (modifiers & (MOD_ALT | MOD_CTRL | MOD_META)) !== 0;
   if (!hasCommandModifier) result.text = key;
 
   return result;

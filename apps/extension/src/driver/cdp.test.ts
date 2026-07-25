@@ -32,6 +32,20 @@ function stubBrowserStorage(): void {
   });
 }
 
+function stubActionBrowser(): ReturnType<typeof vi.fn> {
+  const sendCommand = vi.fn().mockResolvedValue({});
+  vi.stubGlobal("browser", {
+    storage: {
+      session: {
+        get: vi.fn().mockResolvedValue({}),
+        set: vi.fn().mockResolvedValue(undefined),
+      },
+    },
+    debugger: { sendCommand },
+  });
+  return sendCommand;
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -150,6 +164,116 @@ describe("CdpSession.resolveRefCheck", () => {
       ok: false,
       error: `stale or unknown ref: ${testRef(0, 1)}`,
     });
+  });
+});
+
+describe("CdpSession keyboard dispatch", () => {
+  it("submits typed text with Enter's carriage-return key event", async () => {
+    const sendCommand = stubActionBrowser();
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([[testRef(0, 1), 42]]);
+
+    await expect(session.type("c-submit", testRef(0, 1), "secret", true)).resolves.toEqual({
+      type: "action_result",
+      commandId: "c-submit",
+      ok: true,
+    });
+
+    expect(sendCommand.mock.calls).toEqual([
+      [{ tabId: 7 }, "DOM.focus", { backendNodeId: 42 }],
+      [{ tabId: 7 }, "Input.insertText", { text: "secret" }],
+      [
+        { tabId: 7 },
+        "Input.dispatchKeyEvent",
+        {
+          type: "keyDown",
+          modifiers: 0,
+          key: "Enter",
+          code: "Enter",
+          windowsVirtualKeyCode: 13,
+          text: "\r",
+          unmodifiedText: "\r",
+        },
+      ],
+      [
+        { tabId: 7 },
+        "Input.dispatchKeyEvent",
+        {
+          type: "keyUp",
+          modifiers: 0,
+          key: "Enter",
+          code: "Enter",
+          windowsVirtualKeyCode: 13,
+        },
+      ],
+    ]);
+  });
+
+  it("does not dispatch a key event when type submit is false", async () => {
+    const sendCommand = stubActionBrowser();
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([[testRef(0, 1), 42]]);
+
+    await session.type("c-no-submit", testRef(0, 1), "plain text", false);
+
+    expect(sendCommand.mock.calls.map((call) => call[1])).toEqual([
+      "DOM.focus",
+      "Input.insertText",
+    ]);
+  });
+
+  it("uses the same Enter payload for the explicit key command", async () => {
+    const sendCommand = stubActionBrowser();
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([[testRef(0, 1), 42]]);
+
+    await session.key("c-enter", "Enter", testRef(0, 1));
+
+    expect(sendCommand.mock.calls.slice(1)).toEqual([
+      [
+        { tabId: 7 },
+        "Input.dispatchKeyEvent",
+        {
+          type: "keyDown",
+          modifiers: 0,
+          key: "Enter",
+          code: "Enter",
+          windowsVirtualKeyCode: 13,
+          text: "\r",
+          unmodifiedText: "\r",
+        },
+      ],
+      [
+        { tabId: 7 },
+        "Input.dispatchKeyEvent",
+        {
+          type: "keyUp",
+          modifiers: 0,
+          key: "Enter",
+          code: "Enter",
+          windowsVirtualKeyCode: 13,
+        },
+      ],
+    ]);
+  });
+
+  it("uses rawKeyDown for keys without text", async () => {
+    const sendCommand = stubActionBrowser();
+    const session = await CdpSession.create(7, TEST_SCOPE);
+
+    await session.key("c-escape", "Escape");
+
+    expect(sendCommand.mock.calls[0]).toEqual([
+      { tabId: 7 },
+      "Input.dispatchKeyEvent",
+      {
+        type: "rawKeyDown",
+        modifiers: 0,
+        key: "Escape",
+        code: "Escape",
+        windowsVirtualKeyCode: 27,
+      },
+    ]);
   });
 });
 
