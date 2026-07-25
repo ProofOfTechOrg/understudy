@@ -414,6 +414,25 @@ export class CdpSession {
     }
   }
 
+  private async dispatchKey(parsed: ReturnType<typeof parseKeys>): Promise<void> {
+    const base: Record<string, unknown> = {
+      modifiers: parsed.modifiers,
+      key: parsed.key,
+      code: parsed.code,
+      windowsVirtualKeyCode: parsed.windowsVirtualKeyCode,
+    };
+    const keyDown: Record<string, unknown> = {
+      ...base,
+      type: parsed.text === undefined ? "rawKeyDown" : "keyDown",
+    };
+    if (parsed.text !== undefined) {
+      keyDown.text = parsed.text;
+      keyDown.unmodifiedText = parsed.text;
+    }
+    await this.send("Input.dispatchKeyEvent", keyDown);
+    await this.send("Input.dispatchKeyEvent", { ...base, type: "keyUp" });
+  }
+
   snapshotA11y(commandId: string): Promise<Event> {
     const deadlineAt = Date.now() + SNAPSHOT_DEADLINE_MS;
     return this.run(
@@ -497,9 +516,7 @@ export class CdpSession {
       await this.focusOrClick(backendNodeId);
       await this.send("Input.insertText", { text });
       if (submit === true) {
-        const enter = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 };
-        await this.send("Input.dispatchKeyEvent", { type: "keyDown", ...enter });
-        await this.send("Input.dispatchKeyEvent", { type: "keyUp", ...enter });
+        await this.dispatchKey(parseKeys("Enter"));
       }
       return { type: "action_result", commandId, ok: true };
     });
@@ -515,16 +532,7 @@ export class CdpSession {
         await this.optional(this.send("DOM.focus", { backendNodeId }));
       }
       const parsed = parseKeys(keys);
-      const base: Record<string, unknown> = {
-        modifiers: parsed.modifiers,
-        key: parsed.key,
-        code: parsed.code,
-        windowsVirtualKeyCode: parsed.windowsVirtualKeyCode,
-      };
-      const keyDown: Record<string, unknown> = { ...base, type: "keyDown" };
-      if (parsed.text !== undefined) keyDown.text = parsed.text;
-      await this.send("Input.dispatchKeyEvent", keyDown);
-      await this.send("Input.dispatchKeyEvent", { ...base, type: "keyUp" });
+      await this.dispatchKey(parsed);
       return { type: "action_result", commandId, ok: true };
     });
   }

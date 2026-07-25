@@ -21,12 +21,13 @@ describe("parseKeys", () => {
     expect(parseKeys("OPTION+a").modifiers).toBe(1);
   });
 
-  it("maps named keys to {key, code, windowsVirtualKeyCode}", () => {
+  it("maps named keys to their CDP fields", () => {
     expect(parseKeys("Enter")).toEqual({
       modifiers: 0,
       key: "Enter",
       code: "Enter",
       windowsVirtualKeyCode: 13,
+      text: "\r",
     });
     expect(parseKeys("Tab")).toMatchObject({ key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
     expect(parseKeys("Escape")).toMatchObject({
@@ -55,8 +56,13 @@ describe("parseKeys", () => {
     expect(parseKeys("Ctrl+a").text).toBeUndefined();
   });
 
-  it("does not set text for named or control keys", () => {
-    expect(parseKeys("Enter").text).toBeUndefined();
+  it("carries a carriage return only for Enter without a command modifier", () => {
+    expect(parseKeys("Enter").text).toBe("\r");
+    expect(parseKeys("Return").text).toBe("\r");
+    expect(parseKeys("Shift+Enter").text).toBe("\r");
     expect(parseKeys("Ctrl+Enter").text).toBeUndefined();
+    expect(parseKeys("Alt+Enter").text).toBeUndefined();
+    expect(parseKeys("Meta+Enter").text).toBeUndefined();
+    expect(parseKeys("Escape").text).toBeUndefined();
   });
 });
