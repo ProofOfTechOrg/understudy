@@ -25,13 +25,11 @@ the substrate role.
 
 - **Repo**: `proofoftech/understudy` (its OWN repo — not merged into `proofoftech/anchorage`,
   which is the libs-only monorepo shipping breakwater/flowsafe; every product is a separate repo
-  consuming anchorage via published `@proofoftech/*` deps). Branch `master`; HEAD `11565d6`.
-  **M1 protocol package done + tested. M0 CDP spike RUN in a real logged-in Chromium 2026-07-13 —
-  10/11 CDP commands OK; only `Target.getTargets` is restricted (`"Not allowed"`), which does not
-  affect the design (see "M0 findings"). The CDP targeting approach (D2/D7) is validated; the
-  plan's one gating technical risk is retired.** M2 (extension driver) is planned as an
-  executor-ready planner IR at `~/.claude/plans/enchanted-karp-state/`.
-- **Main branch for PRs**: `main` (does not exist yet; create on first push).
+  consuming anchorage via published `@proofoftech/*` deps). As of 2026-07-26, the baseline is
+  branch `master` at `797d0e489df2772d0f5d597141982547861881bb`. Reconfirm the branch and SHA
+  before applying future edits. M0 through M4 are complete; M5 is largely complete with the
+  remaining work listed in its milestone entry.
+- **Main branch for PRs**: `master`.
 - **Runtime targets decided**: Cloudflare-first service; Chromium-only extension; multi-tenant;
   CDP (`chrome.debugger`) as the automation driver. Self-host (Node) of the service is a *future*
   target, kept open behind an interface — not built in v1.
@@ -55,10 +53,10 @@ the substrate role.
   substrate it is used for exactly one thing: the **per-session WebSocket DO** (WS-hibernation
   handling + per-session state). It is **NOT** Anthropic's *Managed Agents* and **NOT** the
   *Claude Agent SDK*. Consumers, not understudy, run the LLM agent (they use Mastra).
-- **Verify fast-moving facts at build time.** Written 2026-07-13. Before the relevant milestone,
-  re-confirm against current docs: (a) the `chrome.debugger` allowed-CDP surface [M0, retired];
+- **Verify fast-moving facts before changing these surfaces.** Written 2026-07-13. Re-confirm
+  against current docs: (a) the `chrome.debugger` allowed-CDP surface [M0 evidence is historical];
   (b) the Agents SDK API (`Agent`, `routeAgentRequest`, `onConnect/onMessage`, `setState`) +
-  Workers/DO limits [M3]; (c) breakwater/flowsafe APIs at the consumer boundary (the
+  Workers/DO limits; (c) breakwater/flowsafe APIs at the consumer boundary (the
   `POST /commands` contract + `fill_secret`).
 - **understudy runs no LLM** — there is no `claude-api` prerequisite here. Model choice
   (Claude `claude-opus-4-8` is the consumers' default; `deepseek-v4-pro` was considered and
@@ -66,7 +64,6 @@ the substrate role.
   consumer's concern. If a thin first-party demo agent is ever built, it uses Claude via Mastra.
 - **Cloudflare build**: lean on the `cloudflare:agents-sdk` / `cloudflare:workers-best-practices` /
   `cloudflare:wrangler` skills.
-- **Index into codebase-memory once code exists** (nothing to index while greenfield).
 
 ## Core decisions (with rationale + rejected options)
 
@@ -124,7 +121,7 @@ understudy/
   pnpm-workspace.yaml
   packages/
     protocol/                  # PUBLISHED @understudy/protocol (zod 4): Command/Event unions + schemas.
-      src/index.ts             #   The shared contract consumers import. Add fill_secret here.
+      src/index.ts             #   Shared contract, including fill_secret, imported by consumers.
     connector/                 # PUBLISHED @understudy/connector (M4): reference breakwater connectors
       src/index.ts             #   (observe/act/fill_credential) consumers import as Mastra tools.
   apps/
@@ -135,7 +132,7 @@ understudy/
       src/secrets.ts           # fill_secret: secretRef → vault resolve → dispatch (plaintext never logged)
       src/auth.ts              # caller (consumer) auth + tenant/session scoping
       wrangler.jsonc
-    extension/                 # MV3, Chromium (WXT) — M2 (see the M2 planner IR)
+    extension/                 # Shipped M2 MV3 Chromium extension built with WXT
       src/entrypoints/background.ts   # SW: WS client, keepalive, command router, CDP session manager
       src/entrypoints/sidepanel/      # React: status, attach/detach (no task/approval UI — that's consumer-side)
       src/driver/cdp.ts               # CDP executors: snapshot/click/type/navigate/... (+ dry-run seam)
@@ -333,10 +330,13 @@ proven default; nothing is built on OOPIF until a consumer requires it.
 ## Consumer integration — the governed connector (breakwater + flowsafe)
 
 This is CONSUMER code (in metamind / smart-compliance), documented here because it defines understudy's
-outward contract. Canonical reference: **`packages/connector` (`@understudy/connector`, M4)** — tested
-against the shipped M3 service contract (bearer caller auth, protocol v0.3.0). The historical sketch it
-grew from, `smart-compliance/docs/examples/understudy-browser-connector.ts`, predates M3 (no caller
-auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer the package.
+outward contract. Canonical reference: **`packages/connector`
+(`@understudy/connector@0.4.0`, M4)**, tested against the shipped M3 service contract
+(bearer caller auth and `@understudy/protocol@0.6.0` target-bound snapshots and refs).
+The historical sketch it grew from,
+`smart-compliance/docs/examples/understudy-browser-connector.ts`, predates M3 (no
+caller auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer
+the package.
 
 - A browser action is wrapped as a **breakwater `createConnector()`** (three connectors:
   `observe` = read/no-approval, `act` = write/discriminated-union, `fill_credential` = write/vaulted).
@@ -444,32 +444,40 @@ auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer t
 - **M0 — CDP spike. ✅ DONE (2026-07-13)** — 10/11 CDP commands OK; only `Target.getTargets` restricted
   (non-blocking); a11y ref-model pruning validated (162/2060 actionable). See "M0 findings".
 - **M1 — Protocol package. ✅ DONE** — `@understudy/protocol` zod schemas + types; round-trip tests.
-  *Follow-ons: `tabs_result` + the zod 3→4 bump land at M2 (the extension bundles zod 4); `fill_secret` + the public **publish** land at M3.*
-- **M2 — Extension driver.** SW holds a WS to a stub server; `cdp.ts` implements
+  *Follow-ons: `tabs_result` + the zod 3→4 bump landed in M2 (the extension bundles zod 4);
+  `fill_secret` and publishable package metadata landed in M3; the release
+  pipeline and first npm publication landed in M4.*
+- **M2 — Extension driver. ✅ DONE** — SW holds a WS to the service; `cdp.ts` implements
   snapshot/click/type/navigate/key/scroll/wait; command router maps protocol → CDP; 20–25 s keepalive +
-  `chrome.alarms` backstop. **Planned as an executor-ready planner IR** at
-  `~/.claude/plans/enchanted-karp-state/` (9 milestones / 7 waves). Small amendments from Topology 1: the
-  zod-4 bump (extension bundles protocol+zod), and a `dryRun` execution mode (resolve ref, don't dispatch)
-  or an explicit "unsupported" deferral. `fill_secret` is service-side, so the executors are unchanged.
-- **M3 — Browser-execution service.** Hono + Agents-SDK **per-session** DO; `routeAgentRequest`;
+  `chrome.alarms` backstop. The extension bundles protocol with zod 4. `dryRun` is enforced by the
+  service before dispatch, and `fill_secret` remains service-side.
+- **M3 — Browser-execution service. ✅ DONE** — Hono + Agents-SDK **per-session** DO; `routeAgentRequest`;
   `POST /v1/sessions/:sessionId/commands` (with `dryRun`); the pending-map + hibernation-resume marker;
-  `fill_secret` vault resolution; caller auth + per-tenant/session scoping. Verify: a stub consumer (or
-  `curl`) drives a real logged-in page over HTTP through the service and gets schema-valid `Event`s;
-  a shutdown/restart or late result settles through timeout/resync without deadlock or stale markers.
-- **M4 — Consumer integration + published contract.** Publish `@understudy/protocol` (zod 4) and a
-  reference breakwater connector (`@understudy/connector`, mirroring the smart-compliance example). A real
-  consumer (metamind / smart-compliance) drives understudy end-to-end with a Mastra agent + flowsafe
-  approvals. *Cross-repo; understudy's deliverable is the published contract + reference connector, not
-  the agent.* **Status (2026-07-25): PACKAGES PUBLISHED** — observe
+  `fill_secret` vault resolution; caller auth + per-tenant/session scoping. Automated service tests
+  cover WebSocket connection, command dispatch, timeout/resync behavior, tenant isolation, and
+  credential handling.
+- **M4 — Consumer integration + published contract. ✅ DONE** —
+  `@understudy/protocol` (zod 4) and the reference breakwater connector
+  `@understudy/connector` are published. Metamind drove Understudy end-to-end
+  through its attended flowsafe browser-enrichment workflow and breakwater
+  connectors. *Cross-repo; understudy's deliverable is the published contract +
+  reference connector, not the consumer workflow.*
+  **Status (2026-07-26): COMPLETE** — observe
   (snapshot/get_tabs/get_dialogs/wait) /
   act (click/type/navigate/key/scroll/switch_tab, grant-gated) / fill_credential (vaulted), egress-pinned
   `runtime.fetch`, caller bearer auth, and tests against the real breakwater wrapper (fail-closed grant,
   idempotent replay, per-hop egress denial, dry-run). `@understudy/protocol@0.6.0` and
   `@understudy/connector@0.4.0` add target-bound snapshots and refs and are published on npm with
   MIT-licensed, `files`-scoped tarballs and npm provenance. The changesets + GitHub Actions release
-  flow is wired in `.github/workflows/release.yml`. Metamind contains the consumer-side Mastra workflow, flowsafe
-  approval, breakwater connector wiring, automated coverage, and attended runbook. The remaining
-  proof is an attended run with its Chromium extension connected.
+  flow is wired in `.github/workflows/release.yml`. Metamind contains the consumer-side Mastra workflow,
+  flowsafe approval, breakwater connector wiring, automated coverage, and attended runbook. The
+  production proof passed on 2026-07-25 UTC (2026-07-26 Asia/Dubai) against
+  Understudy `master@797d0e4` and Metamind `master@0814deb`: a connected Chromium
+  extension observed Example Domain, crossed the flowsafe approval boundary,
+  filled the Expand Testing Secure Area login from
+  `vault://metamind/portal/password`, and observed the authenticated marker. The
+  schema-v2 artifact and all 15 correlated audit entries were validated. The
+  labeled proof batch remains in `draft`; no email or Gmail draft was created.
 - **M5 — Substrate hardening. LARGELY LANDED (2026-07-17, the deferred-items sweep):**
   pre-accept WS/HTTP auth at the Worker edge (`onBeforeConnect`/`onBeforeRequest` — unauthorized
   upgrades are 401/404 before the DO accepts, in-DO gate kept as defense in depth); credential
@@ -498,18 +506,68 @@ auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer t
 
 ## Verification
 
-- **Unit**: protocol zod round-trips (`@understudy/protocol`); a11y-tree pruning/ref-assignment (`cdp.ts`
-  with recorded CDP fixtures); the pure driver logic (a11y/keymap/cdp-events) per the M2 IR.
+Run from the Understudy repository root:
+
+```sh
+pnpm build
+pnpm typecheck
+pnpm test
+```
+
+Done means all packages build and typecheck, and 279 tests pass: protocol 29,
+connector 29, extension 86, and backend 135. For the exact extension artifact
+used by an attended run:
+
+```sh
+pnpm --filter @understudy/extension typecheck
+pnpm --filter @understudy/extension test
+pnpm --filter @understudy/extension build
+```
+
+Done means 86 extension tests pass and WXT writes the production MV3 build to
+`apps/extension/.output/chrome-mv3`.
+
+- **Unit**: protocol zod round-trips (`@understudy/protocol`); a11y-tree
+  pruning/ref-assignment (`cdp.ts` with recorded CDP fixtures); the current
+  a11y/keymap/CDP-event, router, ingress, dedupe, peer-binding, and WebSocket tests.
 - **Service**: `vitest` with `@cloudflare/vitest-pool-workers` for the session DO (WS connect, state
   persistence across simulated hibernation, pending-map resume, tenant scoping, `fill_secret` never
   logging plaintext).
-- **Extension**: `wxt build` + load unpacked in a real logged-in Chromium; scripted end-to-end via the M2
-  stub server.
-- **"Done" for v1** = M3 green: a consumer (or stub) drives a real logged-in site through a multi-step
-  task over `POST /commands` (read → act) with schema-valid events, surviving a mid-task DO hibernation,
-  isolated per tenant/session. M4 proves the governed end-to-end via a real consumer.
+- **Extension**: `wxt build`; exercise local WebSocket command flow with
+  `apps/extension/scripts/stub-server.mjs`; load `.output/chrome-mv3` unpacked for an
+  attended browser run.
+- **v1 is complete.** M3 satisfies the substrate criterion: a consumer drives a
+  multi-step task over `POST /commands` with schema-valid events, hibernation-safe
+  settlement, and tenant/session isolation. M4's governed production proof through
+  Metamind passed on 2026-07-25 UTC (2026-07-26 Asia/Dubai).
 - **Quality gate before merging any non-trivial change** (per project policy): parallel
   `quality-reviewer` + `architect` + independent QA subagents; fix and re-run any lane that flags.
+
+The attended proof creates a labeled draft batch in production. Re-run it only
+with explicit authorization, a connected production extension, four current
+mode-`0600` credential files, and the exact deployed release SHAs. From the
+Metamind repository root:
+
+```sh
+node packages/worker/scripts/enrich-browser-runbook.mjs --self-test
+METAMIND_URL=https://metamind.proofof.tech \
+UNDERSTUDY_URL=https://understudy-backend.gcharang.workers.dev \
+METAMIND_COOKIE_FILE=/secure/path/metamind-cookie \
+UNDERSTUDY_CALLER_TOKEN_FILE=/secure/path/understudy-caller-token \
+UNDERSTUDY_EXTENSION_TOKEN_FILE=/secure/path/understudy-extension-token \
+METAMIND_ADMIN_STEP_UP_FILE=/secure/path/metamind-admin-step-up \
+UNDERSTUDY_TENANT_ID=metamind \
+METAMIND_RELEASE_SHA=0814deb66d55dd5ea10246c968b3d5260fbb68ad \
+UNDERSTUDY_RELEASE_SHA=797d0e489df2772d0f5d597141982547861881bb \
+node packages/worker/scripts/enrich-browser-runbook.mjs
+```
+
+The self-test prints `PASS enrich-browser-runbook self-test`. The attended run
+must print `PASS` and a mode-`0600` schema-v2 artifact path. The extension
+operator must attach a dedicated `https://example.com/` tab when prompted and
+explicitly approve the displayed flowsafe request. A passing artifact records
+matching release SHAs, a successful run, `enriched: true`, both expected evidence
+markers, and correlated audit entries without any persisted secret.
 
 ## Reuse map (don't re-create)
 
@@ -561,7 +619,11 @@ const act = createConnector({
 });
 ```
 
-**Notes for a fresh session executing this plan:** line numbers do not exist yet (greenfield). Locate all
-edits by file + symbol from the repo layout. M2 is captured as a planner IR at
-`~/.claude/plans/enchanted-karp-state/`; M3 (this service) is the next IR. The one assumption that could
-force a design change (the `chrome.debugger` CDP surface) was retired at M0.
+**Notes for a fresh session changing this implementation:** these anchors are as of
+`master@797d0e489df2772d0f5d597141982547861881bb`. Reconfirm the branch, SHA,
+symbols, and surrounding code before editing; do not rely on historical line
+numbers. Current implementation anchors are `packages/protocol/src/index.ts`,
+`packages/connector/src/index.ts`, `apps/backend/src/index.ts`,
+`apps/backend/src/session.ts`, `apps/extension/src/core/router.ts`, and
+`apps/extension/src/driver/cdp.ts`. The one assumption that could have forced a
+design change, the `chrome.debugger` CDP surface, was retired at M0.
