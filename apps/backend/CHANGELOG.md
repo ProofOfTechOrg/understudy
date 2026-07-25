@@ -1,5 +1,12 @@
 # @understudy/backend
 
+## 0.0.3
+
+### Patch Changes
+
+- Updated dependencies [ebfa8a6]
+  - @understudy/protocol@0.6.0
+
 ## 0.0.2
 
 ### Patch Changes
