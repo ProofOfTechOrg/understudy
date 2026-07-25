@@ -9,7 +9,7 @@ drive it over HTTP (Topology 1).
 
 **Full design + build plan: [`docs/technical-plan.md`](docs/technical-plan.md).** Read it first.
 
-## Layout (current scaffold — milestones M0–M4)
+## Repository layout
 
 - **`packages/protocol`** — the shared command/event protocol (TypeScript + zod 4, published
   `@understudy/protocol`). The stable contract between the service, the extension, and
@@ -28,11 +28,15 @@ drive it over HTTP (Topology 1).
   no LLM and embeds no agent framework — the brain and governance (breakwater/flowsafe) live in
   the consumers. See its README.
 
-M4 status: `@understudy/protocol@0.6.0` and `@understudy/connector@0.4.0` are
-published on npm. Metamind contains the cross-repository Mastra workflow,
-flowsafe approval gate, breakwater browser connectors, and attended runbook.
-The remaining M4 step is running that proof with a connected Chromium
-extension. The agent loop and governance stay in the consumer, per Topology 1.
+M4 is complete. `@understudy/protocol@0.6.0` and
+`@understudy/connector@0.4.0` are published on npm. On 2026-07-25 UTC
+(2026-07-26 Asia/Dubai), Metamind completed the production cross-repository
+proof against Understudy
+`master@797d0e4` and Metamind `master@0814deb`: a connected Chromium extension
+executed public-page observation, an approved login using a vaulted credential,
+and authenticated-page observation with correlated flowsafe audit evidence. The
+labeled proof batch remains in `draft`; no email or Gmail draft was created. The
+agent loop and governance stay in the consumer, per Topology 1.
 
 ## Develop
 
