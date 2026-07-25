@@ -1,8 +1,10 @@
 import { safeParseCommand } from "@understudy/protocol";
 import type { Browser } from "wxt/browser";
-import { ReconnectingWs } from "../core/ws-client";
+import { CommandIngress, type StartedCommand } from "../core/command-ingress";
 import { WriteDedupe } from "../core/dedupe";
+import { sendIfPeerCurrent } from "../core/peer-binding";
 import { routeCommand } from "../core/router";
+import { ReconnectingWs } from "../core/ws-client";
 import { CdpSession } from "../driver/cdp";
 import { applyDialogDecision, classifyCdpEvent } from "../driver/cdp-events";
 import { errorMessage } from "../events";
@@ -29,6 +31,10 @@ const LOG_CAP = 50;
 // WXT re-runs main() when the service worker is revived, so these are re-created
 // from scratch each wake; durable state lives in browser.storage.{local,session}.
 let ws: ReconnectingWs | null = null;
+// Input acceptance is retired independently from the socket itself. A URL
+// switch stops admitting messages immediately, but keeps the old peer alive
+// until every command already admitted through CommandIngress has replied.
+let acceptingPeer: ReconnectingWs | null = null;
 let wsConnecting = false;
 // Tracked from ReconnectingWs's onConnecting/onOpen/onClose callbacks.
 let wsStatus: WsStatus = "connecting";
@@ -39,6 +45,10 @@ let currentWsUrl = DEFAULT_WS_URL;
 // after it and clobber a newer in-memory URL with a stale (or unwritten) disk copy.
 let wsUrlHydrated = false;
 let wsUrlEpoch = 0;
+let wsSwitching = false;
+let wsSwitchRequest = 0;
+let requestedWsUrl: string | null = null;
+let wsSwitchTail: Promise<unknown> = Promise.resolve();
 
 let session: CdpSession | null = null;
 let attachedTitle: string | undefined;
@@ -46,6 +56,7 @@ let attachedTitle: string | undefined;
 // Write-replay record (idempotent-retry contract); hydrates lazily from
 // storage.session, so rebuilding it each wake loses nothing.
 const dedupe = new WriteDedupe(browser.storage.session);
+const commandIngress = new CommandIngress();
 
 const logBuffer: LogEntry[] = [];
 const ports = new Set<Browser.runtime.Port>();
@@ -89,7 +100,7 @@ async function readWsUrl(): Promise<string> {
 }
 
 async function ensureConnection(): Promise<void> {
-  if (ws !== null || wsConnecting) return;
+  if (ws !== null || wsConnecting || wsSwitching) return;
   wsConnecting = true;
   try {
     if (!wsUrlHydrated) {
@@ -102,7 +113,7 @@ async function ensureConnection(): Promise<void> {
         wsUrlHydrated = true;
       }
     }
-    if (ws === null) {
+    if (ws === null && !wsSwitching) {
       connectWs();
     }
   } finally {
@@ -111,14 +122,23 @@ async function ensureConnection(): Promise<void> {
 }
 
 function connectWs(): void {
-  ws = new ReconnectingWs(getUrl, { onCommand, onOpen, onClose, onConnecting });
+  let peer!: ReconnectingWs;
+  peer = new ReconnectingWs(getUrl, {
+    onCommand: (raw) => onCommand(raw, peer),
+    onOpen: () => onOpen(peer),
+    onClose: () => onClose(peer),
+    onConnecting,
+  });
+  ws = peer;
+  acceptingPeer = peer;
 }
 
 // ReconnectingWs starts its own pong heartbeat on open, so we only (re)send hello.
-function onOpen(): void {
+function onOpen(peer: ReconnectingWs): void {
+  if (peer !== ws || wsSwitching) return;
   wsStatus = "open";
   log("ws connected");
-  fireAndForget("hello", sendHello);
+  fireAndForget("hello", () => sendHello(peer));
   broadcastState();
 }
 
@@ -127,36 +147,45 @@ function onConnecting(): void {
   broadcastState();
 }
 
-function onClose(): void {
+function onClose(peer: ReconnectingWs): void {
+  if (peer !== ws) return;
   wsStatus = "closed";
   broadcastState();
 }
 
 // A fresh hello on every (re)connect is the resync signal: any commands in flight
 // when the SW was evicted are abandoned, and the peer tolerates repeated hellos.
-async function sendHello(): Promise<void> {
+async function sendHello(peer: ReconnectingWs): Promise<void> {
   const tabs = await queryTabInfos();
-  ws?.send({
-    type: "hello",
-    browser: navigator.userAgent,
-    extVersion: browser.runtime.getManifest().version,
-    tabs,
+  sendIfPeerCurrent(peer, acceptingPeer, (current) => {
+    current.send({
+      type: "hello",
+      browser: navigator.userAgent,
+      extVersion: browser.runtime.getManifest().version,
+      tabs,
+    });
   });
 }
 
-function onCommand(raw: unknown): void {
-  fireAndForget("command", () => handleCommand(raw));
+function onCommand(raw: unknown, peer: ReconnectingWs): void {
+  if (peer !== acceptingPeer) return;
+  fireAndForget("command ingress", () =>
+    commandIngress.enqueue(() => startCommand(raw, peer)),
+  );
 }
 
-async function handleCommand(raw: unknown): Promise<void> {
+async function startCommand(
+  raw: unknown,
+  peer: ReconnectingWs,
+): Promise<StartedCommand | undefined> {
   const parsed = safeParseCommand(raw);
   if (!parsed.success) {
     log(`invalid command dropped: ${parsed.error.message}`, "warn");
     const commandId = extractCommandId(raw);
     if (commandId !== null) {
-      ws?.send({ type: "action_result", commandId, ok: false, error: "invalid command" });
+      peer.send({ type: "action_result", commandId, ok: false, error: "invalid command" });
     }
-    return;
+    return undefined;
   }
 
   // Idempotent-retry gate for WRITE commands (reads always execute). A retry
@@ -167,25 +196,30 @@ async function handleCommand(raw: unknown): Promise<void> {
   const decision = await dedupe.claim(parsed.data);
   if (decision.kind === "replay") {
     log(`replayed recorded result for duplicate write ${parsed.data.commandId}`);
-    ws?.send(decision.event);
-    return;
+    peer.send(decision.event);
+    return undefined;
   }
   if (decision.kind === "drop") {
     log(`dropped duplicate in-flight write ${parsed.data.commandId}; the original execution will answer`);
-    return;
+    return undefined;
   }
 
-  try {
-    const ev = await routeCommand(parsed.data, session);
-    // Record before sending: once the write executed, a crash between the two
-    // must leave the record (a replayable result), not a re-executable gap.
-    await dedupe.remember(parsed.data, ev);
-    ws?.send(ev);
-  } finally {
-    // No-op once remember() cleared the mark; guarantees a thrown execution
-    // still frees its in-flight slot so a later retry can re-run it.
-    dedupe.release(parsed.data);
-  }
+  const activeSession = session;
+  const completion = (async () => {
+    try {
+      const ev = await routeCommand(parsed.data, activeSession);
+      // Record before sending: once the write executed, a crash between the two
+      // must leave the record (a replayable result), not a re-executable gap.
+      await dedupe.remember(parsed.data, ev);
+      peer.send(ev);
+    } finally {
+      // No-op once remember() cleared the mark; guarantees a thrown execution
+      // still frees its in-flight slot so a later retry can re-run it.
+      dedupe.release(parsed.data);
+    }
+  })();
+  fireAndForget("command execution", async () => completion);
+  return { completion };
 }
 
 function extractCommandId(raw: unknown): string | null {
@@ -208,26 +242,37 @@ async function onCdpEvent(
 ): Promise<void> {
   const active = session;
   if (active === null || source.tabId !== active.tabId) return;
+  const eventPeer = acceptingPeer;
   try {
-    const decision = classifyCdpEvent(method, params, { currentUrl: active.currentUrl });
+    const decision = classifyCdpEvent(method, params, {
+      currentUrl: active.currentUrl,
+      mainFrameId: active.mainFrameId,
+    });
+    if (decision.newMainFrameId !== undefined) {
+      active.mainFrameId = decision.newMainFrameId;
+    }
     if (decision.newUrl !== undefined) {
       active.currentUrl = decision.newUrl;
     }
-    if (decision.pageEvent?.kind === "navigated") {
+    if (decision.loadStarted === true) {
       active.markLoadStarted();
-      await active.bumpGeneration();
-    } else if (decision.bumpGeneration === true) {
+    }
+    if (decision.bumpGeneration === true) {
       await active.bumpGeneration();
     }
+    if (session !== active) return;
     if (decision.pageEvent?.kind === "load") {
       active.notifyLoadEventFired();
     }
-    if (decision.pageEvent !== undefined) {
-      ws?.send({
-        type: "page_event",
-        kind: decision.pageEvent.kind,
-        tabId: active.tabId,
-        url: decision.pageEvent.url,
+    const pageEvent = decision.pageEvent;
+    if (pageEvent !== undefined) {
+      sendIfPeerCurrent(eventPeer, acceptingPeer, (current) => {
+        current.send({
+          type: "page_event",
+          kind: pageEvent.kind,
+          tabId: active.tabId,
+          url: pageEvent.url,
+        });
       });
     }
     if (decision.dialog !== undefined) {
@@ -238,7 +283,12 @@ async function onCdpEvent(
       await applyDialogDecision(
         decision.dialog,
         (accept) => active.send("Page.handleJavaScriptDialog", { accept }),
-        (event) => ws?.send({ type: "dialog", tabId: active.tabId, ...event }),
+        (event) => {
+          if (session !== active) return;
+          sendIfPeerCurrent(eventPeer, acceptingPeer, (current) => {
+            current.send({ type: "dialog", tabId: active.tabId, ...event });
+          });
+        },
       );
       log(
         `handled ${decision.dialog.event?.dialogType ?? "unknown"} dialog: ${
@@ -290,7 +340,6 @@ async function attach(): Promise<void> {
         throw cause;
       }
     }
-    next.currentUrl = tab.url ?? "";
     session = next;
     attachedTitle = tab.title;
     await persistAttachedTabId(tabId);
@@ -350,7 +399,6 @@ async function reconcileAttachment(): Promise<void> {
     if (target !== undefined && target.attached) {
       const next = await CdpSession.create(tabId);
       await next.reconcile();
-      next.currentUrl = target.url;
       session = next;
       attachedTitle = target.title;
       log(`reconciled attachment to tab ${tabId}`);
@@ -373,27 +421,56 @@ async function persistAttachedTabId(tabId: number): Promise<void> {
 }
 
 async function setWsUrl(url: string): Promise<void> {
-  // A different WS URL means a different session (the sessionId is in the URL
-  // path): drop the write-replay record so a reused idempotency key can't
-  // replay the previous session's result.
-  if (url !== currentWsUrl) await dedupe.clear();
-  currentWsUrl = url;
+  const previousRequestedUrl = requestedWsUrl ?? currentWsUrl;
+  const sessionChanged = url !== previousRequestedUrl;
+  requestedWsUrl = url;
+  const request = ++wsSwitchRequest;
+  wsSwitching = true;
   wsUrlHydrated = true;
   wsUrlEpoch += 1;
+  wsStatus = "connecting";
+  const oldPeer = acceptingPeer;
+  acceptingPeer = null;
+  broadcastState();
+
+  const change = wsSwitchTail.then(async () => {
+    await commandIngress.barrier(async () => {
+      oldPeer?.stop();
+      if (ws === oldPeer) ws = null;
+      if (!sessionChanged) return;
+      // The session id lives in the URL. Wait for every command accepted from
+      // the old peer before clearing replay state and rotating the ref scope;
+      // this prevents an old snapshot from repopulating refs after invalidation.
+      await dedupe.clear();
+      const active = session;
+      if (active !== null) {
+        try {
+          await active.invalidateRefsForSessionChange();
+        } catch (cause) {
+          log(`persist ref invalidation failed: ${errorMessage(cause)}`, "warn");
+        }
+      }
+    });
+    currentWsUrl = url;
+    try {
+      await browser.storage.local.set({ [WS_URL_KEY]: url });
+    } catch (cause) {
+      log(`persist wsUrl failed: ${errorMessage(cause)}`, "warn");
+    }
+    log(`ws url set to ${url}; reconnecting`);
+  });
+  wsSwitchTail = change.then(
+    () => undefined,
+    () => undefined,
+  );
   try {
-    await browser.storage.local.set({ [WS_URL_KEY]: url });
-  } catch (cause) {
-    log(`persist wsUrl failed: ${errorMessage(cause)}`, "warn");
+    await change;
+  } finally {
+    if (request === wsSwitchRequest) {
+      wsSwitching = false;
+      connectWs();
+    }
   }
-  // Tear down and rebuild directly against the now-authoritative in-memory URL —
-  // routing through ensureConnection would re-read storage, which can be stale
-  // (e.g. the write above just failed) and would clobber this value.
-  if (ws !== null) {
-    ws.stop();
-    ws = null;
-  }
-  log(`ws url set to ${url}; reconnecting`);
-  connectWs();
 }
 
 // ── Panel Port host ──────────────────────────────────────────────────────────

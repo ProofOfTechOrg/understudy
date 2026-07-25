@@ -37,6 +37,15 @@ export type TabInfo = z.infer<typeof TabInfoSchema>;
 export const SnapshotModeSchema = z.enum(["a11y", "dom", "screenshot"]);
 export type SnapshotMode = z.infer<typeof SnapshotModeSchema>;
 
+// Identity of the exact CDP target a snapshot came from. This travels on the
+// snapshot result itself so consumers never have to infer the driven target
+// from chrome.tabs' global active flags (one active tab exists per window).
+export const SnapshotTargetSchema = z.object({
+  tabId: z.number().int().nonnegative(),
+  url: z.string().min(1),
+});
+export type SnapshotTarget = z.infer<typeof SnapshotTargetSchema>;
+
 // A JavaScript dialog the page raised (alert/confirm/prompt) or a
 // navigation-guard prompt (beforeunload). The extension handles each locally
 // and synchronously - an open dialog blocks the single CDP channel, so there
@@ -168,12 +177,14 @@ export const EventSchema = z.discriminatedUnion("type", [
     type: z.literal("snapshot_result"),
     commandId: z.string(),
     tree: z.array(A11yNodeSchema),
+    ...SnapshotTargetSchema.shape,
   }),
   z.object({
     type: z.literal("screenshot_result"),
     commandId: z.string(),
     mime: z.string(),
     b64: z.string(),
+    ...SnapshotTargetSchema.shape,
   }),
   z.object({
     type: z.literal("tabs_result"),

@@ -41,6 +41,7 @@ import {
   parseCommand,
   parseEvent,
   SnapshotModeSchema,
+  SnapshotTargetSchema,
   TabInfoSchema,
 } from "@understudy/protocol";
 import { z } from "zod";
@@ -137,10 +138,12 @@ export const observeOutput = z.object({
   tree: z.array(A11yNodeSchema).optional(),
   /** Vision fallback (canvas / visual layout) - an evidence artifact. */
   screenshot: z.object({ mime: z.string(), b64: z.string() }).optional(),
+  /** Exact attached CDP target captured with tree/screenshot snapshots. */
+  target: SnapshotTargetSchema.optional(),
   tabs: z.array(TabInfoSchema).optional(),
   /** Recent page dialogs (get_dialogs), oldest first. */
   dialogs: z.array(DialogRecordSchema).optional(),
-  /** wait outcome. */
+  /** Wait outcome, or `false` when the driver rejects a snapshot. */
   ok: z.boolean().optional(),
   error: z.string().optional(),
 });
@@ -333,9 +336,17 @@ export function createBrowserConnectors(
       const ev = await callUnderstudy(runtime, env, input.sessionId, toCommand(read));
       switch (read.type) {
         case "snapshot":
-          if (ev.type === "snapshot_result") return { tree: ev.tree };
+          if (ev.type === "snapshot_result") {
+            return { tree: ev.tree, target: { tabId: ev.tabId, url: ev.url } };
+          }
           if (ev.type === "screenshot_result") {
-            return { screenshot: { mime: ev.mime, b64: ev.b64 } };
+            return {
+              screenshot: { mime: ev.mime, b64: ev.b64 },
+              target: { tabId: ev.tabId, url: ev.url },
+            };
+          }
+          if (ev.type === "action_result" && !ev.ok) {
+            return { ok: false, error: ev.error };
           }
           break;
         case "get_tabs":

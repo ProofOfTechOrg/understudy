@@ -1,7 +1,7 @@
 import type { Event } from "@understudy/protocol";
 import type { Protocol } from "devtools-protocol";
 import { actionError, errorMessage } from "../events";
-import { buildA11ySnapshot } from "./a11y";
+import { a11yRefPrefix, buildA11ySnapshot } from "./a11y";
 import { parseKeys } from "./keymap";
 
 type WaitFor = "load" | "idle" | "ms";
@@ -11,6 +11,10 @@ type WaitFor = "load" | "idle" | "ms";
 const SEND_TIMEOUT_MS = 15000;
 const LOAD_TIMEOUT_MS = 15000;
 const IDLE_QUIET_MS = 500;
+// The backend coordinator abandons commands at 30s. One budget covers the
+// entire identity/capture/persist/identity bracket so its sequential CDP calls
+// cannot each consume their independent 15s send timeout.
+const SNAPSHOT_DEADLINE_MS = 25_000;
 
 function isBoxModelError(cause: unknown): boolean {
   return errorMessage(cause).includes("Could not compute box model");
@@ -40,6 +44,7 @@ export class CdpSession {
   generation = 0;
   refMap: Map<string, number> = new Map();
   currentUrl = "";
+  mainFrameId = "";
 
   private loadInFlight = false;
   private readonly loadWaiters = new Set<() => void>();
@@ -48,10 +53,16 @@ export class CdpSession {
   // in order instead of racing to overwrite browser.storage.session.
   private genPersistChain: Promise<unknown> = Promise.resolve();
 
-  private constructor(readonly tabId: number) {}
+  private constructor(
+    readonly tabId: number,
+    private refScopeId: string,
+  ) {}
 
-  static async create(tabId: number): Promise<CdpSession> {
-    const session = new CdpSession(tabId);
+  static async create(
+    tabId: number,
+    refScopeId: string = crypto.randomUUID(),
+  ): Promise<CdpSession> {
+    const session = new CdpSession(tabId, refScopeId);
     await session.loadGeneration();
     return session;
   }
@@ -69,6 +80,7 @@ export class CdpSession {
 
   bumpGeneration(): Promise<number> {
     this.generation += 1;
+    this.refMap.clear();
     const value = this.generation;
     const write = this.genPersistChain.then(() =>
       browser.storage.session.set({ [CdpSession.genKey(this.tabId)]: value }),
@@ -117,6 +129,9 @@ export class CdpSession {
     await this.send("DOM.enable");
     await this.send("Page.enable");
     await this.send("Runtime.enable");
+    const identity = await this.mainFrameIdentity();
+    this.mainFrameId = identity.frameId;
+    this.currentUrl = identity.url;
     this.enabled = true;
   }
 
@@ -129,8 +144,22 @@ export class CdpSession {
   // Generation-namespaced refs (see driver/a11y.ts) make staleness detectable:
   // a ref from a prior snapshot generation fails the prefix check below.
   resolveRef(ref: string): number | null {
-    if (!ref.startsWith(`s${this.generation}e`)) return null;
+    const prefix = a11yRefPrefix({
+      scopeId: this.refScopeId,
+      generation: this.generation,
+    });
+    if (!ref.startsWith(prefix)) return null;
     return this.refMap.get(ref) ?? null;
+  }
+
+  invalidateRefsForSessionChange(nextScopeId: string = crypto.randomUUID()): Promise<void> {
+    return this.enqueue(async () => {
+      this.refScopeId = nextScopeId;
+      // Scope rotation + the synchronous generation increment/refMap clear are
+      // the security boundary. A stuck storage.session write must not prevent
+      // the WebSocket session barrier from connecting its replacement peer.
+      void this.bumpGeneration().catch(() => {});
+    });
   }
 
   markLoadStarted(): void {
@@ -170,13 +199,58 @@ export class CdpSession {
     return result;
   }
 
-  private run(commandId: string, body: () => Promise<Event>): Promise<Event> {
-    return this.enqueue(async () => {
+  private run(
+    commandId: string,
+    body: () => Promise<Event>,
+    deadlineAt?: number,
+  ): Promise<Event> {
+    let started = false;
+    let expiredInQueue = false;
+    const timeoutEvent = (): Event => ({
+      type: "action_result",
+      commandId,
+      ok: false,
+      error: `snapshot timed out after ${SNAPSHOT_DEADLINE_MS}ms`,
+    });
+    const execution = this.enqueue<Event>(async () => {
+      if (
+        expiredInQueue ||
+        (deadlineAt !== undefined && Date.now() >= deadlineAt)
+      ) {
+        return timeoutEvent();
+      }
+      started = true;
       try {
         return await body();
       } catch (cause) {
         return { type: "action_result", commandId, ok: false, error: errorMessage(cause) };
       }
+    });
+    if (deadlineAt === undefined) return execution;
+
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      expiredInQueue = true;
+      void execution.catch(() => {});
+      return Promise.resolve(timeoutEvent());
+    }
+    return new Promise<Event>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!started) {
+          expiredInQueue = true;
+          resolve(timeoutEvent());
+        }
+      }, remainingMs);
+      void execution.then(
+        (event) => {
+          clearTimeout(timer);
+          resolve(event);
+        },
+        (cause: unknown) => {
+          clearTimeout(timer);
+          reject(cause);
+        },
+      );
     });
   }
 
@@ -185,6 +259,101 @@ export class CdpSession {
       return await action;
     } catch {
       return undefined;
+    }
+  }
+
+  private async mainFrameIdentity(deadlineAt?: number): Promise<{
+    frameId: string;
+    loaderId: string;
+    url: string;
+  }> {
+    const read = (): Promise<Protocol.Page.GetFrameTreeResponse> =>
+      this.send("Page.getFrameTree");
+    const { frameTree } =
+      deadlineAt === undefined
+        ? await read()
+        : await this.withSnapshotDeadline(deadlineAt, read);
+    const frame = frameTree.frame;
+    return {
+      frameId: frame.id,
+      loaderId: frame.loaderId,
+      url: `${frame.url}${frame.urlFragment ?? ""}`,
+    };
+  }
+
+  private invalidateIncompleteSnapshot(generation: number): void {
+    this.refMap.clear();
+    if (this.generation !== generation) return;
+    // bumpGeneration mutates the security boundary synchronously. Persistence
+    // remains best-effort and must not extend an already-expired snapshot past
+    // the coordinator's response deadline.
+    void this.bumpGeneration().catch(() => {});
+  }
+
+  private async withSnapshotDeadline<T>(
+    deadlineAt: number,
+    start: () => Promise<T>,
+  ): Promise<T> {
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error(`snapshot timed out after ${SNAPSHOT_DEADLINE_MS}ms`);
+    }
+    const operation = start();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`snapshot timed out after ${SNAPSHOT_DEADLINE_MS}ms`));
+      }, remainingMs);
+    });
+    try {
+      // Promise.race installs rejection handlers on both inputs, so a browser
+      // API promise that rejects after the aggregate deadline is still handled.
+      return await Promise.race([operation, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Binds a snapshot artifact to one stable main document. CDP events can run
+   * while a queued command awaits a response, so main-frame identity reads
+   * bracket the capture and the generation catches same-document DOM changes.
+   * A changed page invalidates the prior ref map and yields no snapshot result
+   * for a consumer to trust.
+   */
+  private async captureStableSnapshot<T>(
+    deadlineAt: number,
+    capture: () => Promise<T>,
+    mintGeneration = false,
+  ): Promise<{ captured: T; generation: number; url: string }> {
+    const baselineGeneration = this.generation;
+    try {
+      const before = await this.mainFrameIdentity(deadlineAt);
+      const captured = await this.withSnapshotDeadline(deadlineAt, capture);
+      let generation = baselineGeneration;
+      if (mintGeneration) {
+        if (this.generation !== baselineGeneration) {
+          throw new Error("page changed during snapshot");
+        }
+        generation = await this.withSnapshotDeadline(deadlineAt, () =>
+          this.bumpGeneration(),
+        );
+      }
+      const after = await this.mainFrameIdentity(deadlineAt);
+      if (
+        this.generation !== generation ||
+        after.frameId !== before.frameId ||
+        after.loaderId !== before.loaderId ||
+        after.url !== before.url
+      ) {
+        throw new Error("page changed during snapshot");
+      }
+      this.mainFrameId = after.frameId;
+      this.currentUrl = after.url;
+      return { captured, generation, url: after.url };
+    } catch (cause) {
+      this.invalidateIncompleteSnapshot(baselineGeneration);
+      throw cause;
     }
   }
 
@@ -246,15 +415,27 @@ export class CdpSession {
   }
 
   snapshotA11y(commandId: string): Promise<Event> {
-    return this.run(commandId, async () => {
-      const { nodes } = await this.send<Protocol.Accessibility.GetFullAXTreeResponse>(
-        "Accessibility.getFullAXTree",
-      );
-      const gen = await this.bumpGeneration();
-      const { tree, refMap } = buildA11ySnapshot(nodes, gen);
-      this.refMap = refMap;
-      return { type: "snapshot_result", commandId, tree };
-    });
+    const deadlineAt = Date.now() + SNAPSHOT_DEADLINE_MS;
+    return this.run(
+      commandId,
+      async () => {
+        const { captured, generation, url } = await this.captureStableSnapshot(
+          deadlineAt,
+          () =>
+            this.send<Protocol.Accessibility.GetFullAXTreeResponse>(
+              "Accessibility.getFullAXTree",
+            ),
+          true,
+        );
+        const { tree, refMap } = buildA11ySnapshot(captured.nodes, {
+          scopeId: this.refScopeId,
+          generation,
+        });
+        this.refMap = refMap;
+        return { type: "snapshot_result", commandId, tree, tabId: this.tabId, url };
+      },
+      deadlineAt,
+    );
   }
 
   // Pure ref-map lookup: MUST NOT snapshot or bump the generation. This is
@@ -271,13 +452,29 @@ export class CdpSession {
   }
 
   screenshot(commandId: string): Promise<Event> {
-    return this.run(commandId, async () => {
-      const { data } = await this.send<Protocol.Page.CaptureScreenshotResponse>(
-        "Page.captureScreenshot",
-        { format: "png" },
-      );
-      return { type: "screenshot_result", commandId, mime: "image/png", b64: data };
-    });
+    const deadlineAt = Date.now() + SNAPSHOT_DEADLINE_MS;
+    return this.run(
+      commandId,
+      async () => {
+        const { captured, url } = await this.captureStableSnapshot(deadlineAt, () =>
+          this.send<Protocol.Page.CaptureScreenshotResponse>(
+            "Page.captureScreenshot",
+            {
+              format: "png",
+            },
+          ),
+        );
+        return {
+          type: "screenshot_result",
+          commandId,
+          mime: "image/png",
+          b64: captured.data,
+          tabId: this.tabId,
+          url,
+        };
+      },
+      deadlineAt,
+    );
   }
 
   click(commandId: string, ref: string): Promise<Event> {

@@ -17,12 +17,13 @@
  *   3. Load the M2 extension (apps/extension) in a real, logged-in
  *      Chromium and connect it to that printed WS URL.
  *   4. Press Enter in this terminal once the extension shows connected.
- *   5. Watch snapshot -> type -> click -> fill_secret drive the page; each
+ *   5. Confirm the snapshot's tabId and URL before the script uses its refs.
+ *   6. Watch snapshot -> type -> click -> fill_secret drive the page; each
  *      returned Event is printed as it comes back.
  *
- * Without the extension connected, every command below will time out (the
- * service's per-command timeout - 30s by default) because nothing ever
- * answers the forwarded command. The `POST /v1/sessions` step (through
+ * Without an authoritative extension connected, every command below fails
+ * fast with HTTP 503 (`extension not connected`) instead of waiting for the
+ * service's per-command timeout. The `POST /v1/sessions` step (through
  * printing the WS URL) is verifiable standalone, with no extension attached.
  *
  * `type` and `click` target the first ref found in the snapshot's a11y tree
@@ -102,6 +103,33 @@ function findFirstRef(nodes) {
   return undefined;
 }
 
+function snapshotTarget(event) {
+  if (event.type !== "snapshot_result") {
+    throw new Error(`snapshot failed: ${JSON.stringify(event)}`);
+  }
+  if (!Number.isInteger(event.tabId) || event.tabId < 0) {
+    throw new Error(`snapshot returned an invalid tabId: ${JSON.stringify(event.tabId)}`);
+  }
+  if (typeof event.url !== "string" || event.url.length === 0) {
+    throw new Error(`snapshot returned an invalid URL: ${JSON.stringify(event.url)}`);
+  }
+  return { tabId: event.tabId, url: event.url };
+}
+
+async function confirmSnapshotTarget(target) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(
+      `Confirm snapshot target tabId=${target.tabId}, url=${JSON.stringify(target.url)} [y/N]: `,
+    );
+    if (!["y", "yes"].includes(answer.trim().toLowerCase())) {
+      throw new Error("snapshot target was not confirmed; refusing to use its refs");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 async function main() {
   console.log("understudy stub consumer - M3 runbook harness");
   console.log(`BASE_URL=${BASE_URL}`);
@@ -124,7 +152,8 @@ async function main() {
     commandId: "stub-1",
     mode: "a11y",
   });
-  const ref = snapshotEvent.type === "snapshot_result" ? findFirstRef(snapshotEvent.tree) : undefined;
+  await confirmSnapshotTarget(snapshotTarget(snapshotEvent));
+  const ref = findFirstRef(snapshotEvent.tree);
   if (!ref) {
     console.log("(no ref found in the snapshot - type/click below will return ok:false)");
   }

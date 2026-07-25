@@ -12,11 +12,12 @@ M3.
 
 | Path | What |
 | --- | --- |
-| `src/driver/a11y.ts` | `buildA11ySnapshot` — pure AX-tree → pruned, generation-namespaced `A11yNode[]` + ref map. No `chrome.*`. |
+| `src/driver/a11y.ts` | `buildA11ySnapshot` — pure AX-tree → pruned `A11yNode[]` + opaque session/attachment/generation-bound ref map. No `chrome.*`. |
 | `src/driver/keymap.ts` | `parseKeys` — pure key-spec parser (`"Ctrl+Enter"` etc.) → CDP `Input.dispatchKeyEvent` fields. No `chrome.*`. |
 | `src/driver/cdp-events.ts` | `classifyCdpEvent` — pure classifier turning a raw CDP event into the effects the background worker should apply. No `chrome.*`. |
 | `src/driver/cdp.ts` | `CdpSession` — the one `chrome.debugger` channel per attached tab: FIFO command queue, per-command timeouts, and the executors backing every protocol Command. |
 | `src/core/ws-client.ts` | `ReconnectingWs` — WebSocket with backoff reconnect and a self-driven pong heartbeat. |
+| `src/core/command-ingress.ts` | `CommandIngress` — preserves command arrival order through async dedupe claims and provides a drain barrier for WebSocket session changes. |
 | `src/core/router.ts` | `routeCommand` — dispatches a parsed `Command` to a `CdpSession` executor or a tab-management handler, always returning exactly one `Event`. |
 | `src/events.ts`, `src/tabs.ts`, `src/messaging.ts` | Shared leaf helpers (`action_result` builder, tab-info query) and the sidepanel↔service-worker `Port` message types. |
 | `src/entrypoints/background.ts` | The MV3 service worker: owns the WS connection, the CDP session, wake-time reattachment, and the alarm/heartbeat keepalive. |

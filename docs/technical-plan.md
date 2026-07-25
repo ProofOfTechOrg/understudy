@@ -100,11 +100,11 @@ the substrate role.
 ┌───────────────────── UNDERSTUDY SERVICE (Cloudflare Worker) ─────────────────┐
 │  Hono: /v1/sessions/:id/commands  · session mgmt · /auth · /health           │
 │  SessionAgent extends Agent  (one Durable Object per SESSION, per tenant/case)│
-│    • terminates the extension WebSocket, holds the CDP session + refMap gen   │
+│    • terminates one authoritative extension WebSocket and tracks session state│
 │    • coordinator.send(cmd) ─ WS ▶ extension ─ Event ▶ resolves pending map    │
 │    • fill_secret: resolve secretRef (vault) → type plaintext service-side     │
 └───────────────────────────────┬──────────────────────────────────────────────┘
-              wss://<service>/session/:sessionId  (auth token)
+       wss://<service>/agents/session/:sessionId  (auth token)
                                  ▼
 ┌───────────────────── User's real Chrome (Chromium) — the EXTENSION (M2) ─────┐
 │  Background SW: WS client · keepalive · command router · CDP session manager  │
@@ -151,10 +151,10 @@ understudy/
 
 The stable IP: shared across the service, the extension, AND consumer connectors; browser-agnostic;
 **published as `@understudy/protocol` on zod 4**. Every message is a discriminated union tagged by
-`type`, carries a `commandId` for request/response correlation, and is validated with zod at every
-boundary.
+`type` and is validated with zod at every boundary. Commands and their correlated results carry a
+`commandId`; connection, page, and heartbeat events do not.
 
-> **Target contract.** The union below is the shape to converge on; `fill_secret`, `tabs_result`, the public publish, and the zod-4 bump land as milestone follow-ons (see Milestones — `tabs_result` + the zod-4 bump at M2, `fill_secret` + publish at M3).
+> **Target contract.** The union below is the current public wire shape. Protocol 0.6 makes the snapshot target fields mandatory, so the service and extension must upgrade in the same rollout.
 
 ```ts
 // Consumer/Service → Extension
@@ -166,6 +166,7 @@ export type Command =
   | { type: "key"; commandId: string; keys: string; ref?: string }
   | { type: "scroll"; commandId: string; ref?: string; dy: number }
   | { type: "wait"; commandId: string; for: "load" | "idle" | "ms"; value?: number }
+  | { type: "resolve_ref"; commandId: string; ref: string }
   | { type: "get_tabs"; commandId: string }
   | { type: "switch_tab"; commandId: string; tabId: number }
   | { type: "fill_secret"; commandId: string; ref: string; secretRef: string; submit?: boolean };
@@ -173,11 +174,12 @@ export type Command =
 // Extension → Service
 export type Event =
   | { type: "hello"; browser: string; extVersion: string; tabs: TabInfo[] }
-  | { type: "snapshot_result"; commandId: string; tree: A11yNode[] }
-  | { type: "screenshot_result"; commandId: string; mime: string; b64: string }
-  | { type: "action_result"; commandId: string; ok: boolean; error?: string; url?: string }
+  | { type: "snapshot_result"; commandId: string; tree: A11yNode[]; tabId: number; url: string }
+  | { type: "screenshot_result"; commandId: string; mime: string; b64: string; tabId: number; url: string }
+  | { type: "action_result"; commandId: string; ok: boolean; error?: string; url?: string; simulated?: boolean }
   | { type: "tabs_result"; commandId: string; tabs: TabInfo[] }
   | { type: "page_event"; kind: "navigated" | "load"; tabId: number; url: string }
+  | { type: "dialog"; tabId: number; dialogType: "alert" | "confirm" | "prompt" | "beforeunload"; message: string; url: string; defaultPrompt?: string; disposition: "accept" | "dismiss" }
   | { type: "pong" };
 
 export interface A11yNode { ref: string; role: string; name?: string; value?: string; children?: A11yNode[] }
@@ -185,8 +187,14 @@ export interface TabInfo { tabId: number; url: string; title: string; active: bo
 ```
 
 Design notes:
-- `ref` is the *only* thing the consumer's agent ever uses to address an element. Opaque to the
-  model; resolved by the extension (see targeting).
+- `ref` is the *only* thing the consumer's agent ever uses to address an element. Its encoding is
+  opaque. The extension binds it to the extension session, exact CDP attachment, and snapshot
+  generation that minted it, then resolves it locally (see targeting).
+- Snapshot results include the exact attached CDP `tabId` and main-frame `url` captured with the
+  artifact. Consumers validate those fields instead of inferring the session target from
+  `TabInfo.active`, which is true once per browser window. An optional command `tabId` is an
+  expected attachment and fails closed on mismatch. A ref also fails closed after another browser
+  connection or tab replaces the attachment, even if both tabs minted the same generation number.
 - **`fill_secret` is an agent↔service command.** The consumer's `fill_credential` connector sends
   `fill_secret{secretRef}`; the **service** resolves `secretRef` against the vault and drives the
   keystrokes into the session (over the trusted service↔extension hop, reusing the extension's
@@ -208,15 +216,18 @@ Design notes:
   consumers express dry-run intent via the service API's `dryRun` flag, never by sending
   `resolve_ref` themselves.
 - `commandId` correlates the async round-trip: the service's `send(cmd)` returns a promise parked
-  in a `Map<commandId, resolver>`; the matching `*_result` event resolves it. Only *in-flight*
-  commands are lost on DO hibernation; persisted session state is not (see the service section).
+  in a `Map<commandId, resolver>`; the matching `*_result` event resolves it. The active request
+  and timeout prevent DO hibernation mid-command. A shutdown or restart settles through the
+  timeout/resync path, and the persisted awaiting marker reconciles a late result.
 - `tabs_result` answers `get_tabs` with a `commandId`-bearing event (added at M2).
 - **Published runtime exports** (what consumer connectors import): `parseCommand` / `parseEvent`
   (throwing) and `safeParseCommand` / `safeParseEvent`; `CommandSchema` / `EventSchema`,
-  `A11yNodeSchema`, `TabInfoSchema`, `SnapshotModeSchema`; `isWriteCommand` +
+  `A11yNodeSchema`, `TabInfoSchema`, `SnapshotModeSchema`, `SnapshotTargetSchema`,
+  `DialogTypeSchema`, `DialogDispositionSchema`, `DialogRecordSchema`; `isWriteCommand` +
   `WRITE_COMMAND_TYPES` (the single write-classification source of truth downstream layers
   derive from — the connector pins its gated union to it at compile time); and the types
-  `Command` / `Event` / `WriteCommandType` / `A11yNode` / `TabInfo` / `SnapshotMode`.
+  `Command` / `Event` / `WriteCommandType` / `A11yNode` / `TabInfo` / `SnapshotMode` /
+  `SnapshotTarget` / `DialogType` / `DialogDisposition` / `DialogRecord`.
 - **Write retries are idempotent end to end** (M5): the connector derives a write's `commandId`
   from the breakwater idempotency key (`ik_<key>`); the service records completed write Events
   per session (`completedWrites`, cap 100) and replays a repeated commandId instead of
@@ -234,16 +245,18 @@ The hard problem. Approach (matches Playwright / chrome-devtools-mcp):
 
 1. **Build snapshot**: `Accessibility.getFullAXTree` (+ `DOM` for `backendNodeId` linkage). Prune to
    actionable/meaningful nodes (buttons, links, inputs, headings, text). Assign each a stable `ref`
-   (generation-namespaced `s{gen}e{seq}`) mapped to its CDP `backendNodeId`. Keep the
-   `ref → backendNodeId` map in the SW for the current snapshot generation.
+   whose opaque namespace binds the extension session, CDP attachment, and snapshot generation,
+   then map it to the CDP `backendNodeId`. Keep the `ref → backendNodeId` map in the SW for the
+   current attachment and snapshot generation.
 2. **The consumer's agent sees** the pruned tree as compact indented text (role + name + ref), not
    raw HTML — far fewer tokens, far more reliable targeting.
 3. **Resolve on action**: `click{ref}` → `backendNodeId` → `DOM.getBoxModel` → `Input.dispatchMouseEvent`
    (press+release at center), OR `Runtime.callFunctionOn` `.click()` when geometry is unreliable.
    `type{ref}` → focus node then `Input.insertText` / `Input.dispatchKeyEvent`.
-4. **Staleness**: a `ref` is valid only for the snapshot generation that produced it. Every mutating
-   action is followed by an implicit re-snapshot before the next action needs one. A stale `ref`
-   returns `action_result{ok:false, error:"stale ref"}`; the consumer re-snapshots and retries.
+4. **Staleness**: a `ref` is valid only for the extension session, CDP attachment, and snapshot
+   generation that produced it. Replacing the browser connection or attached tab invalidates every
+   outstanding ref, including refs whose generation and element sequence happen to collide. A stale
+   ref returns `action_result{ok:false, error:"stale ref"}`; the consumer re-snapshots and retries.
 5. **Screenshots** (`mode:"screenshot"` → `Page.captureScreenshot`) are a *fallback* the agent can
    request when the a11y tree is insufficient (canvas, visual layout). DOM/a11y-first keeps cost down.
 
@@ -442,18 +455,19 @@ auth, local `fill_secret` shim) and carries stale pre-Topology-1 prose; prefer t
   `POST /v1/sessions/:sessionId/commands` (with `dryRun`); the pending-map + hibernation-resume marker;
   `fill_secret` vault resolution; caller auth + per-tenant/session scoping. Verify: a stub consumer (or
   `curl`) drives a real logged-in page over HTTP through the service and gets schema-valid `Event`s;
-  session survives a mid-command DO hibernation without deadlock.
+  a shutdown/restart or late result settles through timeout/resync without deadlock or stale markers.
 - **M4 — Consumer integration + published contract.** Publish `@understudy/protocol` (zod 4) and a
   reference breakwater connector (`@understudy/connector`, mirroring the smart-compliance example). A real
   consumer (metamind / smart-compliance) drives understudy end-to-end with a Mastra agent + flowsafe
   approvals. *Cross-repo; understudy's deliverable is the published contract + reference connector, not
-  the agent.* **Status (2026-07-17): PACKAGES PUBLISHED** — observe (snapshot/get_tabs/wait) /
+  the agent.* **Status (2026-07-25): PACKAGES PUBLISHED** — observe
+  (snapshot/get_tabs/get_dialogs/wait) /
   act (click/type/navigate/key/scroll/switch_tab, grant-gated) / fill_credential (vaulted), egress-pinned
   `runtime.fetch`, caller bearer auth, and tests against the real breakwater wrapper (fail-closed grant,
-  idempotent replay, per-hop egress denial, dry-run). `@understudy/protocol@0.5.0` and
-  `@understudy/connector@0.3.0` are published on npm with MIT-licensed, `files`-scoped tarballs and
-  npm provenance. The changesets + GitHub Actions release flow is wired in
-  `.github/workflows/release.yml`. Metamind contains the consumer-side Mastra workflow, flowsafe
+  idempotent replay, per-hop egress denial, dry-run). `@understudy/protocol@0.6.0` and
+  `@understudy/connector@0.4.0` add target-bound snapshots and refs and are published on npm with
+  MIT-licensed, `files`-scoped tarballs and npm provenance. The changesets + GitHub Actions release
+  flow is wired in `.github/workflows/release.yml`. Metamind contains the consumer-side Mastra workflow, flowsafe
   approval, breakwater connector wiring, automated coverage, and attended runbook. The remaining
   proof is an attended run with its Chromium extension connected.
 - **M5 — Substrate hardening. LARGELY LANDED (2026-07-17, the deferred-items sweep):**

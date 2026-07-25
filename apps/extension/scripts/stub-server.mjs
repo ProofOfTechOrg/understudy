@@ -50,7 +50,7 @@ function printNodes(nodes, depth, budget) {
   }
 }
 
-// ── pretty-printers, one per Event.type (all 7 union members) ────────────────
+// ── pretty-printers, one per Event.type (all 8 union members) ────────────────
 
 function printEvent(ev) {
   switch (ev.type) {
@@ -61,13 +61,13 @@ function printEvent(ev) {
       break;
     case "snapshot_result":
       console.log(
-        `< snapshot_result   [${ev.commandId}]  ${countNodes(ev.tree)} nodes (first 15 shown — copy a ref):`,
+        `< snapshot_result   [${ev.commandId}]  tabId=${ev.tabId}  url=${ev.url}  ${countNodes(ev.tree)} nodes (first 15 shown — copy a ref):`,
       );
       printNodes(ev.tree, 0, { left: 15 });
       break;
     case "screenshot_result":
       console.log(
-        `< screenshot_result [${ev.commandId}]  ${ev.mime}  ${ev.b64.length} b64 chars`,
+        `< screenshot_result [${ev.commandId}]  tabId=${ev.tabId}  url=${ev.url}  ${ev.mime}  ${ev.b64.length} b64 chars`,
       );
       break;
     case "tabs_result":
@@ -88,6 +88,16 @@ function printEvent(ev) {
     case "page_event":
       console.log(`< page_event        ${ev.kind}  tabId=${ev.tabId}  ${ev.url}`);
       break;
+    case "dialog": {
+      const prompt =
+        ev.defaultPrompt === undefined
+          ? ""
+          : `  defaultPrompt=${JSON.stringify(ev.defaultPrompt)}`;
+      console.log(
+        `< dialog            ${ev.dialogType}  disposition=${ev.disposition}  tabId=${ev.tabId}  url=${ev.url}  message=${JSON.stringify(ev.message)}${prompt}`,
+      );
+      break;
+    }
     case "pong":
       console.log(`< pong              · ${new Date().toLocaleTimeString()}`);
       break;

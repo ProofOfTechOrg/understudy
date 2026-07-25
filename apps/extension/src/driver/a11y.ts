@@ -21,6 +21,15 @@ export const MEANINGFUL_ROLES: Set<string> = new Set([
   "cell",
 ]);
 
+export interface A11yRefScope {
+  scopeId: string;
+  generation: number;
+}
+
+export function a11yRefPrefix(scope: A11yRefScope): string {
+  return `a${scope.scopeId}:s${scope.generation}e`;
+}
+
 function axString(value: Protocol.Accessibility.AXValue | undefined): string | undefined {
   const raw = value?.value;
   return typeof raw === "string" ? raw : undefined;
@@ -28,13 +37,14 @@ function axString(value: Protocol.Accessibility.AXValue | undefined): string | u
 
 export function buildA11ySnapshot(
   axNodes: Protocol.Accessibility.AXNode[],
-  gen: number,
+  scope: A11yRefScope,
 ): { tree: A11yNode[]; refMap: Map<string, number> } {
   const refMap = new Map<string, number>();
   const byId = new Map<string, Protocol.Accessibility.AXNode>();
   for (const node of axNodes) byId.set(node.nodeId, node);
 
   const seen = new Set<string>();
+  const refPrefix = a11yRefPrefix(scope);
   let seq = 0;
 
   // DFS pre-order. Returns the kept forest rooted at `nodeId`: a kept node comes
@@ -60,7 +70,7 @@ export function buildA11ySnapshot(
       !node.ignored &&
       backendId !== undefined
     ) {
-      const ref = `s${gen}e${seq++}`;
+      const ref = `${refPrefix}${seq++}`;
       refMap.set(ref, backendId);
       self = { ref, role };
       const name = axString(node.name);

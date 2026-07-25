@@ -10,10 +10,10 @@ that speak it:
 - **consumer connectors** (e.g. [`@understudy/connector`](https://github.com/ProofOfTechOrg/understudy/tree/master/packages/connector))
   that drive the service over `POST /v1/sessions/:sessionId/commands`.
 
-Every message is a zod-4 discriminated union tagged by `type`, carries a
-`commandId` for request/response correlation, and is validated at every
-boundary. Consumers nest these schemas inside their own zod-4 objects, so the
-package requires zod 4.
+Every message is a zod-4 discriminated union tagged by `type` and is validated
+at every boundary. Commands and their correlated results carry a `commandId`;
+connection, page, and heartbeat events do not. Consumers nest these schemas
+inside their own zod-4 objects, so the package requires zod 4.
 
 ## Install
 
@@ -27,13 +27,16 @@ pnpm add @understudy/protocol zod
 import {
   // schemas
   CommandSchema, EventSchema, A11yNodeSchema, TabInfoSchema, SnapshotModeSchema,
+  SnapshotTargetSchema, DialogTypeSchema, DialogDispositionSchema,
+  DialogRecordSchema,
   // parsers
   parseCommand, parseEvent, safeParseCommand, safeParseEvent,
   // classification
   isWriteCommand, WRITE_COMMAND_TYPES,
   // types
   type Command, type CommandType, type Event, type WriteCommandType,
-  type A11yNode, type TabInfo, type SnapshotMode,
+  type A11yNode, type TabInfo, type SnapshotMode, type SnapshotTarget,
+  type DialogType, type DialogDisposition, type DialogRecord,
 } from "@understudy/protocol";
 ```
 
@@ -62,6 +65,14 @@ there, where it is real).
 | `switch_tab` | `tabId` | **write** |
 | `fill_secret` | `ref`, `secretRef`, `submit?` | **write** (vaulted) |
 
+When `snapshot.tabId` or `navigate.tabId` is present, the extension treats it
+as the expected attached CDP tab and fails closed if it differs. It never
+silently executes the command against another attached tab.
+
+Accessibility refs are opaque capabilities bound to the extension session,
+the exact CDP attachment, and the snapshot generation that minted them. A ref
+from one attached tab cannot resolve after another attachment replaces it.
+
 `isWriteCommand` / `WRITE_COMMAND_TYPES` classify the write class in the
 **operational** sense this system enforces: a command with a user-visible side
 effect, which must be gated on approval (D8), simulated (never performed) on a
@@ -87,11 +98,12 @@ commands deserve a warning:
 | type | fields |
 |---|---|
 | `hello` | `browser`, `extVersion`, `tabs` |
-| `snapshot_result` | `commandId`, `tree: A11yNode[]` |
-| `screenshot_result` | `commandId`, `mime`, `b64` |
+| `snapshot_result` | `commandId`, `tree: A11yNode[]`, `tabId`, `url` |
+| `screenshot_result` | `commandId`, `mime`, `b64`, `tabId`, `url` |
 | `tabs_result` | `commandId`, `tabs: TabInfo[]` |
 | `action_result` | `commandId`, `ok`, `error?`, `url?`, `simulated?` |
 | `page_event` | `kind: "navigated" \| "load"`, `tabId`, `url` |
+| `dialog` | `tabId`, `dialogType`, `message`, `url`, `defaultPrompt?`, `disposition` |
 | `pong` | — |
 
 `action_result.simulated` is set only on dry-run responses. A simulated
@@ -99,16 +111,29 @@ commands deserve a warning:
 current snapshot generation), not *executability*; ref-less commands simulate
 `ok: true` without touching the browser at all.
 
+Every snapshot result carries the exact CDP-attached `tabId` and main-frame
+`url` captured with the artifact. Consumers must validate this target before
+using page content; `TabInfo.active` is browser-window state and is not a
+session-attachment signal.
+
 ## Element targeting
 
-`A11yNode.ref` is the only element address a consumer's agent ever uses —
-opaque, generation-namespaced (`s{gen}e{seq}`), resolved by the extension
-against its CDP `backendNodeId` map. Refs are valid only for the snapshot
-generation that produced them; a stale ref returns
-`action_result{ ok: false }` and the consumer re-snapshots.
+`A11yNode.ref` is the only element address a consumer's agent ever uses. Its
+encoding is deliberately unspecified. The extension resolves it against the
+current CDP attachment's `backendNodeId` map and rejects refs minted by another
+extension session, attachment, or snapshot generation. A stale ref returns
+`action_result{ ok: false }`; the consumer re-snapshots before retrying.
 
 ## Versioning
 
+- **0.6.0** — requires `tabId` and `url` on every `snapshot_result` and
+  `screenshot_result`, exports `SnapshotTargetSchema` / `SnapshotTarget`, and
+  binds accessibility refs to their extension session, CDP attachment, and
+  snapshot generation. This is a breaking wire change: upgrade the protocol,
+  service, extension, and `@understudy/connector@0.4.0` together.
+- **0.5.0** — adds `dialog` events and the `DialogTypeSchema`,
+  `DialogDispositionSchema`, and `DialogRecordSchema` exports. The connector
+  exposes recent handled dialogs through `observe`'s `get_dialogs` read.
 - **0.4.0** — exports `WRITE_COMMAND_TYPES` / `WriteCommandType` (the single
   write-classification source downstream layers derive from) and reclassifies
   `scroll` / `switch_tab` as writes, so `isWriteCommand` now returns `true` for

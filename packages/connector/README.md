@@ -17,7 +17,7 @@ limits, audit).
 
 | connector | id | class | protocol commands |
 |---|---|---|---|
-| `observe` | `browser.observe` | read — no approval | `snapshot` (a11y/dom/screenshot), `get_tabs`, `wait` |
+| `observe` | `browser.observe` | read — no approval | `snapshot` (a11y/dom/screenshot), `get_tabs`, `get_dialogs`, `wait` |
 | `act` | `browser.act` | write — approval-gated | `click`, `type`, `navigate`, `key`, `scroll`, `switch_tab` |
 | `fillCredential` | `browser.fill_credential` | vaulted write — approval-gated | `fill_secret` |
 
@@ -30,6 +30,18 @@ to keep in sync.
 The protocol's `resolve_ref` command is deliberately unreachable from here —
 it is an internal service↔extension probe. Dry-run intent is expressed via the
 service API's `dryRun` flag, which the `dryRunExecute` paths set.
+
+Snapshot reads return `target: { tabId, url }` beside the tree or screenshot.
+That target is captured from the exact attached CDP session with the artifact;
+consumers should validate it instead of inferring session identity from the
+global `get_tabs` list, where each browser window can have an active tab.
+When the driver cannot produce a trustworthy snapshot, including an expected
+tab mismatch or a page change during capture, `observe` returns structured
+`{ ok: false, error }` output with the driver's reason.
+
+Accessibility refs are opaque and bound to the extension session, CDP
+attachment, and snapshot generation that minted them. Do not parse their
+encoding or reuse a ref after another attachment replaces the target.
 
 ## Install
 
@@ -50,8 +62,11 @@ import {
   BROWSER_WRITE_CONNECTOR_IDS,
   callBrowserDryRun,
   callBrowserWrite,
+  callConnector,
   createBrowserConnectors,
   durableStores,
+  type ObserveInput,
+  type ObserveOutput,
 } from "@understudy/connector";
 
 // D1-backed stores are load-bearing on Cloudflare: breakwater's in-memory
@@ -67,6 +82,29 @@ const { observe, act, fillCredential } = createBrowserConnectors(
 Register the three connectors as tools on your Mastra agent (they *are*
 Mastra tools — `createConnector()` wraps `createTool()`), or call them from
 workflow steps via the helpers:
+
+```ts
+// 1. Verify that the snapshot came from the intended browser target.
+const snapshot = await callConnector<ObserveInput, ObserveOutput>(
+  observe,
+  {
+    sessionId,
+    read: { type: "snapshot", mode: "a11y", tabId: expectedTabId },
+  },
+  requestContext,
+);
+const target = snapshot.target;
+if (
+  snapshot.ok === false ||
+  target === undefined ||
+  target.tabId !== expectedTabId ||
+  target.url !== expectedUrl
+) {
+  throw new Error(snapshot.error ?? "browser snapshot target mismatch");
+}
+```
+
+After target validation, use the normal simulation and approval flow:
 
 ```ts
 // 1. Simulate before asking for approval — no side effect, no grant needed.
@@ -180,3 +218,12 @@ yours to enforce at the agent.
 - It does not mint sessions. Create one with
   `POST {UNDERSTUDY_URL}/v1/sessions` (bearer `UNDERSTUDY_TOKEN`) during case
   setup and pass the returned `sessionId` into every connector input.
+
+## Versioning
+
+- **0.4.0** — returns the exact snapshot target through `observe`, preserves
+  snapshot driver failures as structured output, and requires
+  `@understudy/protocol@^0.6.0`. Upgrade the service and extension in the same
+  rollout because protocol 0.6 makes snapshot target fields mandatory.
+- **0.3.0** — adds `observe`'s `get_dialogs` read for recent dialogs handled by
+  the extension and requires `@understudy/protocol@^0.5.0`.

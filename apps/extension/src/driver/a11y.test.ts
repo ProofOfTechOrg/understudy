@@ -109,7 +109,10 @@ function preorderRefs(tree: A11yNodeList): string[] {
 
 describe("buildA11ySnapshot", () => {
   it("keeps only meaningful, non-ignored nodes with a backend id; drops-but-descends", () => {
-    const { tree } = buildA11ySnapshot(FIXTURE, 4);
+    const { tree } = buildA11ySnapshot(FIXTURE, {
+      scopeId: "fixture",
+      generation: 4,
+    });
     // Top level, in child order: button(2), link(4, re-parented off the dropped
     // ignored generic 3), textbox(6), heading(10).
     expect(tree.map((node) => node.role)).toEqual(["button", "link", "textbox", "heading"]);
@@ -125,28 +128,56 @@ describe("buildA11ySnapshot", () => {
     expect(tree.some((node) => node.role === "link" && node.name === "Home")).toBe(true);
   });
 
-  it("assigns deterministic s{gen}e{seq} refs in DFS pre-order", () => {
-    const first = buildA11ySnapshot(FIXTURE, 4);
-    const second = buildA11ySnapshot(FIXTURE, 4);
+  it("assigns deterministic attachment-and-generation-scoped refs in DFS pre-order", () => {
+    const scope = { scopeId: "fixture", generation: 4 };
+    const first = buildA11ySnapshot(FIXTURE, scope);
+    const second = buildA11ySnapshot(FIXTURE, scope);
     // Pre-order: button(e0), link(e1), textbox(e2), the textbox's button(e3), heading(e4).
-    expect(preorderRefs(first.tree)).toEqual(["s4e0", "s4e1", "s4e2", "s4e3", "s4e4"]);
+    expect(preorderRefs(first.tree)).toEqual([
+      "afixture:s4e0",
+      "afixture:s4e1",
+      "afixture:s4e2",
+      "afixture:s4e3",
+      "afixture:s4e4",
+    ]);
     // Same input -> identical refs across runs.
     expect(preorderRefs(second.tree)).toEqual(preorderRefs(first.tree));
   });
 
+  it("does not collide when two attachments mint the same generation and sequence", () => {
+    const first = buildA11ySnapshot(FIXTURE, {
+      scopeId: "tab-a",
+      generation: 1,
+    });
+    const second = buildA11ySnapshot(FIXTURE, {
+      scopeId: "tab-b",
+      generation: 1,
+    });
+
+    expect(preorderRefs(first.tree)[0]).toBe("atab-a:s1e0");
+    expect(preorderRefs(second.tree)[0]).toBe("atab-b:s1e0");
+    expect(preorderRefs(first.tree)[0]).not.toBe(preorderRefs(second.tree)[0]);
+  });
+
   it("maps every ref to the correct backendDOMNodeId", () => {
-    const { refMap } = buildA11ySnapshot(FIXTURE, 4);
+    const { refMap } = buildA11ySnapshot(FIXTURE, {
+      scopeId: "fixture",
+      generation: 4,
+    });
     expect([...refMap.entries()]).toEqual([
-      ["s4e0", 100],
-      ["s4e1", 102],
-      ["s4e2", 104],
-      ["s4e3", 105],
-      ["s4e4", 107],
+      ["afixture:s4e0", 100],
+      ["afixture:s4e1", 102],
+      ["afixture:s4e2", 104],
+      ["afixture:s4e3", 105],
+      ["afixture:s4e4", 107],
     ]);
   });
 
   it("reconstructs nested hierarchy among kept nodes", () => {
-    const { tree } = buildA11ySnapshot(FIXTURE, 4);
+    const { tree } = buildA11ySnapshot(FIXTURE, {
+      scopeId: "fixture",
+      generation: 4,
+    });
     const textbox = tree.find((node) => node.role === "textbox");
     expect(textbox?.children?.map((child) => ({ role: child.role, name: child.name }))).toEqual([
       { role: "button", name: "Clear" },
@@ -157,7 +188,10 @@ describe("buildA11ySnapshot", () => {
   });
 
   it("carries role/name/value and leaves a missing name undefined", () => {
-    const { tree } = buildA11ySnapshot(FIXTURE, 4);
+    const { tree } = buildA11ySnapshot(FIXTURE, {
+      scopeId: "fixture",
+      generation: 4,
+    });
     const textbox = tree.find((node) => node.role === "textbox");
     expect(textbox).toMatchObject({ role: "textbox", name: "Search", value: "hello" });
     const heading = tree.find((node) => node.role === "heading");
@@ -166,7 +200,10 @@ describe("buildA11ySnapshot", () => {
   });
 
   it("returns an empty tree and empty refMap for empty input", () => {
-    const { tree, refMap } = buildA11ySnapshot([], 4);
+    const { tree, refMap } = buildA11ySnapshot([], {
+      scopeId: "fixture",
+      generation: 4,
+    });
     expect(tree).toEqual([]);
     expect(refMap.size).toBe(0);
   });

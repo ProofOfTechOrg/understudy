@@ -21,15 +21,16 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  * imports session.ts or `agents` directly.
  */
 export interface CoordinatorHost {
-  /** Writes a JSON frame to the live extension WebSocket. */
+  /** Writes a JSON frame to the session's one authoritative extension WebSocket. */
   sendToExtension(payload: string): void;
   /**
-   * The delivery predicate: does a live, onConnect-authorized extension
-   * socket exist right now? This is the exact precondition sendToExtension
-   * relies on - NOT the persisted SessionState.status scalar, which is a
-   * last-writer-wins echo maintained by lifecycle hooks (onClose guards the
-   * known stamping races, but the scalar is still eventually-consistent
-   * bookkeeping, not the delivery truth).
+   * The delivery predicate: does the persisted authority identify a live,
+   * onConnect-authorized extension socket right now? This is the exact
+   * precondition sendToExtension relies on - NOT the persisted
+   * SessionState.status scalar, which is a last-writer-wins echo maintained
+   * by lifecycle hooks (onClose guards the known stamping races, but the
+   * scalar is still eventually-consistent bookkeeping, not the delivery
+   * truth).
    */
   hasAuthorizedConnection(): boolean;
   /** Reads the persisted awaiting-commandId marker (SessionState.awaitingCommandIds). */
@@ -112,7 +113,18 @@ export class CfSessionCoordinator implements SessionCoordinator {
       // log, by construction.
       console.log("coordinator.send", { commandId: cmd.commandId, type: cmd.type });
 
-      this.host.sendToExtension(JSON.stringify(cmd));
+      try {
+        this.host.sendToExtension(JSON.stringify(cmd));
+      } catch {
+        clearTimeout(timer);
+        this.pending.delete(cmd.commandId);
+        this.dropAwaiting(cmd.commandId);
+        reject(
+          new Error(
+            `${SESSION_NOT_CONNECTED}: authoritative extension connection unavailable during send`,
+          ),
+        );
+      }
     });
   }
 

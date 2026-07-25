@@ -91,6 +91,15 @@ export interface SessionState {
   awaitingCommandIds: string[];
   status: SessionStatus;
   /**
+   * The one authenticated extension connection allowed to receive Commands
+   * and submit Events. `null` means no authoritative connection. Sessions
+   * persisted before this field existed can lack it at runtime; session.ts
+   * migrates that legacy shape only when exactly one authorized connection
+   * exists, so an ambiguous multi-connection state never falls back to
+   * broadcasting.
+   */
+  activeConnectionId: string | null;
+  /**
    * Completed WRITE commands' Events, oldest first, capped in session.ts -
    * the service half of the idempotent-retry contract. A consumer retrying
    * a write under the same commandId (the connector derives it from the

@@ -9,6 +9,7 @@ interface WsHandlers {
 
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 30_000;
+const REPLACED_BY_NEW_EXTENSION_CODE = 4001;
 // The browser WS API exposes no protocol ping frame to JS, so an app-level pong
 // is the only lever; sending one under the MV3 SW's ~30s idle timeout keeps the
 // worker alive as long as the socket stays open (chrome.alarms is the backstop
@@ -86,11 +87,18 @@ export class ReconnectingWs {
       this.handlers.onCommand(parsed);
     });
 
-    socket.addEventListener("close", () => {
+    socket.addEventListener("close", (event) => {
       this.clearHeartbeat();
       if (this.socket === socket) this.socket = null;
       if (this.stopped) return;
       this.handlers.onClose?.();
+      if (event.code === REPLACED_BY_NEW_EXTENSION_CODE) {
+        // The backend has selected another extension connection for this
+        // session. Reconnecting would make the two extensions evict each other.
+        this.stopped = true;
+        this.clearReconnect();
+        return;
+      }
       this.scheduleReconnect();
     });
 
