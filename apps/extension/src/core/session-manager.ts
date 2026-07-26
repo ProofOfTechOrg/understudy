@@ -228,19 +228,29 @@ export class SessionManager implements RuntimeHost {
       this.closedOutbox = [];
       this.vacated = [];
     }
-    const targets = await browser.debugger.getTargets();
+    const restored: SessionRuntime[] = [];
     for (const raw of persisted.assignments) {
       if (raw.browserEpoch !== this.browserEpoch()) continue;
       const runtime = new SessionRuntime({ ...raw }, this);
       this.install(runtime);
+      restored.push(runtime);
+    }
+    if (
+      unreconciledIntent === "release" ||
+      unreconciledIntent === "discard"
+    ) {
+      for (const runtime of restored) {
+        runtime.beginCleanup(unreconciledIntent);
+      }
+      await this.persist();
+      await this.retryCleanup();
+      return;
+    }
+
+    const targets = await browser.debugger.getTargets();
+    for (const runtime of restored) {
+      const raw = runtime.assignment;
       if (runtime.assignment.cleanupIntent !== undefined) {
-        if (
-          unreconciledIntent === "discard" ||
-          (unreconciledIntent === "release" &&
-            runtime.assignment.cleanupIntent === "recover")
-        ) {
-          runtime.beginCleanup(unreconciledIntent);
-        }
         continue;
       }
       const target = targets.find((candidate) => candidate.tabId === raw.tabId);
@@ -295,6 +305,7 @@ export class SessionManager implements RuntimeHost {
   }
 
   async stopAll(intent: CleanupIntent = "release"): Promise<void> {
+    this.beginStopAll(intent);
     if (intent === "release") {
       const previousOutbox = [...this.closedOutbox];
       const previousVacated = this.vacated;
@@ -313,6 +324,12 @@ export class SessionManager implements RuntimeHost {
     }
     for (const runtime of [...this.byLease.values()]) {
       await this.cleanup(runtime, intent);
+    }
+  }
+
+  beginStopAll(intent: CleanupIntent): void {
+    for (const runtime of [...this.byLease.values()]) {
+      runtime.beginCleanup(intent);
     }
   }
 
@@ -343,7 +360,8 @@ export class SessionManager implements RuntimeHost {
     return this.vacated.map((entry) => ({ ...entry }));
   }
 
-  async acknowledgeClosure(entry: ClosureRecord): Promise<void> {
+  async acknowledgeClosure(entry: ClosureRecord): Promise<boolean> {
+    if (!this.hasOutboxEntry(entry)) return false;
     const previous = this.closedOutbox;
     this.closedOutbox = previous.filter(
       (candidate) => !sameClosure(candidate, entry),
@@ -354,6 +372,7 @@ export class SessionManager implements RuntimeHost {
       this.closedOutbox = previous;
       throw error;
     }
+    return true;
   }
 
   async discardServerState(): Promise<void> {

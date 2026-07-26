@@ -3,6 +3,7 @@ import {
   A11yNodeSchema,
   CommandSchema,
   CommandRequestSchema,
+  DeviceControlServerFrameSchema,
   DialogRecordSchema,
   EventSchema,
   PROTOCOL_CAPABILITIES,
@@ -467,5 +468,29 @@ describe("safe command frames", () => {
         event: { type: "pong" },
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("device control frames", () => {
+  const acknowledgement = {
+    type: "closed_ack",
+    sessionId: "session-1",
+    leaseId: "lease-1",
+    leaseEpoch: 2,
+    browserEpoch: "browser-1",
+  } as const;
+
+  it("parses an exact closure acknowledgement", () => {
+    expect(DeviceControlServerFrameSchema.parse(acknowledgement)).toEqual(
+      acknowledgement,
+    );
+  });
+
+  it.each([
+    { ...acknowledgement, sessionId: undefined },
+    { ...acknowledgement, leaseEpoch: -1 },
+    { ...acknowledgement, extra: true },
+  ])("rejects a malformed closure acknowledgement", (frame) => {
+    expect(DeviceControlServerFrameSchema.safeParse(frame).success).toBe(false);
   });
 });

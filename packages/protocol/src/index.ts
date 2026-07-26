@@ -515,6 +515,13 @@ export const DeviceControlServerFrameSchema = z.discriminatedUnion("type", [
     browserEpoch: IdSchema,
     sessionTicket: z.string().min(1).max(4 * 1024),
   }),
+  strictObject({
+    type: z.literal("closed_ack"),
+    sessionId: IdSchema,
+    leaseId: IdSchema,
+    leaseEpoch: NonnegativeIntSchema,
+    browserEpoch: IdSchema,
+  }),
   strictObject({ type: z.literal("credential_revoked") }),
 ]);
 export type DeviceControlServerFrame = z.infer<typeof DeviceControlServerFrameSchema>;

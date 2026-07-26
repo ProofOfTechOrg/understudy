@@ -70,6 +70,11 @@ export interface LeaseResource {
   dialogDelivery: "ok" | "interrupted" | "overflow";
 }
 
+export interface ClosureConfirmation {
+  status: "closed" | "expired";
+  newlyClosed: boolean;
+}
+
 export type CreateLeaseResult =
   | { kind: "created"; created: true; lease: LeaseResource }
   | { kind: "replay"; created: false; lease: LeaseResource }
@@ -654,7 +659,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     browserEpoch: string;
     deviceId: string;
     now?: number;
-  }): Promise<UnattendedSessionLifecycle | null> {
+  }): Promise<ClosureConfirmation | null> {
     const now = input.now ?? Date.now();
     const before = this.lease(input.sessionId);
     if (
@@ -662,8 +667,16 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       before.lease_id !== input.leaseId ||
       before.device_id !== input.deviceId ||
       before.lease_epoch !== input.leaseEpoch ||
-      before.browser_epoch !== input.browserEpoch ||
-      before.release_at !== null ||
+      before.browser_epoch !== input.browserEpoch
+    ) {
+      return null;
+    }
+    if (before.release_at !== null) {
+      return before.status === "closed" || before.status === "expired"
+        ? { status: before.status, newlyClosed: false }
+        : null;
+    }
+    if (
       !(
         before.status === "allocating" ||
         before.status === "provisioning" ||
@@ -694,7 +707,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     ).toArray();
     await this.scheduleNextAlarm();
     return changed.length === 1 && changed[0]?.status === terminalStatus
-      ? terminalStatus
+      ? { status: terminalStatus, newlyClosed: true }
       : null;
   }
 

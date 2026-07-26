@@ -198,14 +198,9 @@ app.get("/v1/sessions/:sessionId", async (c) => {
   if ((await scopeSession(sessionId, actor.tenantId, c.env)) === "not-found") {
     return c.json({ error: "not found" }, 404);
   }
-  const status = await (await getSessionStub(c.env, sessionId)).getStatus();
-  if (
-    "mode" in status &&
-    status.mode === "unattended" &&
-    (status.status === "closed" || status.status === "expired" || status.status === "lost")
-  ) {
-    return c.json(status, 410);
-  }
+  const session = await getSessionStub(c.env, sessionId);
+  const status = await session.getStatus();
+  if (await session.isTerminal()) return c.json(status, 410);
   return c.json(status);
 });
 

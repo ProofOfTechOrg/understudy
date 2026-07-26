@@ -165,6 +165,10 @@ export class ProfileClient {
   configure(config: ProfileConfig): Promise<void> {
     const normalized = normalizeProfileConfig(config);
     const generation = this.invalidateControl();
+    const cleanupIntent = this.configureCleanupIntent(normalized);
+    if (cleanupIntent !== null) {
+      this.sessions.beginStopAll(cleanupIntent);
+    }
     return this.configureRequest(normalized, generation);
   }
 
@@ -184,6 +188,10 @@ export class ProfileClient {
     normalized: ProfileConfig,
     generation: number,
   ): Promise<void> {
+    const cleanupIntent = this.configureCleanupIntent(normalized);
+    if (cleanupIntent !== null) {
+      this.sessions.beginStopAll(cleanupIntent);
+    }
     const normalizedKey = await profileKey(normalized);
     if (!this.isGenerationCurrent(generation)) return;
     this.blockedProfileIdentity = null;
@@ -249,6 +257,9 @@ export class ProfileClient {
 
   stopAll(): Promise<void> {
     const generation = this.invalidateControl();
+    this.sessions.beginStopAll(
+      this.credentialRevoked ? "discard" : "release",
+    );
     return this.stopAllRequest(generation);
   }
 
@@ -262,14 +273,14 @@ export class ProfileClient {
   }
 
   private async stopAllInitialized(generation: number): Promise<void> {
+    const intent = this.credentialRevoked ? "discard" : "release";
+    this.sessions.beginStopAll(intent);
     this.stagedConfig = null;
     if (this.config !== null) {
       this.config = { ...this.config, unattendedEnabled: false };
       if (!(await this.persistProfileState(this.config, null, generation))) return;
     }
-    await this.sessions.stopAll(
-      this.credentialRevoked ? "discard" : "release",
-    );
+    await this.sessions.stopAll(intent);
     if (!this.isGenerationCurrent(generation)) return;
   }
 
@@ -479,6 +490,7 @@ export class ProfileClient {
                 : "terminal_close";
             this.blockedProfileIdentity = profileIdentity(attempt.config);
             this.invalidateControl();
+            this.sessions.beginStopAll("discard");
             this.setStatus("error");
             void this.enqueueLifecycle(async () => {
               await this.ensureInitialized();
@@ -580,10 +592,17 @@ export class ProfileClient {
         return;
       case "credential_revoked":
         this.invalidateControl();
+        this.sessions.beginStopAll("discard");
         await this.enqueueLifecycle(async () => {
           await this.handleCredentialRevoked();
         });
         return;
+      case "closed_ack": {
+        const acknowledged = await this.sessions.acknowledgeClosure(frame);
+        if (!acknowledged || !this.isPeerCurrent(attempt, peer)) return;
+        await this.flushClosureOutbox(attempt, peer);
+        return;
+      }
     }
   }
 
@@ -594,8 +613,6 @@ export class ProfileClient {
     for (const entry of this.sessions.closureOutbox()) {
       if (!this.isPeerCurrent(attempt, peer)) return;
       if (!peer.send(closedFrame(entry))) return;
-      await this.sessions.acknowledgeClosure(entry);
-      if (!this.isPeerCurrent(attempt, peer)) return;
     }
     if (
       attempt.purpose === "cleanup" &&
@@ -627,6 +644,7 @@ export class ProfileClient {
   }
 
   private async handleCredentialRevoked(): Promise<void> {
+    this.sessions.beginStopAll("discard");
     this.credentialRevoked = true;
     this.blockedProfileIdentity = null;
     this.controlBlock = null;
@@ -644,6 +662,7 @@ export class ProfileClient {
     config: ProfileConfig,
     reason: ControlBlockReason,
   ): Promise<void> {
+    this.sessions.beginStopAll("discard");
     this.blockedProfileIdentity = profileIdentity(config);
     this.invalidateControl();
     await this.enqueueLifecycle(async () => {
@@ -655,6 +674,7 @@ export class ProfileClient {
     config: ProfileConfig,
     reason: ControlBlockReason,
   ): Promise<void> {
+    this.sessions.beginStopAll("discard");
     if (
       this.config === null ||
       profileIdentity(this.config) !== profileIdentity(config)
@@ -773,6 +793,24 @@ export class ProfileClient {
       this.sessions.closureOutbox().length > 0 ||
       this.sessions.pendingReleaseCleanup()
     );
+  }
+
+  private configureCleanupIntent(
+    normalized: ProfileConfig,
+  ): "release" | "discard" | null {
+    if (this.credentialRevoked) return "discard";
+    const current = this.config;
+    if (current === null) return null;
+    const identityChanged =
+      profileIdentity(current) !== profileIdentity(normalized);
+    const disabling = current.unattendedEnabled && !normalized.unattendedEnabled;
+    if (!identityChanged && !disabling) return null;
+    const ownsOldWork =
+      current.unattendedEnabled ||
+      this.sessions.assignments().length > 0 ||
+      this.sessions.closureOutbox().length > 0 ||
+      this.sessions.vacatedLeases().length > 0;
+    return ownsOldWork ? "release" : null;
   }
 
   private async persistProfileState(

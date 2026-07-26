@@ -51,6 +51,8 @@ Attended deletion persists terminal authority immediately, cancels active attemp
 
 Unattended deletion remains acknowledgement-driven. It returns `202` while the extension still owns the tab or the matching closure frame is pending, then returns `204` after cleanup confirmation.
 
+`GET /v1/sessions/:id` returns `410` for every terminal session. This includes attended sessions with a durable closed flag and unattended sessions in `closing`, `closed`, `expired`, or `lost`. The response body retains its existing status shape.
+
 ## Configure secrets
 
 Wrangler requires six secrets:
@@ -119,6 +121,10 @@ The `RATE_LIMITER` binding allows 300 requests/min per credential pseudonym. It 
 Long-lived device credentials never enter WebSocket URLs. A device authenticates over HTTPS, receives a signed ticket, and uses it once on the control socket.
 
 The Worker verifies ticket signature, audience, expiry, and path-bound object name before object routing. The target object consumes the JTI hash atomically and validates current tenant, device, lease, and epoch authority.
+
+The extension persists a `closed` record and retries it until the Worker returns an exact `closed_ack`. The coordinator acknowledges both the first durable closure and exact replays. It rejects missing, stale, mismatched, or lost leases. `DeviceAgent` updates the session lifecycle before sending the acknowledgement, and it emits release telemetry only for the first transition.
+
+Deploy this backend behavior before the acknowledging extension. Older extensions ignore `closed_ack`. Newer extensions fail closed against an older backend by retaining their closure records and staged profiles.
 
 Attended protocol-1 sockets retain their legacy `EXTENSION_TOKENS` query flow for compatibility. Unattended sockets require tickets.
 

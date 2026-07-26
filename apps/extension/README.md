@@ -64,7 +64,7 @@ The local origin policy is the maximum this profile will host. Each session requ
 
 The extension restricts local-storage access to trusted extension contexts.
 
-`chrome.storage.session` contains browser epoch, versioned lease assignments, cleanup intent, queued closure fences, tab IDs, ref generations, write journal entries, and dialog outbox records. It never contains command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, or prior URLs.
+`chrome.storage.session` contains browser epoch, versioned lease assignments, cleanup intent, queued closure fences, tab IDs, ref generations, write journal entries, and dialog outbox records. A closure fence remains queued until the backend returns an exact `closed_ack`. The extension resends queued closures after reconnects. It never contains command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, or prior URLs.
 
 Browser restart clears execution authority. The extension creates fresh blank tabs for live recovering leases and never restores old URLs.
 
@@ -107,11 +107,11 @@ The outbox holds at most 256 records and 256 KiB. Overflow still answers the bro
 
 ## Stop automation
 
-**Stop all** durably disables hosting before tab cleanup. It closes only tabs proven to belong to current leases and does not close unrelated tabs.
+**Stop all** invalidates the control socket, fences every session runtime, and stops every session socket before profile or assignment persistence. Profile disable, replacement, credential revocation, and terminal control failures use the same ordering. A rejected storage write therefore leaves every in-memory runtime non-accepting.
 
-Tab removal is confirmation-based. If Chrome reports a failed removal and the tab still exists, the extension retains lease ownership and its heartbeat fence. The 30-second backstop alarm retries cleanup. Release cleanup queues a `closed` frame only after confirmed removal, while recovery cleanup omits the lease so the backend can provision a fresh blank tab.
+Tab removal remains sequential and confirmation-based after the synchronous fence. The extension closes only tabs proven to belong to current leases and does not close unrelated tabs. If Chrome reports a failed removal and the tab still exists, the extension retains lease ownership and its heartbeat fence. The 30-second backstop alarm retries cleanup. Release cleanup queues a `closed` frame only after confirmed removal, while recovery cleanup omits the lease so the backend can provision a fresh blank tab.
 
-Cleanup-only control connections send device hello, heartbeat, and queued closure frames through the retired profile. They reject provision and session-ticket frames.
+Cleanup-only control connections send device hello, heartbeat, and queued closure frames through the retired profile. They reject provision and session-ticket frames. They stop only after release cleanup finishes and the backend acknowledges every queued closure. A staged profile remains inactive until both conditions hold.
 
 Credential revocation persists a terminal local marker, discards backend-terminal lease ownership, and suppresses control-ticket reconnects across service-worker restarts.
 

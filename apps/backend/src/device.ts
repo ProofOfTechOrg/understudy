@@ -414,19 +414,29 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
         });
         return;
       case "closed": {
-        const terminal = await this.coordinator(fence.tenantId).confirmClosed({
+        const confirmation = await this.coordinator(fence.tenantId).confirmClosed({
           ...frame,
           deviceId: this.name,
         });
-        if (terminal !== null) {
+        if (confirmation !== null) {
           const session = await getAgentByName(this.env.SESSION, frame.sessionId);
-          await session.markLifecycle(terminal, false);
-          await emitTelemetry(this.env, {
-            event: "release",
-            outcome: terminal,
-            tenantId: fence.tenantId,
-            deviceId: this.name,
+          await session.markLifecycle(confirmation.status, false);
+          if (confirmation.newlyClosed) {
+            await emitTelemetry(this.env, {
+              event: "release",
+              outcome: confirmation.status,
+              tenantId: fence.tenantId,
+              deviceId: this.name,
+              sessionId: frame.sessionId,
+            });
+          }
+          if (!this.matchesAuthority(connection, fence)) return;
+          this.send(connection, {
+            type: "closed_ack",
             sessionId: frame.sessionId,
+            leaseId: frame.leaseId,
+            leaseEpoch: frame.leaseEpoch,
+            browserEpoch: frame.browserEpoch,
           });
         }
         return;

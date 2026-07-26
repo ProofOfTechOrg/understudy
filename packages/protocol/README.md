@@ -94,9 +94,21 @@ The guarantee is at-most-once execution with explicit pending and unknown outcom
 
 ## Use device-control frames
 
-`DeviceControlClientFrameSchema` validates device hello, heartbeat, provision acknowledgement, close acknowledgement, and provisioning failure frames. `DeviceControlServerFrameSchema` validates provision, close, reconnect ticket, and credential-revocation frames.
+`DeviceControlClientFrameSchema` validates device hello, heartbeat, provision acknowledgement, closure confirmation, and provisioning failure frames. `DeviceControlServerFrameSchema` validates provision, close, reconnect ticket, closure acknowledgement, and credential-revocation frames.
 
 Device control never carries consumer commands or vaulted plaintext.
+
+## Confirm session closure
+
+Session closure uses a reciprocal acknowledgement:
+
+```text
+persist closed -> send closed -> confirm backend lifecycle -> closed_ack
+```
+
+The device retains each `closed` record until it receives a `closed_ack` with the exact session, lease, lease epoch, and browser epoch. It resends unacknowledged records after reconnects. The backend accepts an exact replay after a successful closure, but it never acknowledges a missing, stale, mismatched, or lost lease.
+
+Deploy the backend before the extension. An older extension ignores the additive `closed_ack` frame. A newer extension connected to an older backend retains the closure record and does not promote a staged profile.
 
 ## Handle terminal WebSocket closes
 

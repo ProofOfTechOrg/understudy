@@ -208,6 +208,16 @@ describe("TenantDeviceCoordinator allocation", () => {
     expect(
       await stub.confirmClosed({
         sessionId: created.lease.sessionId,
+        leaseId: "stale-lease",
+        deviceId: created.lease.deviceId,
+        leaseEpoch: created.lease.leaseEpoch,
+        browserEpoch: created.lease.browserEpoch,
+        now: now + 2,
+      }),
+    ).toBeNull();
+    expect(
+      await stub.confirmClosed({
+        sessionId: created.lease.sessionId,
         leaseId: created.lease.leaseId,
         deviceId: DEVICE_B,
         leaseEpoch: created.lease.leaseEpoch,
@@ -225,6 +235,16 @@ describe("TenantDeviceCoordinator allocation", () => {
         now: now + 2,
       }),
     ).toBeNull();
+    expect(
+      await stub.confirmClosed({
+        sessionId: created.lease.sessionId,
+        leaseId: created.lease.leaseId,
+        deviceId: created.lease.deviceId,
+        leaseEpoch: created.lease.leaseEpoch,
+        browserEpoch: "stale-browser",
+        now: now + 2,
+      }),
+    ).toBeNull();
     expect(await stub.getLease(created.lease.sessionId, now + 3)).toMatchObject({
       status: "provisioning",
     });
@@ -237,10 +257,37 @@ describe("TenantDeviceCoordinator allocation", () => {
         browserEpoch: created.lease.browserEpoch,
         now: now + 3,
       }),
-    ).toBe("closed");
+    ).toEqual({ status: "closed", newlyClosed: true });
+    expect(
+      await stub.confirmClosed({
+        sessionId: created.lease.sessionId,
+        leaseId: created.lease.leaseId,
+        deviceId: created.lease.deviceId,
+        leaseEpoch: created.lease.leaseEpoch,
+        browserEpoch: created.lease.browserEpoch,
+        now: now + 4,
+      }),
+    ).toEqual({ status: "closed", newlyClosed: false });
     expect((await stub.listDevices(now + 4))[0]).toMatchObject({
       used: 0,
     });
+
+    const lost = await stub.createLease({
+      ...leaseInput(2, "https://two.example"),
+      now: now + 5,
+    });
+    if (lost.kind !== "created") throw new Error("expected created lease");
+    await stub.revokeDevice(DEVICE_A, undefined, now + 6);
+    expect(
+      await stub.confirmClosed({
+        sessionId: lost.lease.sessionId,
+        leaseId: lost.lease.leaseId,
+        deviceId: lost.lease.deviceId,
+        leaseEpoch: lost.lease.leaseEpoch,
+        browserEpoch: lost.lease.browserEpoch,
+        now: now + 7,
+      }),
+    ).toBeNull();
   });
 
   it("never falls back from an explicit full device and auto-selects by used capacity", async () => {

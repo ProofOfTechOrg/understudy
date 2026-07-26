@@ -472,6 +472,14 @@ describe("attended session retirement", () => {
       reason: "session deleted",
     });
 
+    const terminalStatus = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A),
+    );
+    expect(terminalStatus.status).toBe(410);
+    expect(await terminalStatus.json()).toMatchObject({
+      status: "detached",
+    });
+
     const repeated = await exports.default.fetch(
       authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
         method: "DELETE",

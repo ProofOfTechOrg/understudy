@@ -19,6 +19,7 @@ class FakeWebSocket {
 
   readyState = 0;
   readonly sent: unknown[] = [];
+  closeCount = 0;
   private readonly listeners = new Map<string, Listener[]>();
 
   constructor(readonly url: string) {
@@ -36,6 +37,8 @@ class FakeWebSocket {
   }
 
   close(code = 1000): void {
+    this.closeCount += 1;
+    this.readyState = 3;
     this.emit("close", { code });
   }
 
@@ -535,9 +538,205 @@ describe("ProfileClient generation fencing", () => {
       ),
     ).toHaveLength(0);
   });
+
+  it("fences a live runtime before disabled profile persistence can fail", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    fixture.createWindow.mockResolvedValue({
+      id: 3,
+      tabs: [{ id: 7 }],
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const control = FakeWebSocket.instances[0];
+    control?.open();
+    control?.message({
+      type: "provision",
+      sessionId: "session-1",
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      sessionTicket: "session-ticket",
+    });
+    await vi.waitFor(() =>
+      expect(control?.sent).toContainEqual(
+        expect.objectContaining({ type: "provisioned" }),
+      ),
+    );
+    const sessionSocket = FakeWebSocket.instances.find((socket) =>
+      socket.url.includes("/agents/session/"),
+    );
+    if (sessionSocket === undefined) throw new Error("session socket missing");
+    fixture.localArea.set.mockRejectedValueOnce(new Error("profile write failed"));
+
+    const stopping = client.stopAll();
+
+    expect(sessionSocket.closeCount).toBe(1);
+    expect(client.sessions.assignments()).toEqual([
+      expect.objectContaining({ cleanupIntent: "release" }),
+    ]);
+    await expect(stopping).rejects.toThrow("profile write failed");
+    expect(client.sessions.assignments()).toEqual([
+      expect.objectContaining({ cleanupIntent: "release" }),
+    ]);
+  });
+
+  it("fences replacement work before hashing or profile persistence", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    fixture.createWindow.mockResolvedValue({
+      id: 3,
+      tabs: [{ id: 7 }],
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const control = FakeWebSocket.instances[0];
+    control?.open();
+    control?.message({
+      type: "provision",
+      sessionId: "session-1",
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      sessionTicket: "session-ticket",
+    });
+    await vi.waitFor(() =>
+      expect(control?.sent).toContainEqual(
+        expect.objectContaining({ type: "provisioned" }),
+      ),
+    );
+    const sessionSocket = FakeWebSocket.instances.find((socket) =>
+      socket.url.includes("/agents/session/"),
+    );
+    if (sessionSocket === undefined) throw new Error("session socket missing");
+    let releaseHash!: () => void;
+    const hashGate = new Promise<void>((resolve) => {
+      releaseHash = resolve;
+    });
+    const digest = vi
+      .spyOn(crypto.subtle, "digest")
+      .mockImplementation(async () => {
+        await hashGate;
+        return new Uint8Array(32).buffer;
+      });
+    const writesBefore = fixture.localArea.set.mock.calls.length;
+    const replacement = {
+      ...CONFIG,
+      serviceOrigin: "https://new.example",
+      deviceCredential: "new-credential",
+    };
+
+    const configuring = client.configure(replacement);
+
+    expect(sessionSocket.closeCount).toBe(1);
+    expect(digest).not.toHaveBeenCalled();
+    expect(fixture.localArea.set).toHaveBeenCalledTimes(writesBefore);
+    await vi.waitFor(() => expect(digest).toHaveBeenCalledOnce());
+    expect(fixture.localArea.set).toHaveBeenCalledTimes(writesBefore);
+    releaseHash();
+    await configuring;
+  });
+
+  it("keeps a credential-revoked runtime fenced when profile persistence fails", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    fixture.createWindow.mockResolvedValue({
+      id: 3,
+      tabs: [{ id: 7 }],
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const control = FakeWebSocket.instances[0];
+    control?.open();
+    control?.message({
+      type: "provision",
+      sessionId: "session-1",
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      sessionTicket: "session-ticket",
+    });
+    await vi.waitFor(() =>
+      expect(control?.sent).toContainEqual(
+        expect.objectContaining({ type: "provisioned" }),
+      ),
+    );
+    const sessionSocket = FakeWebSocket.instances.find((socket) =>
+      socket.url.includes("/agents/session/"),
+    );
+    if (sessionSocket === undefined) throw new Error("session socket missing");
+    fixture.localArea.set.mockRejectedValueOnce(new Error("profile write failed"));
+
+    control?.message({ type: "credential_revoked" });
+
+    await vi.waitFor(() => expect(sessionSocket.closeCount).toBe(1));
+    expect(client.sessions.assignments()).toEqual([
+      expect.objectContaining({ cleanupIntent: "discard" }),
+    ]);
+  });
 });
 
 describe("ProfileClient startup cleanup", () => {
+  it("retains and resends a closure until the backend acknowledges its exact fence", async () => {
+    const closure = {
+      sessionId: "session-closed",
+      leaseId: "lease-closed",
+      leaseEpoch: 2,
+      browserEpoch: EPOCH,
+    };
+    const fixture = installBrowser({
+      local: persistedConfig({ ...CONFIG, unattendedEnabled: false }),
+      session: {
+        "understudy:browserEpoch": EPOCH,
+        "understudy:assignments": {
+          version: 3,
+          assignments: [],
+          closedOutbox: [closure],
+          vacatedLeases: [],
+        },
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.start();
+    const first = FakeWebSocket.instances[0];
+    first?.open();
+    await vi.waitFor(() =>
+      expect(first?.sent).toContainEqual({ type: "closed", ...closure }),
+    );
+    expect(client.sessions.closureOutbox()).toEqual([closure]);
+
+    first?.emit("close", { code: 1006 });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    const second = FakeWebSocket.instances[1];
+    second?.open();
+    await vi.waitFor(() =>
+      expect(second?.sent).toContainEqual({ type: "closed", ...closure }),
+    );
+    expect(client.sessions.closureOutbox()).toEqual([closure]);
+
+    second?.message({ type: "closed_ack", ...closure });
+    await vi.waitFor(() => expect(client.sessions.closureOutbox()).toEqual([]));
+    expect(
+      (
+        fixture.session["understudy:assignments"] as {
+          closedOutbox: unknown[];
+        }
+      ).closedOutbox,
+    ).toEqual([]);
+    await vi.waitFor(() => expect(client.currentStatus()).toBe("disabled"));
+  });
+
   it("consumes a vacated lease only after its replacement runtime is installed", async () => {
     const vacated = {
       sessionId: "session-vacated",
@@ -632,6 +831,9 @@ describe("ProfileClient startup cleanup", () => {
     await vi.waitFor(() =>
       expect(cleanup?.sent).toContainEqual({ type: "closed", ...vacated }),
     );
+    expect(client.sessions.closureOutbox()).toEqual([vacated]);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    cleanup?.message({ type: "closed_ack", ...vacated });
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "https://old.example/v1/device/connect-ticket",
@@ -718,6 +920,14 @@ describe("ProfileClient startup cleanup", () => {
         browserEpoch: EPOCH,
       }),
     );
+    expect(client.sessions.closureOutbox()).toHaveLength(1);
+    FakeWebSocket.instances[0]?.message({
+      type: "closed_ack",
+      sessionId: "session-1",
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+    });
     await vi.waitFor(() =>
       expect(client.currentStatus()).toBe("disabled"),
     );
@@ -773,7 +983,7 @@ describe("ProfileClient startup cleanup", () => {
     expect(client.sessions.closureOutbox()).toHaveLength(1);
   });
 
-  it("promotes a replacement only after the old control queues its closure frame", async () => {
+  it("promotes a replacement only after an exact durable closure acknowledgement", async () => {
     const assignment = {
       sessionId: "session-1",
       leaseId: "lease-1",
@@ -822,7 +1032,34 @@ describe("ProfileClient startup cleanup", () => {
         browserEpoch: assignment.browserEpoch,
       }),
     );
+    expect(client.sessions.closureOutbox()).toHaveLength(1);
+    cleanup?.message({
+      type: "closed_ack",
+      sessionId: assignment.sessionId,
+      leaseId: assignment.leaseId,
+      leaseEpoch: assignment.leaseEpoch + 1,
+      browserEpoch: assignment.browserEpoch,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.sessions.closureOutbox()).toHaveLength(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    cleanup?.message({
+      type: "closed_ack",
+      sessionId: assignment.sessionId,
+      leaseId: assignment.leaseId,
+      leaseEpoch: assignment.leaseEpoch,
+      browserEpoch: assignment.browserEpoch,
+    });
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+    expect(client.sessions.closureOutbox()).toEqual([]);
+    expect(
+      (
+        fixture.session["understudy:assignments"] as {
+          closedOutbox: unknown[];
+        }
+      ).closedOutbox,
+    ).toEqual([]);
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "https://old.example/v1/device/connect-ticket",
