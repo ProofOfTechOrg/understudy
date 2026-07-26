@@ -1,64 +1,110 @@
-# Extension (M2)
+<!-- Content type: Reference -->
 
-WXT + React MV3 extension that puppets a user's already-logged-in Chromium tab
-over a WebSocket. It holds the WS connection, runs a CDP session against a
-single designated tab via `chrome.debugger`, and executes protocol Commands
-(`snapshot`, `click`, `type`, `navigate`, `key`, `scroll`, `wait`, `resolve_ref`,
-`get_tabs`, `switch_tab`) as schema-valid `@understudy/protocol` Events. The peer in M2 is
-a throwaway stub server (`scripts/stub-server.mjs`); the real Hono backend is
-M3.
+# Host Understudy sessions in Chromium
 
-## Layout
+The Manifest V3 extension supports attended control of one selected tab and unattended control of at most two extension-owned tabs. Unattended hosting requires a tenant-dedicated Chrome profile because tabs share profile cookies and browser storage.
 
-| Path | What |
-| --- | --- |
-| `src/driver/a11y.ts` | `buildA11ySnapshot` — pure AX-tree → pruned `A11yNode[]` + opaque session/attachment/generation-bound ref map. No `chrome.*`. |
-| `src/driver/keymap.ts` | `parseKeys` — pure key-spec parser (`"Ctrl+Enter"` etc.) → CDP `Input.dispatchKeyEvent` fields. No `chrome.*`. |
-| `src/driver/cdp-events.ts` | `classifyCdpEvent` — pure classifier turning a raw CDP event into the effects the background worker should apply. No `chrome.*`. |
-| `src/driver/cdp.ts` | `CdpSession` — the one `chrome.debugger` channel per attached tab: FIFO command queue, per-command timeouts, and the executors backing every protocol Command. |
-| `src/core/ws-client.ts` | `ReconnectingWs` — WebSocket with backoff reconnect and a self-driven pong heartbeat. |
-| `src/core/command-ingress.ts` | `CommandIngress` — preserves command arrival order through async dedupe claims and provides a drain barrier for WebSocket session changes. |
-| `src/core/router.ts` | `routeCommand` — dispatches a parsed `Command` to a `CdpSession` executor or a tab-management handler, always returning exactly one `Event`. |
-| `src/events.ts`, `src/tabs.ts`, `src/messaging.ts` | Shared leaf helpers (`action_result` builder, tab-info query) and the sidepanel↔service-worker `Port` message types. |
-| `src/entrypoints/background.ts` | The MV3 service worker: owns the WS connection, the CDP session, wake-time reattachment, and the alarm/heartbeat keepalive. |
-| `src/entrypoints/sidepanel/` | React panel (WS status, WS URL field, Attach/Detach, live log) talking to the background worker over a `chrome.runtime.Port`. |
-| `scripts/stub-server.mjs` | Throwaway M2 verification peer — validates every extension-emitted Event against the real protocol schemas. |
+## Understand the runtime
 
-## Develop
+The background service worker separates profile and session responsibilities:
 
-Run from the repo root (`pnpm-workspace.yaml` scopes `@understudy/extension`):
+| Module | Responsibility |
+|---|---|
+| `core/profile-client.ts` | Enrollment, browser epoch, device ticket, and control socket |
+| `core/session-manager.ts` | Runtime maps by session, lease, and tab |
+| `core/session-runtime.ts` | One tab, CDP session, command queue, session socket, journal, and dialog outbox |
+| `core/write-journal.ts` | Awaited `prepared`, `started`, `completed_unacked`, and `unknown` states |
+| `core/dialog-outbox.ts` | Browser-epoch-scoped dialog acknowledgement and replay |
+| `driver/cdp.ts` | CDP execution, aggregate deadlines, top-level origin interception, and popup containment |
+| `entrypoints/background.ts` | Profile host plus compatible attended session |
+| `entrypoints/sidepanel/` | Enrollment, capacity, emergency stop, and attended controls |
+
+Each unattended lease creates a new `about:blank` tab in an unfocused automation window. The extension never adopts an existing tab for unattended work.
+
+## Build the production extension
+
+Run:
 
 ```bash
-pnpm --filter @understudy/extension dev         # wxt dev server (throwaway profile — no logins)
-pnpm --filter @understudy/extension build       # wxt build -> .output/chrome-mv3/
-pnpm --filter @understudy/extension typecheck   # wxt prepare && tsc --noEmit
-pnpm --filter @understudy/extension test        # vitest run
-pnpm --filter @understudy/extension stub        # node scripts/stub-server.mjs
+pnpm --filter @understudy/protocol build
+pnpm --filter @understudy/extension typecheck
+pnpm --filter @understudy/extension test
+pnpm --filter @understudy/extension build
 ```
 
-`@understudy/protocol` resolves from source via a WXT `alias` in
-`wxt.config.ts` (not `exports`/`dist`), so typecheck and dev don't depend on
-the protocol package being built first. The stub server is the exception — it
-imports the built `dist/`, so run `pnpm --filter @understudy/protocol build`
-before `pnpm --filter @understudy/extension stub`.
+Load `apps/extension/.output/chrome-mv3/` through `chrome://extensions`. Use the production build for real-browser tests. WXT development mode creates a disposable profile and does not prove behavior against the operator’s login state.
 
-## Manifest
+The manifest requires Chrome 125 or newer and requests debugger, tabs, active tab, storage, alarms, side panel, and host permissions.
 
-`wxt.config.ts` declares:
+## Enroll a dedicated profile
 
-- `minimum_chrome_version: "116"` — the version whose MV3 service-worker idle
-  timer is reset by WebSocket traffic, which the heartbeat in
-  `src/core/ws-client.ts` relies on.
-- `permissions: ["debugger", "tabs", "activeTab", "storage", "alarms"]` (WXT
-  auto-adds `sidePanel`) and `host_permissions: ["<all_urls>"]`. No
-  `offscreen` permission and no content script — deliberately deferred until a
-  real agent loop shows eviction pain (see the repo-root `docs/technical-plan.md`).
+Open the side panel and enter:
 
-## Verifying end-to-end
+- HTTPS service origin
+- Device UUID
+- Raw device credential
+- One exact allowed origin per line
+- **Enable unattended hosting**
 
-Unit tests (`pnpm --filter @understudy/extension test`) cover the pure driver
-logic and the router. They do not prove the extension against a real,
-logged-in Chromium tab over the real WebSocket wire — for that, follow
-[`RUNBOOK.md`](RUNBOOK.md): build the protocol dist, build the extension, load
-it unpacked, start the stub server, and drive it with real commands while
-watching for `EVENT SCHEMA VIOLATION` logs.
+The credential field is write-only and must be supplied on every save. Panel state and logs never read it back.
+
+The local origin policy is the maximum this profile will host. Each session request must be a subset.
+
+## Understand storage
+
+`chrome.storage.local` contains only:
+
+- Service origin
+- Enabled state
+- Device ID
+- Raw device credential
+- Local origin policy
+
+The extension restricts local-storage access to trusted extension contexts.
+
+`chrome.storage.session` contains browser epoch, lease assignments, tab IDs, ref generations, write journal entries, and dialog outbox records. It never contains command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, prior URLs, or restoration tasks.
+
+Browser restart clears execution authority. The extension creates fresh blank tabs for live recovering leases and never restores old URLs.
+
+## Control tabs safely
+
+One runtime can see only its own tab. `hello`, `get_tabs`, and `switch_tab` never report or activate another profile tab.
+
+Top-level navigations must remain within `allowedOrigins`. Explicit navigate commands are checked before dispatch. CDP Fetch interception also blocks redirects and JavaScript navigation. Cross-origin subresources and iframes remain allowed; the origin policy is not an egress firewall.
+
+Popup targets related to a controlled tab are paused and closed before execution. `tabs.onCreated` adds a second ownership check.
+
+## Recover command state
+
+Writes use protocol 2:
+
+```text
+persist prepared
+  -> write_ready
+  -> persist started
+  -> execute once
+  -> persist completed_unacked
+  -> replay until result_ack
+```
+
+A storage failure before `started` prevents the browser action. A same-epoch service-worker restart:
+
+- Cancels an ungranted preparation unless the backend still recognizes it
+- Marks a started write without a durable result unknown
+- Replays a completed unacknowledged result
+
+A browser epoch change blocks writes for recovering sessions. Delete the old session and create a new session to resume writes.
+
+## Deliver dialogs
+
+The extension persists each dialog before answering it. It accepts alerts and before-unload dialogs, dismisses confirms and prompts, then replays the record until `dialog_ack`.
+
+The outbox holds at most 256 records and 256 KiB. Overflow still answers the browser dialog and reports content-free health.
+
+## Stop automation
+
+**Stop all** closes only tabs proven to belong to current leases and disables unattended hosting. It does not close unrelated or restored tabs.
+
+Attended **Detach tab** detaches CDP but never closes the selected user tab.
+
+Follow [`RUNBOOK.md`](RUNBOOK.md) for the real-Chromium acceptance and recovery procedure.

@@ -35,11 +35,15 @@ import {
 import {
   A11yNodeSchema,
   type Command,
+  CommandStatusResponseSchema,
   type DialogRecord,
   DialogRecordSchema,
   type Event,
   parseCommand,
   parseEvent,
+  PendingCommandResponseSchema,
+  type PendingCommandResponse,
+  type CommandStatusResponse,
   SnapshotModeSchema,
   SnapshotTargetSchema,
   TabInfoSchema,
@@ -111,26 +115,41 @@ export const BROWSER_WRITE_CONNECTOR_IDS = [
 // the service API's dryRun flag, which the act/fill_credential dryRunExecute
 // paths set.
 
+const ConnectorIdSchema = z.string().min(1).max(128);
+const ConnectorRefSchema = z.string().min(1).max(256);
+const ConnectorTabIdSchema = z.number().int().nonnegative();
+
 export const observeInput = z.object({
-  sessionId: z.string(),
+  sessionId: ConnectorIdSchema,
   read: z.discriminatedUnion("type", [
     z.object({
       type: z.literal("snapshot"),
       mode: SnapshotModeSchema, // "a11y" | "dom" | "screenshot"
-      tabId: z.number().optional(),
-    }),
-    z.object({ type: z.literal("get_tabs") }),
+      tabId: ConnectorTabIdSchema.optional(),
+    }).strict(),
+    z.object({ type: z.literal("get_tabs") }).strict(),
     z.object({
       type: z.literal("wait"),
       for: z.enum(["load", "idle", "ms"]),
-      value: z.number().optional(),
+      value: z.number().int().min(0).max(20_000).optional(),
+    }).strict().superRefine((value, ctx) => {
+      if (value.for === "ms" && value.value === undefined) {
+        ctx.addIssue({ code: "custom", path: ["value"], message: "value is required for wait.ms" });
+      }
+      if (value.for !== "ms" && value.value !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["value"],
+          message: "value is forbidden unless wait.for is 'ms'",
+        });
+      }
     }),
     // Recent page dialogs the browser auto-handled - read from the session
     // status (GET), not a command: dialogs are answered extension-side, this
     // just reports what happened.
-    z.object({ type: z.literal("get_dialogs") }),
+    z.object({ type: z.literal("get_dialogs") }).strict(),
   ]),
-});
+}).strict();
 export type ObserveInput = z.infer<typeof observeInput>;
 
 export const observeOutput = z.object({
@@ -146,7 +165,7 @@ export const observeOutput = z.object({
   /** Wait outcome, or `false` when the driver rejects a snapshot. */
   ok: z.boolean().optional(),
   error: z.string().optional(),
-});
+}).strict();
 export type ObserveOutput = z.infer<typeof observeOutput>;
 
 // Write actions deliberately EXCLUDE secret entry: non-secret type.text (a
@@ -162,21 +181,33 @@ export type ObserveOutput = z.infer<typeof observeOutput>;
 // relationship is pinned at compile time AND runtime in index.test.ts, so a
 // protocol classification change breaks the build instead of drifting.
 export const actInput = z.object({
-  sessionId: z.string(),
+  sessionId: ConnectorIdSchema,
   action: z.discriminatedUnion("type", [
-    z.object({ type: z.literal("click"), ref: z.string() }),
+    z.object({ type: z.literal("click"), ref: ConnectorRefSchema }).strict(),
     z.object({
       type: z.literal("type"),
-      ref: z.string(),
-      text: z.string(),
+      ref: ConnectorRefSchema,
+      text: z.string().max(64 * 1024),
       submit: z.boolean().optional(),
-    }),
-    z.object({ type: z.literal("navigate"), url: z.url(), tabId: z.number().optional() }),
-    z.object({ type: z.literal("key"), keys: z.string(), ref: z.string().optional() }),
-    z.object({ type: z.literal("scroll"), ref: z.string().optional(), dy: z.number() }),
-    z.object({ type: z.literal("switch_tab"), tabId: z.number() }),
+    }).strict(),
+    z.object({
+      type: z.literal("navigate"),
+      url: z.string().min(1).max(8 * 1024).pipe(z.url()),
+      tabId: ConnectorTabIdSchema.optional(),
+    }).strict(),
+    z.object({
+      type: z.literal("key"),
+      keys: z.string().min(1).max(256),
+      ref: ConnectorRefSchema.optional(),
+    }).strict(),
+    z.object({
+      type: z.literal("scroll"),
+      ref: ConnectorRefSchema.optional(),
+      dy: z.number().finite(),
+    }).strict(),
+    z.object({ type: z.literal("switch_tab"), tabId: ConnectorTabIdSchema }).strict(),
   ]),
-});
+}).strict();
 export type ActInput = z.infer<typeof actInput>;
 
 export const actOutput = z.object({
@@ -184,16 +215,16 @@ export const actOutput = z.object({
   url: z.string().optional(),
   error: z.string().optional(),
   simulated: z.boolean().optional(),
-});
+}).strict();
 export type ActOutput = z.infer<typeof actOutput>;
 
 export const fillCredentialInput = z.object({
-  sessionId: z.string(),
-  ref: z.string(),
+  sessionId: ConnectorIdSchema,
+  ref: ConnectorRefSchema,
   /** Opaque vault handle (e.g. "vault://tenant/portal/password") - NEVER the plaintext. */
-  secretRef: z.string(),
+  secretRef: z.string().min(1).max(512),
   submit: z.boolean().optional(),
-});
+}).strict();
 export type FillCredentialInput = z.infer<typeof fillCredentialInput>;
 
 export const fillCredentialOutput = z.object({
@@ -201,7 +232,7 @@ export const fillCredentialOutput = z.object({
   filled: z.boolean(),
   error: z.string().optional(),
   simulated: z.boolean().optional(),
-});
+}).strict();
 export type FillCredentialOutput = z.infer<typeof fillCredentialOutput>;
 
 // -- Service bridge ------------------------------------------------------------
@@ -226,16 +257,102 @@ async function callUnderstudy(
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${env.UNDERSTUDY_TOKEN}`,
+        "understudy-command-contract": "2",
       },
       body: JSON.stringify({ command, dryRun: opts.dryRun ?? false }),
     },
   );
+  if (res.status === 202) {
+    const pending = PendingCommandResponseSchema.parse(await res.json());
+    throw new UnderstudyCommandPendingError(pending);
+  }
   if (!res.ok) {
+    const failure = await parseCommandFailure(res);
+    if (res.status === 504 && failure.code === "command_not_started") {
+      throw new UnderstudyCommandNotStartedError(command.commandId);
+    }
+    if (res.status === 409 && failure.code === "command_outcome_unknown") {
+      throw new UnderstudyCommandOutcomeUnknownError(command.commandId);
+    }
     // Status + session only - request/response bodies can carry page content,
     // evidence, or PII that must not reach a log sink.
     throw new Error(`understudy service ${res.status} for session ${sessionId}`);
   }
   return parseEvent(await res.json());
+}
+
+const CommandFailureSchema = z
+  .object({
+    code: z.string().max(128).optional(),
+    error: z.string().max(256).optional(),
+    commandId: z.string().max(128).optional(),
+    safeToRetry: z.boolean().optional(),
+  })
+  .strict();
+
+async function parseCommandFailure(response: {
+  json(): Promise<unknown>;
+}): Promise<z.infer<typeof CommandFailureSchema>> {
+  try {
+    return CommandFailureSchema.parse(await response.json());
+  } catch {
+    return {};
+  }
+}
+
+export class UnderstudyCommandPendingError extends Error {
+  readonly pending: PendingCommandResponse;
+
+  constructor(pending: PendingCommandResponse) {
+    super(`understudy command ${pending.commandId} is pending`);
+    this.name = "UnderstudyCommandPendingError";
+    this.pending = pending;
+  }
+}
+
+export class UnderstudyCommandNotStartedError extends Error {
+  readonly commandId: string;
+  readonly safeToRetry = true as const;
+
+  constructor(commandId: string) {
+    super(`understudy command ${commandId} was not started`);
+    this.name = "UnderstudyCommandNotStartedError";
+    this.commandId = commandId;
+  }
+}
+
+export class UnderstudyCommandOutcomeUnknownError extends Error {
+  readonly commandId: string;
+  readonly safeToRetry = false as const;
+
+  constructor(commandId: string) {
+    super(`understudy command ${commandId} has an unknown outcome`);
+    this.name = "UnderstudyCommandOutcomeUnknownError";
+    this.commandId = commandId;
+  }
+}
+
+export async function pollUnderstudyCommand(
+  runtime: ConnectorRuntime,
+  env: BrowserConnectorEnv,
+  sessionId: string,
+  commandId: string,
+): Promise<CommandStatusResponse> {
+  const base = env.UNDERSTUDY_URL.replace(/\/$/, "");
+  const response = await runtime.fetch(
+    `${base}/v1/sessions/${encodeURIComponent(sessionId)}/commands/${encodeURIComponent(commandId)}`,
+    {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${env.UNDERSTUDY_TOKEN}`,
+        "understudy-command-contract": "2",
+      },
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`understudy service ${response.status} for session ${sessionId}`);
+  }
+  return CommandStatusResponseSchema.parse(await response.json());
 }
 
 /**
@@ -270,7 +387,8 @@ async function getSessionStatus(
 // the retry re-runs execute() - under a random id the service could not
 // recognize the retry, and the write would run twice. Under the derived id
 // the service replays the recorded Event instead (its completedWrites
-// cache), making write retries exactly-once end to end.
+// cache). Protocol 2 supplies at-most-once execution plus explicit pending
+// and unknown outcomes when an external result cannot be proven.
 function toCommand(fields: object, commandId?: string): Command {
   return parseCommand({ ...fields, commandId: commandId ?? crypto.randomUUID() });
 }
@@ -279,12 +397,17 @@ function toCommand(fields: object, commandId?: string): Command {
 // idempotency key from, so the derived commandId and breakwater's replay
 // store always key off the same value. Structural access: Mastra's context
 // type does not surface requestContext.get on every version.
-function idempotencyCommandId(ctx: ToolExecutionContext): string | undefined {
+async function idempotencyCommandId(ctx: ToolExecutionContext): Promise<string | undefined> {
   const requestContext = (
     ctx as { requestContext?: { get?: (key: string) => unknown } }
   ).requestContext;
   const key = requestContext?.get?.(IDEMPOTENCY_KEY_CONTEXT_KEY);
-  return typeof key === "string" && key.length > 0 ? `ik_${key}` : undefined;
+  if (typeof key !== "string" || key.length === 0) return undefined;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key));
+  const hex = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `ik_${hex}`;
 }
 
 // -- Connectors ------------------------------------------------------------------
@@ -377,7 +500,7 @@ export function createBrowserConnectors(
       rateLimit: "60/min",
     },
     execute: async (input, ctx, runtime): Promise<ActOutput> => {
-      const command = toCommand(input.action, idempotencyCommandId(ctx));
+      const command = toCommand(input.action, await idempotencyCommandId(ctx));
       const ev = await callUnderstudy(runtime, env, input.sessionId, command);
       if (ev.type === "action_result") return { ok: ev.ok, url: ev.url, error: ev.error };
       throw new Error(`act: unexpected event '${ev.type}'`);
@@ -425,7 +548,7 @@ export function createBrowserConnectors(
           secretRef: input.secretRef, // opaque handle; resolved service-side
           ...(input.submit !== undefined ? { submit: input.submit } : {}),
         },
-        idempotencyCommandId(ctx),
+        await idempotencyCommandId(ctx),
       );
       const ev = await callUnderstudy(runtime, env, input.sessionId, command);
       if (ev.type === "action_result") return { ok: ev.ok, filled: ev.ok, error: ev.error };

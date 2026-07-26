@@ -9,7 +9,12 @@
  */
 
 import type { Command, Event } from "@understudy/protocol";
-import { COMMAND_TIMED_OUT, DUPLICATE_COMMAND, SESSION_NOT_CONNECTED } from "./coordinator";
+import {
+  COMMAND_TIMED_OUT,
+  DUPLICATE_COMMAND,
+  SESSION_BUSY,
+  SESSION_NOT_CONNECTED,
+} from "./coordinator";
 import type { PendingCommand, PendingMap, SessionCoordinator } from "./coordinator";
 import type { SessionStatus } from "./types";
 
@@ -39,6 +44,8 @@ export interface CoordinatorHost {
   persistAwaitingCommandIds(ids: string[]): void;
   /** Persists the session status via the DO's setState. */
   persistStatus(status: SessionStatus): void;
+  /** Persists a result that arrived after the caller's timeout tombstoned it. */
+  persistLateResult(event: Event): void;
 }
 
 export class CfSessionCoordinator implements SessionCoordinator {
@@ -95,23 +102,23 @@ export class CfSessionCoordinator implements SessionCoordinator {
         new Error(`${DUPLICATE_COMMAND}: ${cmd.commandId} is already awaiting its event`),
       );
     }
+    if (this.pending.size > 0 || this.host.getAwaitingCommandIds().length > 0) {
+      return Promise.reject(
+        new Error(`${SESSION_BUSY}: another command owns the session slot`),
+      );
+    }
     return new Promise<Event>((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(
           new Error(`${COMMAND_TIMED_OUT}: ${cmd.commandId} (${cmd.type}) after ${this.timeoutMs}ms`),
         );
-        this.pending.delete(cmd.commandId);
-        this.dropAwaiting(cmd.commandId);
+        const pending = this.pending.get(cmd.commandId);
+        if (pending !== undefined) pending.timedOut = true;
       }, this.timeoutMs);
 
-      const pendingCommand: PendingCommand = { resolve, reject, timer };
+      const pendingCommand: PendingCommand = { resolve, reject, timer, timedOut: false };
       this.pending.set(cmd.commandId, pendingCommand);
       this.addAwaiting(cmd.commandId);
-
-      // DL-004: metadata only, never the full command - a fill_secret's
-      // eventual plaintext (type.text) and its secretRef must never reach a
-      // log, by construction.
-      console.log("coordinator.send", { commandId: cmd.commandId, type: cmd.type });
 
       try {
         this.host.sendToExtension(JSON.stringify(cmd));
@@ -146,6 +153,7 @@ export class CfSessionCoordinator implements SessionCoordinator {
     const pendingCommand = this.pending.get(commandId);
     if (pendingCommand) {
       clearTimeout(pendingCommand.timer);
+      if (pendingCommand.timedOut) this.host.persistLateResult(ev);
       pendingCommand.resolve(ev);
       this.pending.delete(commandId);
       this.dropAwaiting(commandId);
@@ -154,6 +162,7 @@ export class CfSessionCoordinator implements SessionCoordinator {
 
     if (this.host.getAwaitingCommandIds().includes(commandId)) {
       // Orphaned/late result: reconcile the marker, resolve nothing.
+      this.host.persistLateResult(ev);
       this.dropAwaiting(commandId);
       return;
     }

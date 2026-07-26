@@ -52,6 +52,7 @@ export class CdpSession {
   // Chained (not fire-and-forget) so concurrent bumpGeneration() calls persist
   // in order instead of racing to overwrite browser.storage.session.
   private genPersistChain: Promise<unknown> = Promise.resolve();
+  private allowedOrigins: Set<string> | null = null;
 
   private constructor(
     readonly tabId: number,
@@ -133,6 +134,71 @@ export class CdpSession {
     this.mainFrameId = identity.frameId;
     this.currentUrl = identity.url;
     this.enabled = true;
+  }
+
+  async enableUnattendedContainment(allowedOrigins: readonly string[]): Promise<void> {
+    this.allowedOrigins = new Set(allowedOrigins);
+    await this.send("Fetch.enable", {
+      patterns: [
+        {
+          urlPattern: "*",
+          resourceType: "Document",
+          requestStage: "Request",
+        },
+      ],
+    });
+    await this.send("Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: true,
+      flatten: true,
+      filter: [{ type: "page", exclude: false }],
+    });
+  }
+
+  async handleFetchRequestPaused(params: unknown): Promise<void> {
+    const event = params as {
+      requestId?: unknown;
+      request?: { url?: unknown };
+      frameId?: unknown;
+      resourceType?: unknown;
+    };
+    if (typeof event.requestId !== "string") return;
+    const isMainDocument =
+      event.resourceType === "Document" &&
+      typeof event.frameId === "string" &&
+      event.frameId === this.mainFrameId;
+    const url = event.request?.url;
+    if (
+      isMainDocument &&
+      (typeof url !== "string" || !this.isAllowedTopLevelUrl(url))
+    ) {
+      await this.send("Fetch.failRequest", {
+        requestId: event.requestId,
+        errorReason: "BlockedByClient",
+      });
+      await this.bumpGeneration();
+      return;
+    }
+    await this.send("Fetch.continueRequest", { requestId: event.requestId });
+  }
+
+  async closePausedRelatedTarget(params: unknown): Promise<void> {
+    const event = params as {
+      targetInfo?: { targetId?: unknown; type?: unknown };
+    };
+    const targetId = event.targetInfo?.targetId;
+    if (event.targetInfo?.type !== "page" || typeof targetId !== "string") return;
+    await this.send("Target.closeTarget", { targetId });
+  }
+
+  isAllowedTopLevelUrl(value: string): boolean {
+    if (value === "about:blank") return true;
+    if (this.allowedOrigins === null) return true;
+    try {
+      return this.allowedOrigins.has(new URL(value).origin);
+    } catch {
+      return false;
+    }
   }
 
   async reconcile(): Promise<void> {
@@ -578,6 +644,9 @@ export class CdpSession {
 
   navigate(commandId: string, url: string): Promise<Event> {
     return this.run(commandId, async () => {
+      if (!this.isAllowedTopLevelUrl(url)) {
+        return actionError(commandId, "navigation origin is not allowed for this session");
+      }
       await this.bumpGeneration();
       this.markLoadStarted();
       const res = await this.send<Protocol.Page.NavigateResponse>("Page.navigate", { url });

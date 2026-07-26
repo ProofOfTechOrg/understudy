@@ -2,8 +2,13 @@ import { describe, it, expect } from "vitest";
 import {
   A11yNodeSchema,
   CommandSchema,
+  CommandRequestSchema,
   DialogRecordSchema,
   EventSchema,
+  PROTOCOL_CAPABILITIES,
+  PROTOCOL_VERSION,
+  SessionClientFrameSchema,
+  SessionServerFrameSchema,
   isWriteCommand,
   parseCommand,
   safeParseCommand,
@@ -61,6 +66,90 @@ describe("CommandSchema", () => {
 
   it("rejects resolve_ref missing ref", () => {
     expect(safeParseCommand({ type: "resolve_ref", commandId: "c1" }).success).toBe(false);
+  });
+
+  it("rejects unknown fields instead of silently stripping them", () => {
+    expect(
+      safeParseCommand({ type: "get_tabs", commandId: "c1", unexpected: true }).success,
+    ).toBe(false);
+  });
+
+  it("enforces bounded IDs, refs, text, keys, URLs, and secret references", () => {
+    expect(safeParseCommand({ type: "get_tabs", commandId: "x".repeat(129) }).success).toBe(false);
+    expect(
+      safeParseCommand({ type: "click", commandId: "c", ref: "r".repeat(257) }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({
+        type: "type",
+        commandId: "c",
+        ref: "r",
+        text: "t".repeat(64 * 1024 + 1),
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({ type: "key", commandId: "c", keys: "k".repeat(257) }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({
+        type: "navigate",
+        commandId: "c",
+        url: `https://example.com/${"x".repeat(8 * 1024)}`,
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({
+        type: "fill_secret",
+        commandId: "c",
+        ref: "r",
+        secretRef: "s".repeat(513),
+      }).success,
+    ).toBe(false);
+  });
+
+  it("applies KiB limits to UTF-8 bytes rather than JavaScript code units", () => {
+    expect(
+      safeParseCommand({
+        type: "type",
+        commandId: "c",
+        ref: "r",
+        text: "😀".repeat(16 * 1024 + 1),
+      }).success,
+    ).toBe(false);
+    expect(
+      DialogRecordSchema.safeParse({
+        dialogId: "dialog-1",
+        occurredAt: "2026-07-26T00:00:00.000Z",
+        tabId: 1,
+        dialogType: "alert",
+        message: "😀".repeat(1024 + 1),
+        url: "https://example.com/",
+        disposition: "accept",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires wait.ms and forbids wait values for the other modes", () => {
+    expect(safeParseCommand({ type: "wait", commandId: "c", for: "ms" }).success).toBe(false);
+    expect(
+      safeParseCommand({ type: "wait", commandId: "c", for: "ms", value: 20_001 }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({ type: "wait", commandId: "c", for: "load", value: 1 }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({ type: "wait", commandId: "c", for: "ms", value: 20_000 }).success,
+    ).toBe(true);
+  });
+});
+
+describe("CommandRequestSchema", () => {
+  it("rejects truthy-looking dryRun values and unknown request fields", () => {
+    const command = { type: "click", commandId: "c", ref: "r" };
+    expect(CommandRequestSchema.safeParse({ command, dryRun: "true" }).success).toBe(false);
+    expect(
+      CommandRequestSchema.safeParse({ command, dryRun: false, unexpected: 1 }).success,
+    ).toBe(false);
   });
 });
 
@@ -186,9 +275,39 @@ describe("EventSchema", () => {
     expect(safeParseEvent({ type: "tabs_result", commandId: "c1" }).success).toBe(false);
   });
 
+  it("requires a protocol-v2 hello to expose exactly one owned tab", () => {
+    const hello = {
+      type: "hello",
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: [...PROTOCOL_CAPABILITIES],
+      browser: "Chrome/125",
+      extVersion: "0.1.0",
+      tabs: [
+        { tabId: 1, url: "about:blank", title: "", active: false },
+        { tabId: 2, url: "about:blank", title: "", active: false },
+      ],
+    };
+    expect(EventSchema.safeParse(hello).success).toBe(false);
+  });
+
+  it("keeps a bounded multi-tab protocol-1 hello parseable during rollout", () => {
+    const hello = {
+      type: "hello",
+      browser: "Chrome/124",
+      extVersion: "0.0.3",
+      tabs: [
+        { tabId: 1, url: "https://one.example/", title: "One", active: true },
+        { tabId: 2, url: "https://two.example/", title: "Two", active: false },
+      ],
+    };
+    expect(EventSchema.parse(hello)).toEqual(hello);
+  });
+
   it("round-trips a dialog event with a defaultPrompt", () => {
     const ev = {
       type: "dialog",
+      dialogId: "dialog-1",
+      occurredAt: "2026-07-26T00:00:00.000Z",
       tabId: 7,
       dialogType: "prompt",
       message: "Enter your name",
@@ -202,6 +321,8 @@ describe("EventSchema", () => {
   it("round-trips a dialog event without a defaultPrompt (optional)", () => {
     const ev = {
       type: "dialog",
+      dialogId: "dialog-2",
+      occurredAt: "2026-07-26T00:00:00.000Z",
       tabId: 7,
       dialogType: "beforeunload",
       message: "",
@@ -241,6 +362,8 @@ describe("EventSchema", () => {
 describe("DialogRecordSchema", () => {
   it("is the dialog Event payload minus its `type`, pinned to the event member", () => {
     const record = {
+      dialogId: "dialog-3",
+      occurredAt: "2026-07-26T00:00:00.000Z",
       tabId: 2,
       dialogType: "confirm",
       message: "Sure?",
@@ -266,5 +389,74 @@ describe("A11yNodeSchema", () => {
       children: [{ ref: "2", role: "button", name: "Go" }],
     };
     expect(A11yNodeSchema.parse(tree)).toEqual(tree);
+  });
+});
+
+describe("safe command frames", () => {
+  const deadlineAt = "2026-07-26T00:00:25.000Z";
+
+  it("parses prepare/ready/grant/result with explicit attempts and fences", () => {
+    const prepare = {
+      type: "write_prepare",
+      attemptId: "attempt-1",
+      deadlineAt,
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+      browserEpoch: "browser-1",
+      commandId: "command-1",
+      commandType: "click",
+      requestFingerprint: "a".repeat(64),
+    };
+    expect(SessionServerFrameSchema.parse(prepare)).toEqual(prepare);
+
+    const ready = {
+      type: "write_ready",
+      attemptId: "attempt-1",
+      deadlineAt,
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+      browserEpoch: "browser-1",
+      commandId: "command-1",
+      requestFingerprint: "a".repeat(64),
+    };
+    expect(SessionClientFrameSchema.parse(ready)).toEqual(ready);
+
+    const result = {
+      type: "command_result",
+      attemptId: "attempt-1",
+      commandId: "command-1",
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+      browserEpoch: "browser-1",
+      event: { type: "action_result", commandId: "command-1", ok: true },
+    };
+    expect(SessionClientFrameSchema.parse(result)).toEqual(result);
+  });
+
+  it("rejects a grant carrying a read and a result with a mismatched command ID", () => {
+    expect(
+      SessionServerFrameSchema.safeParse({
+        type: "write_grant",
+        attemptId: "attempt-1",
+        deadlineAt,
+        command: { type: "get_tabs", commandId: "command-1" },
+      }).success,
+    ).toBe(false);
+    expect(
+      SessionClientFrameSchema.safeParse({
+        type: "command_result",
+        attemptId: "attempt-1",
+        commandId: "command-1",
+        event: { type: "action_result", commandId: "different", ok: true },
+      }).success,
+    ).toBe(false);
+    expect(
+      SessionClientFrameSchema.safeParse({
+        type: "command_result",
+        attemptId: "attempt-1",
+        commandId: "command-1",
+        event: { type: "pong" },
+      }).success,
+    ).toBe(false);
   });
 });

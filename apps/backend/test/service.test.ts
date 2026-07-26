@@ -1,8 +1,14 @@
 import { describe, it, expect, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { safeParseCommand, safeParseEvent } from "@understudy/protocol";
-import type { Command } from "@understudy/protocol";
+import {
+  PROTOCOL_CAPABILITIES,
+  PROTOCOL_VERSION,
+  safeParseCommand,
+  safeParseEvent,
+  safeParseSessionServerFrame,
+} from "@understudy/protocol";
+import type { Command, SessionServerFrame } from "@understudy/protocol";
 import type { SessionAgent } from "../src/session";
 import type { SessionStatus } from "../src/types";
 import { encryptSecret } from "../src/vault";
@@ -54,6 +60,24 @@ function postCommand(
   );
 }
 
+function postCommandV2(
+  sessionId: string,
+  token: string,
+  command: unknown,
+  dryRun = false,
+): Promise<Response> {
+  return exports.default.fetch(
+    authedRequest(`/v1/sessions/${sessionId}/commands`, token, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Understudy-Command-Contract": "2",
+      },
+      body: JSON.stringify({ command, dryRun }),
+    }),
+  );
+}
+
 async function openSession(callerToken: string): Promise<string> {
   const res = await exports.default.fetch(
     authedRequest("/v1/sessions", callerToken, { method: "POST" }),
@@ -82,6 +106,48 @@ async function connectFakeExtension(sessionId: string, token = EXTENSION_TOKEN_A
   const socket = getWebSocket(res);
   socket.accept();
   return socket;
+}
+
+async function connectSafeExtension(sessionId: string): Promise<WebSocket> {
+  const socket = await connectFakeExtension(sessionId);
+  socket.send(
+    JSON.stringify({
+      type: "hello",
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: [...PROTOCOL_CAPABILITIES],
+      browser: "Chrome/125",
+      extVersion: "0.1.0",
+      tabs: [
+        {
+          tabId: 7,
+          url: "https://example.com/",
+          title: "Example",
+          active: true,
+        },
+      ],
+    }),
+  );
+  const stub = await getSessionStub(sessionId);
+  expect(await stub.waitForProtocolV2Connection(2_000)).toBe(true);
+  return socket;
+}
+
+function waitForServerFrame<T extends SessionServerFrame["type"]>(
+  socket: WebSocket,
+  type: T,
+): Promise<Extract<SessionServerFrame, { type: T }>> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error(`timed out waiting for ${type}`)),
+      10_000,
+    );
+    socket.addEventListener("message", (event: MessageEvent) => {
+      const parsed = safeParseSessionServerFrame(JSON.parse(event.data as string));
+      if (!parsed.success || parsed.data.type !== type) return;
+      clearTimeout(timeout);
+      resolve(parsed.data as Extract<SessionServerFrame, { type: T }>);
+    });
+  });
 }
 
 /**
@@ -298,6 +364,44 @@ describe("command parsing", () => {
       socket.close(1000, "done");
     }
   });
+
+  it.each([
+    {
+      label: "truthy-looking dryRun",
+      body: {
+        command: { type: "click", commandId: "strict-dry-run", ref: "r1" },
+        dryRun: "true",
+      },
+    },
+    {
+      label: "unknown request field",
+      body: {
+        command: { type: "get_tabs", commandId: "strict-extra" },
+        dryRun: false,
+        unexpected: true,
+      },
+    },
+  ])("rejects $label with zero WebSocket traffic", async ({ body }) => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const received = collectCommands(socket);
+    try {
+      const response = await exports.default.fetch(
+        authedRequest(`/v1/sessions/${sessionId}/commands`, CALLER_TOKEN_A, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "invalid command" });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
 });
 
 describe("command round-trip via a live extension WebSocket", () => {
@@ -346,6 +450,311 @@ describe("command round-trip via a live extension WebSocket", () => {
   });
 });
 
+describe("command contract v2", () => {
+  it("durably prepares and grants a write before accepting its result", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    try {
+      const preparePromise = waitForServerFrame(socket, "write_prepare");
+      const responsePromise = postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "v2-write",
+        ref: "owned-ref",
+      });
+      const prepare = await preparePromise;
+      const grantPromise = waitForServerFrame(socket, "write_grant");
+      socket.send(
+        JSON.stringify({
+          type: "write_ready",
+          attemptId: prepare.attemptId,
+          commandId: prepare.commandId,
+          deadlineAt: prepare.deadlineAt,
+          requestFingerprint: prepare.requestFingerprint,
+        }),
+      );
+      const grant = await grantPromise;
+      expect(grant.command).toEqual({
+        type: "click",
+        commandId: "v2-write",
+        ref: "owned-ref",
+      });
+      socket.send(
+        JSON.stringify({
+          type: "command_result",
+          attemptId: grant.attemptId,
+          commandId: "v2-write",
+          event: {
+            type: "action_result",
+            commandId: "v2-write",
+            ok: true,
+          },
+        }),
+      );
+
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        type: "action_result",
+        commandId: "v2-write",
+        ok: true,
+      });
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("conflicts a reused command ID with a changed request fingerprint", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    try {
+      const preparePromise = waitForServerFrame(socket, "write_prepare");
+      const firstResponse = postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "v2-conflict",
+        ref: "first-ref",
+      });
+      const prepare = await preparePromise;
+      const grantPromise = waitForServerFrame(socket, "write_grant");
+      socket.send(
+        JSON.stringify({
+          type: "write_ready",
+          attemptId: prepare.attemptId,
+          commandId: prepare.commandId,
+          deadlineAt: prepare.deadlineAt,
+          requestFingerprint: prepare.requestFingerprint,
+        }),
+      );
+      const grant = await grantPromise;
+      socket.send(
+        JSON.stringify({
+          type: "command_result",
+          attemptId: grant.attemptId,
+          commandId: "v2-conflict",
+          event: {
+            type: "action_result",
+            commandId: "v2-conflict",
+            ok: true,
+          },
+        }),
+      );
+      expect((await firstResponse).status).toBe(200);
+
+      const conflict = await postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "v2-conflict",
+        ref: "changed-ref",
+      });
+      expect(conflict.status).toBe(409);
+      expect(await conflict.json()).toEqual({
+        code: "command_id_conflict",
+        commandId: "v2-conflict",
+      });
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("returns session_busy for a distinct command while one attempt owns the slot", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    try {
+      const preparePromise = waitForServerFrame(socket, "write_prepare");
+      const firstResponse = postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "v2-busy-a",
+        ref: "first-ref",
+      });
+      const prepare = await preparePromise;
+
+      const busy = await postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "key",
+        commandId: "v2-busy-b",
+        keys: "Escape",
+      });
+      expect(busy.status).toBe(429);
+      expect(await busy.json()).toEqual({
+        code: "session_busy",
+        commandId: "v2-busy-b",
+      });
+
+      const grantPromise = waitForServerFrame(socket, "write_grant");
+      socket.send(
+        JSON.stringify({
+          type: "write_ready",
+          attemptId: prepare.attemptId,
+          commandId: prepare.commandId,
+          deadlineAt: prepare.deadlineAt,
+          requestFingerprint: prepare.requestFingerprint,
+        }),
+      );
+      const grant = await grantPromise;
+      socket.send(
+        JSON.stringify({
+          type: "command_result",
+          attemptId: grant.attemptId,
+          commandId: "v2-busy-a",
+          event: {
+            type: "action_result",
+            commandId: "v2-busy-a",
+            ok: true,
+          },
+        }),
+      );
+      expect((await firstResponse).status).toBe(200);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("never returns 202 to a legacy connector after the extension selects protocol v2", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    try {
+      const preparePromise = waitForServerFrame(socket, "write_prepare");
+      const legacyResponse = postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "legacy-on-v2",
+        ref: "owned-ref",
+      });
+      const prepare = await preparePromise;
+      const grantPromise = waitForServerFrame(socket, "write_grant");
+      socket.send(
+        JSON.stringify({
+          type: "write_ready",
+          attemptId: prepare.attemptId,
+          commandId: prepare.commandId,
+          deadlineAt: prepare.deadlineAt,
+          requestFingerprint: prepare.requestFingerprint,
+        }),
+      );
+      const grant = await grantPromise;
+      socket.send(
+        JSON.stringify({
+          type: "command_result",
+          attemptId: grant.attemptId,
+          commandId: "legacy-on-v2",
+          event: {
+            type: "action_result",
+            commandId: "legacy-on-v2",
+            ok: true,
+          },
+        }),
+      );
+      const response = await legacyResponse;
+      expect(response.status).toBe(200);
+      expect(response.status).not.toBe(202);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it(
+    "atomically wins the prepare timeout and never grants a late-ready write",
+    async () => {
+      const sessionId = await openSession(CALLER_TOKEN_A);
+      const socket = await connectSafeExtension(sessionId);
+      const frames: SessionServerFrame[] = [];
+      socket.addEventListener("message", (event: MessageEvent) => {
+        const parsed = safeParseSessionServerFrame(JSON.parse(event.data as string));
+        if (parsed.success) frames.push(parsed.data);
+      });
+      try {
+        const preparePromise = waitForServerFrame(socket, "write_prepare");
+        const responsePromise = postCommandV2(sessionId, CALLER_TOKEN_A, {
+          type: "click",
+          commandId: "v2-safe-timeout",
+          ref: "owned-ref",
+        });
+        const prepare = await preparePromise;
+        const response = await responsePromise;
+        expect(response.status).toBe(504);
+        expect(await response.json()).toEqual({
+          code: "command_not_started",
+          commandId: "v2-safe-timeout",
+          safeToRetry: true,
+        });
+
+        socket.send(
+          JSON.stringify({
+            type: "write_ready",
+            attemptId: prepare.attemptId,
+            commandId: prepare.commandId,
+            deadlineAt: prepare.deadlineAt,
+            requestFingerprint: prepare.requestFingerprint,
+          }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(frames.some((frame) => frame.type === "write_grant")).toBe(false);
+      } finally {
+        socket.close(1000, "done");
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "converges simultaneous safe retries of one logical command onto one new attempt",
+    async () => {
+      const sessionId = await openSession(CALLER_TOKEN_A);
+      const socket = await connectSafeExtension(sessionId);
+      try {
+        const firstPrepare = waitForServerFrame(socket, "write_prepare");
+        const firstResponse = postCommandV2(sessionId, CALLER_TOKEN_A, {
+          type: "click",
+          commandId: "v2-retry-race",
+          ref: "owned-ref",
+        });
+        await firstPrepare;
+        expect((await firstResponse).status).toBe(504);
+
+        const retryPrepare = waitForServerFrame(socket, "write_prepare");
+        const retries = [
+          postCommandV2(sessionId, CALLER_TOKEN_A, {
+            type: "click",
+            commandId: "v2-retry-race",
+            ref: "owned-ref",
+          }),
+          postCommandV2(sessionId, CALLER_TOKEN_A, {
+            type: "click",
+            commandId: "v2-retry-race",
+            ref: "owned-ref",
+          }),
+        ];
+        const prepare = await retryPrepare;
+        const grantPromise = waitForServerFrame(socket, "write_grant");
+        socket.send(
+          JSON.stringify({
+            type: "write_ready",
+            attemptId: prepare.attemptId,
+            commandId: prepare.commandId,
+            deadlineAt: prepare.deadlineAt,
+            requestFingerprint: prepare.requestFingerprint,
+          }),
+        );
+        const grant = await grantPromise;
+        socket.send(
+          JSON.stringify({
+            type: "command_result",
+            attemptId: grant.attemptId,
+            commandId: "v2-retry-race",
+            event: {
+              type: "action_result",
+              commandId: "v2-retry-race",
+              ok: true,
+            },
+          }),
+        );
+
+        const responses = await Promise.all(retries);
+        expect(responses.map((response) => response.status).sort()).toEqual([200, 202]);
+      } finally {
+        socket.close(1000, "done");
+      }
+    },
+    15_000,
+  );
+});
+
 describe("fill_secret", () => {
   it("resolves the vault secret and types it via the extension without leaking the plaintext", async () => {
     // #given a seeded vault secret and a connected fake extension
@@ -355,7 +764,7 @@ describe("fill_secret", () => {
 
     // Captures every raw WS frame (Command AND Agents-SDK framework
     // messages alike) so the no-leak check below can assert the plaintext
-    // appears on the wire exactly once - the one hop where it must travel.
+    // appears on the single wire hop where it must travel.
     const rawFrames: string[] = [];
     socket.addEventListener("message", (event: MessageEvent) => {
       rawFrames.push(event.data as string);
@@ -1008,12 +1417,12 @@ describe("error taxonomy (route mapping)", () => {
         expect(res.status).toBe(504);
         expect(await res.json()).toEqual({ error: "command timed out" });
 
-        // #then the awaiting marker was cleared by the REAL DO-level timeout
-        // (the fake-timer coordinator test covers this deterministically;
-        // this re-asserts it through the integrated path, post-settlement)
+        // #then the durable marker still fences the session. Dropping it
+        // here would admit another command while this command remains queued
+        // in the extension and could execute later.
         const stub = await getSessionStub(sessionId);
         await runInDurableObject(stub, (instance: SessionAgent) => {
-          expect(instance.state.awaitingCommandIds).toEqual([]);
+          expect(instance.state.awaitingCommandIds).toEqual(["c-silent"]);
         });
       } finally {
         socket.close(1000, "done");
@@ -1123,7 +1532,7 @@ describe("idempotent write replay (stable commandId contract)", () => {
       });
 
       // #then the recorded Event is replayed byte-for-byte and the extension
-      // never saw a second click - the write executed exactly once
+      // never saw a second click: the write executed at most once
       expect(retryRes.status).toBe(200);
       expect(await retryRes.json()).toEqual(first);
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1296,7 +1705,7 @@ describe("idempotent write replay (stable commandId contract)", () => {
 
       // #when the same read commandId is posted again
       // #then it round-trips to the extension again - reads are free to
-      // re-execute; only writes carry the exactly-once contract
+      // re-execute; only writes carry the at-most-once contract
       expect((await roundTripGetTabs(socket, sessionId, "read-1")).status).toBe(200);
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(received.filter((cmd) => cmd.type === "get_tabs")).toHaveLength(2);
@@ -1625,6 +2034,8 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
       socket.send(
         JSON.stringify({
           type: "dialog",
+          dialogId: "dialog-confirm-1",
+          occurredAt: "2026-07-26T00:00:00.000Z",
           tabId: 3,
           dialogType: "confirm",
           message: "Delete this item?",
@@ -1641,6 +2052,8 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
       const status = (await res.json()) as { dialogs: unknown[] };
       expect(status.dialogs).toEqual([
         {
+          dialogId: "dialog-confirm-1",
+          occurredAt: "2026-07-26T00:00:00.000Z",
           tabId: 3,
           dialogType: "confirm",
           message: "Delete this item?",
@@ -1663,6 +2076,8 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
       socket.send(
         JSON.stringify({
           type: "dialog",
+          dialogId: "dialog-alert-1",
+          occurredAt: "2026-07-26T00:00:00.000Z",
           tabId: 1,
           dialogType: "alert",
           message: "Saved",
@@ -1673,6 +2088,8 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
       socket.send(
         JSON.stringify({
           type: "dialog",
+          dialogId: "dialog-prompt-1",
+          occurredAt: "2026-07-26T00:00:01.000Z",
           tabId: 1,
           dialogType: "prompt",
           message: "Name?",

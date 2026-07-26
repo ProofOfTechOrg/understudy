@@ -518,6 +518,8 @@ describe("dialog recording (onMessage → SessionState.dialogs)", () => {
   function dialogEvent(message: string): string {
     return JSON.stringify({
       type: "dialog",
+      dialogId: `dialog-${message}`,
+      occurredAt: "2026-07-26T00:00:00.000Z",
       tabId: 1,
       dialogType: "alert",
       message,

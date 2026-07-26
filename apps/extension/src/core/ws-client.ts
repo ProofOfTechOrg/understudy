@@ -1,10 +1,9 @@
-import type { Event } from "@understudy/protocol";
-
 interface WsHandlers {
   onCommand: (cmd: unknown) => void;
   onOpen: () => void;
   onClose?: () => void;
   onConnecting?: () => void;
+  heartbeatFrame?: () => unknown | null;
 }
 
 const BACKOFF_BASE_MS = 500;
@@ -26,21 +25,26 @@ export class ReconnectingWs {
   constructor(
     private readonly getUrl: () => string,
     private readonly handlers: WsHandlers,
+    private readonly maxInboundBytes = 16 * 1024 * 1024,
   ) {
     this.connect();
   }
 
-  send(ev: Event): void {
+  send(frame: unknown): void {
     const socket = this.socket;
     if (socket !== null && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify(ev));
+      socket.send(JSON.stringify(frame));
     }
   }
 
   startHeartbeat(): void {
     this.clearHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      this.send({ type: "pong" });
+      const frame =
+        this.handlers.heartbeatFrame === undefined
+          ? { type: "pong" }
+          : this.handlers.heartbeatFrame();
+      if (frame !== null) this.send(frame);
     }, HEARTBEAT_MS);
   }
 
@@ -78,9 +82,14 @@ export class ReconnectingWs {
     });
 
     socket.addEventListener("message", (ev) => {
+      const text = typeof ev.data === "string" ? ev.data : String(ev.data);
+      if (new TextEncoder().encode(text).byteLength > this.maxInboundBytes) {
+        socket.close(1009, "frame too large");
+        return;
+      }
       let parsed: unknown;
       try {
-        parsed = JSON.parse(typeof ev.data === "string" ? ev.data : String(ev.data));
+        parsed = JSON.parse(text) as unknown;
       } catch {
         return;
       }

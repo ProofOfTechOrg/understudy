@@ -1,15 +1,15 @@
 :root {
-  color-scheme: light;
-  --color-bg: #ffffff;
-  --color-text: #1a1a1a;
-  --color-muted: #6b7280;
-  --color-border: #e5e7eb;
-  --color-amber-bg: #fef3c7;
-  --color-amber-text: #92400e;
-  --color-green-bg: #d1fae5;
-  --color-green-text: #065f46;
-  --color-red-bg: #fee2e2;
-  --color-red-text: #991b1b;
+  color-scheme: dark;
+  --ink: #f2f0e8;
+  --muted: #96978f;
+  --paper: #101210;
+  --panel: #171a17;
+  --line: #343a33;
+  --acid: #c9f64c;
+  --acid-ink: #172000;
+  --amber: #efb24e;
+  --red: #ff6b5f;
+  --blue: #75baff;
 }
 
 * {
@@ -18,174 +18,355 @@
 
 body {
   margin: 0;
-  padding: 12px;
-  background: var(--color-bg);
-  color: var(--color-text);
-  font-family:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  font-size: 13px;
+  min-width: 280px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
 }
 
 .panel {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
+  padding: 16px 12px 24px;
 }
 
-.panel-header {
+.masthead,
+.section-heading,
+.form-actions,
+.capacity-strip {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
 }
 
-.panel-header h1 {
+.masthead {
+  padding: 2px 2px 8px;
+  border-bottom: 3px solid var(--ink);
+}
+
+.eyebrow,
+.section-index,
+.capacity-strip p,
+.privacy-note,
+.tab-detail,
+.warning {
   margin: 0;
-  font-size: 15px;
 }
 
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
+.eyebrow,
+.section-index {
+  color: var(--acid);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+h1,
+h2 {
+  margin: 0;
+  line-height: 1;
+}
+
+h1 {
+  margin-top: 5px;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 29px;
+  font-weight: 400;
+  letter-spacing: -0.04em;
+}
+
+h2 {
+  margin-top: 5px;
+  font-size: 12px;
   letter-spacing: 0.03em;
   text-transform: uppercase;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 3px 7px;
+  border: 1px solid currentColor;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.status-connected,
+.status-open {
+  color: var(--acid);
 }
 
 .status-connecting {
-  background: var(--color-amber-bg);
-  color: var(--color-amber-text);
+  color: var(--amber);
 }
 
-.status-open {
-  background: var(--color-green-bg);
-  color: var(--color-green-text);
-}
-
+.status-error,
 .status-closed {
-  background: var(--color-red-bg);
-  color: var(--color-red-text);
+  color: var(--red);
 }
 
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+.capacity-strip {
+  position: relative;
+  padding: 11px 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--ink);
+  color: #11130f;
 }
 
-.field label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--color-muted);
-  letter-spacing: 0.03em;
+.metric {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 31px;
+}
+
+.metric-total {
+  color: #5b5f56;
+}
+
+.capacity-strip p {
+  flex: 1;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 
-.field input {
-  padding: 6px 8px;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
-  color: var(--color-text);
+.signal {
+  width: 10px;
+  height: 10px;
+  background: #8c9086;
+  box-shadow: 0 0 0 4px rgb(17 19 15 / 8%);
 }
 
-.field input:focus {
-  outline: 2px solid #3b82f6;
-  outline-offset: -1px;
+.signal-connected {
+  background: #83ae00;
 }
 
-.attach {
+.signal-connecting {
+  background: #d48a10;
+}
+
+.signal-error {
+  background: #dc382b;
+}
+
+.card,
+.logbook {
+  border: 1px solid var(--line);
+  background: rgb(23 26 23 / 96%);
+}
+
+.card {
+  padding: 13px;
+}
+
+.section-heading {
+  margin-bottom: 14px;
+}
+
+.enrollment-form,
+.stacked-field,
+.attached-block {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 9px;
 }
 
-.attach button {
-  align-self: flex-start;
-  padding: 6px 14px;
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  background: #f9fafb;
-  color: var(--color-text);
-  font-size: 13px;
-  font-weight: 600;
+.enrollment-form > label,
+.stacked-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+label > span {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  outline: none;
+  background: #0d0f0d;
+  color: var(--ink);
+}
+
+input {
+  min-height: 34px;
+  padding: 7px 8px;
+}
+
+textarea {
+  min-height: 74px;
+  padding: 8px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+input:focus,
+textarea:focus {
+  border-color: var(--acid);
+  box-shadow: inset 3px 0 0 var(--acid);
+}
+
+::placeholder {
+  color: #62675f;
+}
+
+.form-actions {
+  align-items: flex-end;
+  margin-top: 2px;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 150px;
+}
+
+.toggle input {
+  width: 15px;
+  min-height: 15px;
+  margin: 0;
+  accent-color: var(--acid);
+}
+
+.toggle span {
+  color: var(--ink);
+  line-height: 1.35;
+}
+
+.button {
+  min-height: 31px;
+  padding: 6px 9px;
+  border: 1px solid;
+  border-radius: 0;
   cursor: pointer;
-}
-
-.attach button:hover {
-  background: #f3f4f6;
-}
-
-.attach-banner {
-  margin: 0;
-  padding: 8px 10px;
-  background: var(--color-amber-bg);
-  color: var(--color-amber-text);
-  border-radius: 6px;
-  font-size: 12px;
-  line-height: 1.4;
-}
-
-.attach-info {
-  margin: 0;
-  overflow-wrap: anywhere;
-  font-size: 12px;
-  color: var(--color-muted);
-}
-
-.log {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-height: 0;
-}
-
-.log h2 {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--color-muted);
-  letter-spacing: 0.03em;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.button:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 2px 2px 0 currentColor;
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.button:active {
+  transform: none;
+  box-shadow: none;
+}
+
+.button-primary {
+  border-color: var(--acid);
+  background: var(--acid);
+  color: var(--acid-ink);
+}
+
+.button-secondary {
+  align-self: flex-start;
+  border-color: var(--ink);
+  background: transparent;
+  color: var(--ink);
+}
+
+.button-danger {
+  border-color: var(--red);
+  background: transparent;
+  color: var(--red);
+}
+
+.privacy-note,
+.warning,
+.tab-detail {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.warning {
+  padding-left: 8px;
+  border-left: 2px solid var(--amber);
+  color: var(--amber);
+}
+
+.logbook .section-heading {
+  padding: 12px 13px 0;
+}
+
+.log-count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
 
 .log-list {
-  max-height: 320px;
+  max-height: 260px;
   margin: 0;
-  padding: 8px;
+  padding: 8px 12px 12px;
   overflow-y: auto;
   list-style: none;
-  background: #0b1021;
-  border-radius: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11.5px;
-  line-height: 1.6;
-  color: #d1d5db;
+  counter-reset: events;
 }
 
 .log-list li {
-  display: flex;
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
   gap: 8px;
-  white-space: pre-wrap;
-  word-break: break-word;
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
-.log-time {
-  flex: none;
-  color: #6b7280;
+.log-list time {
+  color: #73776f;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
 }
 
-.log-message {
-  flex: 1;
+.log-empty {
+  color: var(--muted);
 }
 
-.log-warn .log-message {
-  color: #fbbf24;
+.log-warn span {
+  color: var(--amber);
 }
 
-.log-error .log-message {
-  color: #f87171;
+.log-error span {
+  color: var(--red);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button:hover {
+    transform: none;
+  }
 }

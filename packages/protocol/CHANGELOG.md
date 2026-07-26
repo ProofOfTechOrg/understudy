@@ -1,5 +1,13 @@
 # @understudy/protocol
 
+## 0.7.0
+
+### Minor Changes
+
+- Add protocol 2 capabilities and bounded strict schemas for HTTP command requests, session frames, device-control frames, device status, unattended session status, durable command polling, and pending command responses.
+- Add the prepare, ready, grant, result, and acknowledgement frames required for at-most-once write execution with explicit pending and unknown outcomes.
+- Add `dialogId`, `occurredAt`, dialog acknowledgements, single-owned-tab limits, and bounded accessibility, URL, text, key, ref, identifier, browser, and payload fields.
+
 ## 0.6.0
 
 ### Minor Changes

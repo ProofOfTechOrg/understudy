@@ -1,64 +1,77 @@
-# understudy
+<!-- Content type: Landing -->
 
-A governed **browser-execution service** that puppets a user's *already-logged-in* browser
-via a Chromium extension. The Cloudflare-hosted service holds the live sessions and exposes
-`POST /v1/sessions/:sessionId/commands`; the extension executes each command in the user's
-real tab via CDP and reports back. understudy runs **no LLM** — the agent brain and all
-governance (approvals, RBAC, audit via breakwater/flowsafe) live in the consumer apps that
-drive it over HTTP (Topology 1).
+# Run governed browser commands in user-controlled Chromium
 
-**Full design + build plan: [`docs/technical-plan.md`](docs/technical-plan.md).** Read it first.
+Understudy is a model-free browser-execution service. A Cloudflare Worker coordinates attended and unattended sessions while an installed Manifest V3 extension executes commands through the Chrome DevTools Protocol (CDP). Consumer applications own model execution, approvals, role-based access control, policies, and durable audit through breakwater and flowsafe.
 
-## Repository layout
+Read [`docs/technical-plan.md`](docs/technical-plan.md) for the architecture, safety contract, limits, and rollout gates.
 
-- **`packages/protocol`** — the shared command/event protocol (TypeScript + zod 4, published
-  `@understudy/protocol`). The stable contract between the service, the extension, and
-  consumer connectors; the core IP.
-- **`packages/connector`** — **M4** the reference `@proofoftech/breakwater` connectors
-  (`@understudy/connector`): `observe` / `act` / `fill_credential`, approval-gated via
-  flowsafe grants, egress-pinned to the service host. What consumer apps import to turn
-  browser actions into governed Mastra tools. See its README.
-- **`apps/cdp-spike`** — **M0** throwaway harness: a buildless MV3 extension that verifies the
-  `chrome.debugger` CDP command surface (the plan's one gating technical risk). See its README.
-- **`apps/extension`** — **M2** the real extension: a WXT + React MV3 extension that puppets a
-  logged-in Chromium tab over a WebSocket. See its README.
-- **`apps/backend`** — **M3** the browser-execution service: a Cloudflare Worker (Hono) plus one
-  Agents-SDK Durable Object per session, terminating the extension's WebSocket and exposing
-  `POST /v1/sessions/:id/commands` for consumer apps (metamind, smart-compliance) to drive. Runs
-  no LLM and embeds no agent framework — the brain and governance (breakwater/flowsafe) live in
-  the consumers. See its README.
+## Explore the repository
 
-M4 is complete. `@understudy/protocol@0.6.0` and
-`@understudy/connector@0.4.0` are published on npm. On 2026-07-25 UTC
-(2026-07-26 Asia/Dubai), Metamind completed the production cross-repository
-proof against Understudy
-`master@797d0e4` and Metamind `master@0814deb`: a connected Chromium extension
-executed public-page observation, an approved login using a vaulted credential,
-and authenticated-page observation with correlated flowsafe audit evidence. The
-labeled proof batch remains in `draft`; no email or Gmail draft was created. The
-agent loop and governance stay in the consumer, per Topology 1.
+| Path | Purpose |
+|---|---|
+| `packages/protocol` | Published Zod 4 command, event, control-frame, and status contracts |
+| `packages/connector` | Published breakwater connectors for observe, act, and vaulted credential fill |
+| `apps/backend` | Hono Worker, session and device Agents, tenant coordinator, quotas, and telemetry |
+| `apps/extension` | WXT and React extension with attended and two-tab unattended hosting |
+| `apps/cdp-spike` | Historical Manifest V3 CDP capability harness |
 
-## Develop
+`@understudy/protocol@0.7.0` and `@understudy/connector@0.5.0` are prepared in this repository. A local build does not publish them.
 
-```sh
+## Understand the isolation boundary
+
+An unattended device is one tenant-dedicated Chrome profile with capacity for two extension-owned tabs. Those tabs have separate command, CDP, ref, and lifecycle state, but share cookies and browser storage.
+
+Understudy never:
+
+- Uses a Cloudflare-managed browser
+- Automatically attaches an existing tab for unattended work
+- Restores old URLs or tasks after restart
+- Replays a granted write with an unproven result
+- Records video, GIF, Document Object Model history, or session content
+- Replaces consumer approval or durable audit
+
+Protocol 2 provides at-most-once write execution with explicit pending and unknown outcomes.
+
+## Develop the repository
+
+Requirements:
+
+- Node 22 or newer
+- pnpm 11.5.2
+- Chrome 125 or newer for production extension verification
+
+Run:
+
+```bash
 pnpm install
-pnpm build       # first on a fresh clone: @understudy/* resolve via gitignored dist/
+pnpm build
 pnpm typecheck
 pnpm test
 ```
 
-Requires Node ≥22 and pnpm ≥10.16 (see `package.json`). Dependencies are quarantined for
-7 days via `minimumReleaseAge` in `pnpm-workspace.yaml` (supply-chain guard against
-freshly-published malicious versions; first-party `@proofoftech/*` packages are exempt).
+Dependencies use a 7-day minimum release age through `pnpm-workspace.yaml`. First-party `@proofoftech/*` packages are exempt.
 
-## Release (npm)
+For the production extension:
 
-Changesets and GitHub Actions manage releases from `master`; see
-`.changeset/README.md`. A pull request that changes a published package adds a
-changeset with `pnpm changeset`. The release workflow opens or updates the
-“Version Packages” pull request, then publishes the approved versions with npm
-provenance. The repository secret `NPM_TOKEN` needs publish access to the
-`@understudy` scope.
+```bash
+pnpm --filter @understudy/extension build
+```
 
-The M0 harness needs no build — load `apps/cdp-spike` unpacked in a Chromium browser
-(`apps/cdp-spike/README.md`).
+Load `apps/extension/.output/chrome-mv3/` through `chrome://extensions`. Follow the [real-Chromium acceptance runbook](apps/extension/RUNBOOK.md).
+
+## Release published packages
+
+Changesets and GitHub Actions manage releases from `master`. A pull request that changes a published package adds a changeset with:
+
+```bash
+pnpm changeset
+```
+
+The release workflow opens or updates the **Version Packages** pull request. Merging that pull request publishes approved versions with npm provenance. `NPM_TOKEN` needs publish access to the `@understudy` scope.
+
+Backend deployment remains a separate Wrangler operation. Keep `UNATTENDED_ENABLED_TENANTS=[]` until the canary extension passes the production acceptance suite.
+
+## Preserve attended proof history
+
+The completed attended design and production proof remain in Git at Understudy `master@797d0e489df2772d0f5d597141982547861881bb` and Metamind `master@0814deb`. Attended mode remains compatible in the current extension and API.

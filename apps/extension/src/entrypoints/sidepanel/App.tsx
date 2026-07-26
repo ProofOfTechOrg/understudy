@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import type { ReactElement } from "react";
+import type { FormEvent, ReactElement } from "react";
 import type { Browser } from "wxt/browser";
 import type { AttachedTab, LogEntry, PanelMsg, SwMsg } from "../../messaging";
 
 const DEFAULT_WS_URL = "ws://localhost:8787";
-const WS_URL_STORAGE_KEY = "local:wsUrl";
+const WS_URL_STORAGE_KEY = "session:wsUrl";
 const RECONNECT_DELAY_MS = 500;
 
 type StateSnapshot = Extract<SwMsg, { type: "state" }>;
@@ -22,29 +22,21 @@ export function App(): ReactElement {
     }
   };
 
-  // Seed the wsUrl field from persisted storage so it has a sensible value
-  // before the first streamed `state` message arrives; state.wsUrl is the
-  // single source of truth once it does.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const stored = await storage.getItem<string>(WS_URL_STORAGE_KEY, {
-          fallback: DEFAULT_WS_URL,
-        });
+    void storage
+      .getItem<string>(WS_URL_STORAGE_KEY, { fallback: DEFAULT_WS_URL })
+      .then((stored) => {
         if (!cancelled) setSeedWsUrl(stored);
-      } catch (cause) {
+      })
+      .catch((cause: unknown) => {
         console.warn("understudy: failed to read stored wsUrl", cause);
-      }
-    })();
+      });
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Port connection lifecycle (DL-008): connect on mount; on an
-  // eviction-driven disconnect, reconnect (which wakes the SW) and
-  // re-request state, without a manual reload.
   useEffect(() => {
     let disposed = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -58,8 +50,10 @@ export function App(): ReactElement {
         if (msg.type === "state") {
           setSwState(msg);
         } else {
-          setSwState((prev) =>
-            prev === null ? prev : { ...prev, logs: [...prev.logs, msg.entry] },
+          setSwState((previous) =>
+            previous === null
+              ? previous
+              : { ...previous, logs: [...previous.logs, msg.entry] },
           );
         }
       });
@@ -68,11 +62,10 @@ export function App(): ReactElement {
         if (disposed) return;
         reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
       });
-      send({ type: "getState" });
+      port.postMessage({ type: "getState" } satisfies PanelMsg);
     };
 
     connect();
-
     return () => {
       disposed = true;
       clearTimeout(reconnectTimer);
@@ -81,10 +74,14 @@ export function App(): ReactElement {
     };
   }, []);
 
-  const wsStatus: StateSnapshot["wsStatus"] = swState?.wsStatus ?? "connecting";
-  const wsUrl: string = swState?.wsUrl ?? seedWsUrl;
-  const attached: AttachedTab | null = swState?.attached ?? null;
-  const logs: LogEntry[] = swState?.logs ?? [];
+  const wsStatus = swState?.wsStatus ?? "connecting";
+  const wsUrl = swState?.wsUrl ?? seedWsUrl;
+  const attached = swState?.attached ?? null;
+  const profileStatus = swState?.profileStatus ?? "disabled";
+  const controlledTabs = swState?.controlledTabs ?? 0;
+  const profileConfig = swState?.profileConfig ?? null;
+  const logs = swState?.logs ?? [];
+  const formKey = JSON.stringify(profileConfig);
 
   const commitWsUrl = (rawUrl: string): void => {
     const trimmed = rawUrl.trim();
@@ -92,67 +89,209 @@ export function App(): ReactElement {
     send({ type: "setWsUrl", url: trimmed });
   };
 
+  const configureProfile = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const originPolicy = String(data.get("originPolicy") ?? "")
+      .split(/\r?\n/)
+      .map((origin) => origin.trim())
+      .filter((origin) => origin.length > 0);
+    send({
+      type: "configureProfile",
+      serviceOrigin: String(data.get("serviceOrigin") ?? "").trim(),
+      deviceId: String(data.get("deviceId") ?? "").trim(),
+      deviceCredential: String(data.get("deviceCredential") ?? ""),
+      originPolicy,
+      enabled: data.get("enabled") === "on",
+    });
+    const credential = event.currentTarget.elements.namedItem("deviceCredential");
+    if (credential instanceof HTMLInputElement) credential.value = "";
+  };
+
   return (
-    <div className="panel">
-      <header className="panel-header">
-        <h1>understudy</h1>
-        <span className={`status-pill status-${wsStatus}`}>{wsStatus}</span>
+    <main className="panel">
+      <header className="masthead">
+        <div>
+          <p className="eyebrow">Browser control plane</p>
+          <h1>Understudy</h1>
+        </div>
+        <span className={`status status-${profileStatus}`} aria-live="polite">
+          {profileStatus}
+        </span>
       </header>
 
-      <section className="field">
-        <label htmlFor="ws-url">WebSocket URL</label>
-        <input
-          id="ws-url"
-          key={wsUrl}
-          type="text"
-          defaultValue={wsUrl}
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          onBlur={(event) => commitWsUrl(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") event.currentTarget.blur();
-          }}
-        />
+      <section className="capacity-strip" aria-label="Unattended host capacity">
+        <div>
+          <span className="metric">{controlledTabs}</span>
+          <span className="metric-total"> / 2</span>
+        </div>
+        <p>controlled tabs</p>
+        <span className={`signal signal-${profileStatus}`} aria-hidden="true" />
       </section>
 
-      <section className="attach">
-        {attached === null ? (
-          <button type="button" onClick={() => send({ type: "attach" })}>
-            Attach
+      <section className="card">
+        <div className="section-heading">
+          <div>
+            <p className="section-index">01</p>
+            <h2>Dedicated profile host</h2>
+          </div>
+          <button className="button button-danger" type="button" onClick={() => send({ type: "stopAll" })}>
+            Stop all
           </button>
-        ) : (
-          <>
-            <button type="button" onClick={() => send({ type: "detach" })}>
-              Detach
+        </div>
+
+        <form className="enrollment-form" key={formKey} onSubmit={configureProfile}>
+          <label>
+            <span>Service origin</span>
+            <input
+              name="serviceOrigin"
+              type="url"
+              required
+              defaultValue={profileConfig?.serviceOrigin ?? ""}
+              placeholder="https://understudy.example.com"
+              spellCheck={false}
+              autoCapitalize="off"
+            />
+          </label>
+          <label>
+            <span>Device ID</span>
+            <input
+              name="deviceId"
+              type="text"
+              required
+              defaultValue={profileConfig?.deviceId ?? ""}
+              placeholder="00000000-0000-4000-8000-000000000000"
+              spellCheck={false}
+              autoCapitalize="off"
+            />
+          </label>
+          <label>
+            <span>Device credential</span>
+            <input
+              name="deviceCredential"
+              type="password"
+              required
+              placeholder="Required on every save; never read back"
+              autoComplete="off"
+            />
+          </label>
+          <label>
+            <span>Local origin policy</span>
+            <textarea
+              name="originPolicy"
+              required
+              rows={4}
+              defaultValue={profileConfig?.originPolicy.join("\n") ?? ""}
+              placeholder={"https://portal.example.com\nhttps://admin.example.com"}
+              spellCheck={false}
+              autoCapitalize="off"
+            />
+          </label>
+          <div className="form-actions">
+            <label className="toggle">
+              <input
+                name="enabled"
+                type="checkbox"
+                defaultChecked={profileConfig?.unattendedEnabled ?? false}
+              />
+              <span>Enable unattended hosting</span>
+            </label>
+            <button className="button button-primary" type="submit">
+              Save enrollment
             </button>
-            <p className="attach-banner">
-              This tab is being controlled by understudy — the yellow "being debugged" banner is
-              expected.
-            </p>
-            <p className="attach-info">
-              {attached.title ?? "Untitled tab"}
-              {attached.url ? ` — ${attached.url}` : ""}
-            </p>
-          </>
-        )}
+          </div>
+        </form>
+        <p className="privacy-note">
+          Credential input is write-only. Execution state stays in browser session storage and clears on restart.
+        </p>
       </section>
 
-      <section className="log">
-        <h2>Log</h2>
-        <ul className="log-list">
-          {logs.map((entry, index) => (
-            <li key={index} className={entry.level ? `log-${entry.level}` : undefined}>
-              <span className="log-time">{formatTimestamp(entry.timestamp)}</span>
-              <span className="log-message">{entry.message}</span>
-            </li>
-          ))}
-        </ul>
+      <section className="card">
+        <div className="section-heading">
+          <div>
+            <p className="section-index">02</p>
+            <h2>Attended session</h2>
+          </div>
+          <span className={`status status-${wsStatus}`}>{wsStatus}</span>
+        </div>
+        <label className="stacked-field">
+          <span>Session WebSocket URL</span>
+          <input
+            key={wsUrl}
+            type="text"
+            defaultValue={wsUrl}
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            onBlur={(event) => commitWsUrl(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
+          />
+        </label>
+        <AttendedControls attached={attached} send={send} />
       </section>
+
+      <LogBook logs={logs} />
+    </main>
+  );
+}
+
+function AttendedControls({
+  attached,
+  send,
+}: {
+  attached: AttachedTab | null;
+  send: (message: PanelMsg) => void;
+}): ReactElement {
+  if (attached === null) {
+    return (
+      <button className="button button-secondary" type="button" onClick={() => send({ type: "attach" })}>
+        Attach active tab
+      </button>
+    );
+  }
+  return (
+    <div className="attached-block">
+      <button className="button button-secondary" type="button" onClick={() => send({ type: "detach" })}>
+        Detach tab
+      </button>
+      <p className="warning">Chrome’s “being debugged” banner is expected. Do not detach from that banner.</p>
+      <p className="tab-detail">
+        {attached.title ?? "Untitled tab"}
+        {attached.url ? ` — ${attached.url}` : ""}
+      </p>
     </div>
   );
 }
 
+function LogBook({ logs }: { logs: LogEntry[] }): ReactElement {
+  return (
+    <section className="logbook">
+      <div className="section-heading">
+        <div>
+          <p className="section-index">03</p>
+          <h2>Local event log</h2>
+        </div>
+        <span className="log-count">{logs.length}</span>
+      </div>
+      <ol className="log-list">
+        {logs.length === 0 ? <li className="log-empty">No local events.</li> : null}
+        {logs.map((entry, index) => (
+          <li key={`${entry.timestamp}:${index}`} className={entry.level ? `log-${entry.level}` : undefined}>
+            <time>{formatTimestamp(entry.timestamp)}</time>
+            <span>{entry.message}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 function formatTimestamp(ms: number): string {
-  return new Date(ms).toLocaleTimeString();
+  return new Date(ms).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }

@@ -5,7 +5,10 @@ import type { DialogDisposition, DialogRecord, DialogType } from "@understudy/pr
 // The reportable fields of a `dialog` protocol Event, minus the wire-level
 // `type`/`tabId` the background worker adds (it owns the tabId). Derived from
 // the protocol's DialogRecord so it can never drift from the wire shape.
-export type DialogEventFields = Omit<DialogRecord, "tabId">;
+export type DialogEventFields = Omit<
+  DialogRecord,
+  "tabId" | "dialogId" | "occurredAt"
+>;
 
 // The effects the background service worker must apply for a raw CDP event. Every
 // field is optional so an empty decision ({}) is a valid no-op and the consumer

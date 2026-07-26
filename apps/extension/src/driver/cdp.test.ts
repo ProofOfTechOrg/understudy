@@ -763,3 +763,105 @@ describe("CdpSession ref target binding", () => {
     expect(session.resolveRef(oldRef)).toBeNull();
   });
 });
+
+describe("CdpSession unattended containment", () => {
+  function containmentSession(): Promise<{
+    session: CdpSession;
+    sendCommand: ReturnType<typeof vi.fn>;
+  }> {
+    const sendCommand = vi.fn().mockResolvedValue({});
+    vi.stubGlobal("browser", {
+      storage: {
+        session: {
+          get: vi.fn().mockResolvedValue({}),
+          set: vi.fn().mockResolvedValue(undefined),
+        },
+      },
+      debugger: {
+        sendCommand,
+      },
+    });
+    return CdpSession.create(7, TEST_SCOPE).then((session) => ({
+      session,
+      sendCommand,
+    }));
+  }
+
+  it("prechecks explicit navigation and permits only about:blank or an allowed origin", async () => {
+    const { session, sendCommand } = await containmentSession();
+    await session.enableUnattendedContainment(["https://allowed.example"]);
+
+    expect(session.isAllowedTopLevelUrl("about:blank")).toBe(true);
+    expect(session.isAllowedTopLevelUrl("https://allowed.example/path")).toBe(true);
+    expect(session.isAllowedTopLevelUrl("https://blocked.example/")).toBe(false);
+    await expect(
+      session.navigate("blocked-nav", "https://blocked.example/"),
+    ).resolves.toEqual({
+      type: "action_result",
+      commandId: "blocked-nav",
+      ok: false,
+      error: "navigation origin is not allowed for this session",
+    });
+    expect(
+      sendCommand.mock.calls.some((call) => call[1] === "Page.navigate"),
+    ).toBe(false);
+  });
+
+  it("blocks top-level redirects/JavaScript navigation but permits iframes and subresources", async () => {
+    const { session, sendCommand } = await containmentSession();
+    session.mainFrameId = "main-frame";
+    await session.enableUnattendedContainment(["https://allowed.example"]);
+
+    await session.handleFetchRequestPaused({
+      requestId: "top",
+      request: { url: "https://blocked.example/redirect" },
+      frameId: "main-frame",
+      resourceType: "Document",
+    });
+    await session.handleFetchRequestPaused({
+      requestId: "iframe",
+      request: { url: "https://blocked.example/frame" },
+      frameId: "child-frame",
+      resourceType: "Document",
+    });
+    await session.handleFetchRequestPaused({
+      requestId: "script",
+      request: { url: "https://blocked.example/app.js" },
+      frameId: "main-frame",
+      resourceType: "Script",
+    });
+
+    expect(sendCommand.mock.calls).toContainEqual([
+      { tabId: 7 },
+      "Fetch.failRequest",
+      { requestId: "top", errorReason: "BlockedByClient" },
+    ]);
+    expect(sendCommand.mock.calls).toContainEqual([
+      { tabId: 7 },
+      "Fetch.continueRequest",
+      { requestId: "iframe" },
+    ]);
+    expect(sendCommand.mock.calls).toContainEqual([
+      { tabId: 7 },
+      "Fetch.continueRequest",
+      { requestId: "script" },
+    ]);
+  });
+
+  it("closes a paused related page target before resuming it", async () => {
+    const { session, sendCommand } = await containmentSession();
+
+    await session.closePausedRelatedTarget({
+      targetInfo: { type: "page", targetId: "popup-target" },
+    });
+
+    expect(sendCommand).toHaveBeenCalledWith(
+      { tabId: 7 },
+      "Target.closeTarget",
+      { targetId: "popup-target" },
+    );
+    expect(
+      sendCommand.mock.calls.some((call) => call[1] === "Runtime.runIfWaitingForDebugger"),
+    ).toBe(false);
+  });
+});

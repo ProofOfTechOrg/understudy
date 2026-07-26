@@ -15,6 +15,7 @@ function createFakeHost(connected = true): CoordinatorHost & { sent: string[] } 
       awaiting = ids;
     },
     persistStatus: () => {},
+    persistLateResult: () => {},
     sent,
   };
 }
@@ -44,7 +45,7 @@ describe("CfSessionCoordinator", () => {
     expect(host.getAwaitingCommandIds()).toEqual([]);
   });
 
-  it("rejects with a payload-free error when the per-command timeout fires, and clears the marker", async () => {
+  it("rejects with a payload-free error at timeout but retains the slot until the late result is reconciled", async () => {
     // #given a coordinator with a short per-command timeout
     vi.useFakeTimers();
     try {
@@ -58,10 +59,14 @@ describe("CfSessionCoordinator", () => {
       await vi.advanceTimersByTimeAsync(1000);
       const err = await caught;
 
-      // #then it rejects with a payload-free error and the marker is cleared
+      // #then it rejects with a payload-free error while the durable marker
+      // keeps later commands out of the extension's FIFO.
       expect(err).toBeInstanceOf(Error);
       expect((err as Error).message).toBe("command timed out: c2 (click) after 1000ms");
       expect((err as Error).message).not.toContain("r1");
+      expect(host.getAwaitingCommandIds()).toEqual(["c2"]);
+
+      coordinator.resolvePending({ type: "action_result", commandId: "c2", ok: true });
       expect(host.getAwaitingCommandIds()).toEqual([]);
     } finally {
       vi.useRealTimers();
@@ -165,7 +170,7 @@ describe("CfSessionCoordinator", () => {
     }
   });
 
-  it("logs only commandId and type - never a fill_secret's secretRef or a type command's plaintext", () => {
+  it("does not log command metadata, refs, or plaintext", async () => {
     // #given a spy on console.log and two sensitive commands
     const host = createFakeHost();
     const coordinator = new CfSessionCoordinator(host);
@@ -183,45 +188,52 @@ describe("CfSessionCoordinator", () => {
       text: "hunter2-plaintext",
     };
 
+    let second: Promise<Event> | undefined;
     try {
-      // #when both commands are sent
-      void coordinator.send(fillSecret);
-      void coordinator.send(typeCmd);
+      // #when both commands are sent one at a time
+      const first = coordinator.send(fillSecret);
+      coordinator.resolvePending({ type: "action_result", commandId: "c4", ok: true });
+      await first;
+      second = coordinator.send(typeCmd);
 
-      // #then every logged call carries exactly {commandId, type} - never ref/secretRef/text
-      const loggedMetadata = logSpy.mock.calls.map((call) => call[1]);
-      expect(loggedMetadata).toContainEqual({ commandId: "c4", type: "fill_secret" });
-      expect(loggedMetadata).toContainEqual({ commandId: "c5", type: "type" });
-
-      const serializedCalls = JSON.stringify(logSpy.mock.calls);
-      expect(serializedCalls).not.toContain("vault://super-secret-password");
-      expect(serializedCalls).not.toContain("hunter2-plaintext");
-      expect(serializedCalls).not.toContain("s1e2");
-      expect(serializedCalls).not.toContain("s1e3");
+      // #then command execution emits no ad hoc logs. The HTTP boundary owns
+      // bounded, pseudonymized command telemetry through the shared emitter.
+      expect(logSpy).not.toHaveBeenCalled();
     } finally {
       logSpy.mockRestore();
-      coordinator.resolvePending({ type: "action_result", commandId: "c4", ok: true });
       coordinator.resolvePending({ type: "action_result", commandId: "c5", ok: true });
+      if (second !== undefined) await second;
     }
   });
 
-  it("abandonInFlight rejects every pending command and clears the marker", async () => {
-    // #given two outstanding commands
+  it("abandonInFlight rejects the pending command and clears the marker", async () => {
+    // #given one outstanding command
     const host = createFakeHost();
     const coordinator = new CfSessionCoordinator(host);
     const cmdA: Command = { type: "get_tabs", commandId: "c6" };
-    const cmdB: Command = { type: "snapshot", commandId: "c7", mode: "dom" };
     const promiseA = coordinator.send(cmdA);
-    const promiseB = coordinator.send(cmdB);
-    expect(host.getAwaitingCommandIds()).toEqual(["c6", "c7"]);
+    expect(host.getAwaitingCommandIds()).toEqual(["c6"]);
 
     // #when a fresh hello resync abandons in-flight commands
     coordinator.abandonInFlight("session resynced: hello received");
 
     // #then both reject with the given reason and the marker is cleared
     await expect(promiseA).rejects.toThrow("session resynced: hello received");
-    await expect(promiseB).rejects.toThrow("session resynced: hello received");
     expect(host.getAwaitingCommandIds()).toEqual([]);
+  });
+
+  it("refuses a distinct command while another command owns the session slot", async () => {
+    const host = createFakeHost();
+    const coordinator = new CfSessionCoordinator(host);
+    const first = coordinator.send({ type: "get_tabs", commandId: "c-busy-a" });
+
+    await expect(
+      coordinator.send({ type: "snapshot", commandId: "c-busy-b", mode: "a11y" }),
+    ).rejects.toThrow("session busy: another command owns the session slot");
+    expect(host.sent).toHaveLength(1);
+
+    coordinator.resolvePending({ type: "tabs_result", commandId: "c-busy-a", tabs: [] });
+    await first;
   });
 
   it("refuses a second send for a commandId already in flight, leaving the first undisturbed", async () => {

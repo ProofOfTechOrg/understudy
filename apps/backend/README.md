@@ -1,329 +1,170 @@
-# Backend (M3)
+<!-- Content type: Reference -->
 
-## Overview
+# Operate the Understudy backend
 
-Consumer apps (metamind, smart-compliance) drive a user's real, logged-in browser by
-POSTing protocol Commands to this service and getting back the correlated Event. The
-service holds no LLM and imports no agent framework (Topology 1) — the agent brain,
-tool loop, and governance (breakwater/flowsafe) live in the consumer, not here. This
-service's only job is: terminate the M2 extension's WebSocket, hold the live CDP
-session per browser session, correlate each Command to its Event, enforce caller
-auth + tenant isolation, and resolve `fill_secret` against a vault without ever
-exposing plaintext outside this Worker.
+The backend is a Cloudflare Worker with Hono, Agents SDK Durable Objects, a raw SQLite coordinator, KV vault storage, Analytics Engine telemetry, and a rate-limit backstop. It coordinates attended and unattended sessions but never runs the browser.
 
-## Architecture
+## Understand the object topology
 
-A Hono HTTP front door and one Agents-SDK Durable Object per session (`SessionAgent`)
-share the Worker's `fetch` handler: `routeAgentRequest` claims the
-`/agents/session/:sessionId` WebSocket path (the M2 extension's connection target;
-`session` is kebab-cased from the `SESSION` binding name in `wrangler.jsonc`, not
-from the `SessionAgent` class name); the Hono app claims everything else, including
-`/v1/sessions*` and `/health`.
+The Worker binds three Durable Object classes:
 
-Command flow: `POST /v1/sessions/:sessionId/commands` → `authenticate` (bearer
-caller token → `{actor, tenantId}`, 401 on failure) → `scopeSession` (verifies the
-sessionId's embedded tenant matches the caller's, 404 on mismatch) → `safeParseCommand`
-(400 on an unparseable body or schema failure) → `stub.dispatch()` or, for `fill_secret`, `stub.fillSecret()`
-→ the correlated Event is returned as JSON. This order is load-bearing: an
-unauthenticated or cross-tenant request never reaches parsing or dispatch.
+| Binding | Class | Authority |
+|---|---|---|
+| `SESSION` | `SessionAgent` | Session WebSocket, command journal, schedules, results, dialogs, and vault resolution |
+| `DEVICE` | `DeviceAgent` | One authoritative control WebSocket per enrolled profile |
+| `TENANT_CONTROL` | `TenantDeviceCoordinator` | Tenant devices, allocations, leases, exact quotas, idempotency, and alarms |
 
-Expected dispatch failures cross the DO RPC boundary as a typed
-`DispatchOutcome` (`src/types.ts`), never as a rejected RPC promise — workerd
-logs every server-side RPC rejection as an uncaught exception even when the
-caller handles it, and a typed reason beats message-prefix parsing at the
-route (internally the coordinator still rejects with the `src/coordinator.ts`
-prefix constants; `SessionAgent.dispatchFailure` maps them in-isolate). The
-route maps reasons to statuses:
-**503** `{error: "extension not connected"}` when the session has no live,
-authoritative onConnect-authorized extension socket — the gate consults that delivery
-predicate directly (not the persisted `status` scalar), fails fast instead of
-burning the 30s timeout, and answers non-2xx deliberately: a 200 `ok:false`
-Event would be cached by a consumer's idempotency store and replayed after
-reconnect; **503** `{error: "session resynced mid-command"}` when a fresh
-`hello` abandoned the in-flight command (the extension reconnected — same
-retryable family, its own honest reason); **504** `{error: "command timed
-out"}` when a connected extension never answered; **409** `{error: "command
-already in flight"}` for a concurrent duplicate of a still-pending write
-commandId; anything else is a genuine bug and remains a uniform JSON **500**
-via `app.onError`. A real `fill_secret` checks the liveness predicate
-*before* touching the vault, so no plaintext is ever resolved for a command
-that cannot dispatch. Exception: a ref-less dryRun write (e.g. navigate)
-still short-circuits to simulated `ok:true` without touching the wire — it
-was never a liveness signal.
+Migration `v1` created `SessionAgent`. Additive migration `v2` creates `DeviceAgent` and `TenantDeviceCoordinator`. Do not remove either migration during rollback.
 
-Completed **writes** are additionally recorded per commandId
-(`SessionState.completedWrites`, capped at 100): a retry under the same
-commandId — the connector derives it from the breakwater idempotency key —
-replays the recorded Event instead of executing twice, closing the
-write-performed-but-response-lost retry gap. Reads never replay.
+## Use the HTTP API
 
-Inside the DO, `SessionAgent` holds a `CfSessionCoordinator` (the Cloudflare
-implementation of the portable `SessionCoordinator` interface). `send(cmd)` writes
-the command to the extension WebSocket, parks a `{resolve, reject, timer}` in an
-in-memory `Map` keyed by `commandId`, and persists the commandId into
-`SessionState.awaitingCommandIds`. `onMessage` parses every inbound frame as a
-protocol Event and routes `*_result`/`pong` to `coordinator.resolvePending`, which
-matches by `commandId`, resolves the parked promise, clears the timer, and drops the
-id from the awaiting-marker set.
+All `/v1` caller endpoints require `Authorization: Bearer <caller_token>`. The service returns `404` for malformed, unknown, or cross-tenant session IDs.
 
-`SessionCoordinator` (`coordinator.ts`) is a Cloudflare-import-free interface;
-`CfSessionCoordinator` (`coordinator-cf.ts`) is the only file that couples it to
-Cloudflare, via a constructor-injected `CoordinatorHost` rather than a direct import
-of `session.ts` (which would be circular) or the `agents` package. A raw-DO or
-Node self-host swap only needs a new implementation of this one interface — the
-command API (`index.ts`, `session.ts`) is unaffected.
+| Endpoint | Result |
+|---|---|
+| `POST /v1/sessions` with no body | Create an attended session |
+| `POST /v1/sessions` with an unattended body | Allocate and provision a device lease |
+| `GET /v1/devices` | Read device status and capacity |
+| `GET /v1/sessions/:id` | Read active or terminal session status |
+| `DELETE /v1/sessions/:id` | Detach attended or close unattended |
+| `POST /v1/sessions/:id/commands` | Admit a strict command request |
+| `GET /v1/sessions/:id/commands/:commandId` | Poll a protocol-2 command |
+| `POST /v1/device/connect-ticket` | Mint a device control ticket |
 
-## WebSocket security model
+Unattended creation requires a UUID `Idempotency-Key` and this body:
 
-The first gate is at the **Worker edge**: `routeAgentRequest`'s
-`onBeforeConnect`/`onBeforeRequest` hooks (`index.ts::gateAgentRequest`)
-verify the extension token and tenant scope before the Durable Object ever
-accepts the socket (or serves the SDK's HTTP surface). A bad token is a
-plain 401 and a cross-tenant sessionId a 404 (no existence oracle, matching
-the /v1 discipline) — the socket never enters the DO's connection set at
-all.
-
-The in-DO gate remains as defense in depth for any path that reaches the DO
-without that router: `onConnect` runs the same async checks
-(`verifyExtensionToken` + `scopeSession`) before marking a connection
-`connection.setState({ authorized: true })`, closing with 1008 otherwise. Once
-authenticated, the newest socket becomes the session's sole authority through
-persisted `SessionState.activeConnectionId`; prior authorized sockets are
-demoted and closed with 4001 (`"replaced by newer extension connection"`).
-The Agents SDK accepts a socket — and admits it to the connection set
-`getConnections()` returns — before that async check resolves, so an
-unauthenticated or wrong-tenant socket could sit in the connection set
-during that window. Four things close this gap:
-
-- `sendToExtension` (the coordinator's outbound path) resolves exactly the
-  authorized socket named by `activeConnectionId`, so a command is never
-  broadcast, sent to a socket still pending auth, or duplicated during a
-  reconnect overlap.
-- `onMessage` returns immediately unless its sender is that same authoritative,
-  authorized socket, so neither an unauthenticated nor a replaced socket can
-  inject events or resolve another socket's command.
-- `shouldSendProtocolMessages` returns `false` unconditionally, suppressing the
-  SDK's own connect-time protocol frames — the extension speaks only the
-  `@understudy/protocol` wire shape and already discards anything else, so this
-  costs nothing for a legitimate connection.
-- `validateStateChange` rejects any state write whose `source` isn't `"server"` —
-  the SDK's generic client→server `cf_agent_state` sync path reaches this hook for
-  any accepted connection, including one still awaiting auth, and this DO's state
-  is server-driven only.
-
-Persisted sessions created before `activeConnectionId` existed migrate lazily
-only when exactly one authorized socket is live. Multiple legacy candidates are
-ambiguous and fail closed until a newly authenticated socket claims authority;
-the service never falls back to the former broadcast behavior. Closing a
-replaced socket cannot detach its replacement because `onClose` clears status
-only when the closing connection owns the persisted authority.
-
-## Design decisions
-
-- **Per-session DO, not per-user**: a user can have multiple concurrent
-  cases/sessions; a per-user DO would conflate them and cross tenant boundaries.
-  Keying by `sessionId` gives per-tenant/per-case isolation, with the tenant
-  recoverable from the id itself.
-- **404 for cross-tenant sessions, never 403**: a 403 would confirm the session
-  exists for someone who doesn't own it — an existence oracle. Every
-  `scopeSession` failure path (bad shape, bad HMAC signature, wrong tenant, decode
-  error) collapses to the same `"not-found"` the route turns into 404, so no
-  response shape distinguishes "malformed id" from "someone else's session."
-- **sessionIds are minted, not looked up**: `mintSessionId` HMAC-signs a payload
-  containing the tenant; `scopeSession` verifies the signature and payload rather
-  than querying a table. This makes tenant-ownership verification stateless.
-  `POST /v1/sessions` also accepts an optional `Idempotency-Key` UUID. The UUID is
-  hashed with the authenticated tenant before signing, so retries and concurrent
-  requests from one consumer converge on the same tenant-scoped session without
-  exposing the caller's key in the session id. Omitting the header preserves the
-  fresh-session behavior.
-- **`fill_secret` resolves service-side, DO-scoped**: the agent (consumer-side)
-  only ever sees an opaque `secretRef`. `secrets.ts::resolveSecret` performs vault
-  lookup only — it imports neither `session.ts` nor the coordinator, so it cannot
-  itself dispatch anything. The actual resolve-then-type happens entirely inside
-  `SessionAgent.fillSecret`: the plaintext is fetched, immediately handed to
-  `coordinator.send({type: "type", ...})` (whose logging is metadata-only —
-  `{commandId, type}`, never the command body), and never written to `setState`,
-  never included in the Event response, and never appears in an error string. It
-  exists only transiently inside this one Durable Object, for the duration of the
-  one service→extension WS hop. Resolution is **tenant-scoped**: `fillSecret`
-  derives the session's authoritative tenant from its HMAC-signed `sessionId`
-  (`this.name`, via `auth.ts::tenantOf` — never a caller claim) and refuses any
-  `secretRef` outside that tenant's `vault://<tenantId>/…` namespace *before* any
-  vault read, so a consumer authenticated as tenant B, driving its own session,
-  can never resolve tenant A's secret. A cross-tenant *or* tenant-less ref returns
-  the same scrubbed `ok:false` an absent secret does (no existence oracle). Because
-  understudy owns one shared vault across every tenant, this check lives server-side
-  here — it is not delegated to a consumer-side breakwater, which can only govern
-  that consumer's own agent, never isolate one tenant from another.
-- **`dryRun` is a service-API parameter (`{command, dryRun?}`), not a `Command`
-  union field**: adding it to every Command variant would churn the shared,
-  published protocol for a cross-cutting concern. On a dryRun WRITE command,
-  `dispatch` never dispatches the *mutating* command — instead it sends a
-  read-only `resolve_ref` probe (also via `coordinator.send`), which the
-  extension answers from its live ref map, returning a simulated
-  `action_result` (`simulated: true`) either way. The probe must NOT be a
-  `snapshot`: the extension re-mints every ref per snapshot (generation bump),
-  so a snapshot probe can never contain the consumer's ref — dryRun would
-  always refuse — and it invalidates every outstanding ref, breaking the
-  approved command that follows the simulation (the original M3 dry-run bug,
-  caught by the attended e2e). `fillSecret` does the same ref-only check on
-  dryRun and never calls `resolveSecret` or dispatches a `type` command; a
-  `secretRef` outside the session's own tenant short-circuits to a simulated
-  `ok:false` (the refusal the real call gives) before even the ref probe, so a
-  governance preview is honest on the tenant axis too and still reads no vault.
-  This is fail-safe by construction: a governance simulation (called *before* an
-  approval grant exists) can never actually mutate the page or resolve a
-  secret. A dry-run `ok` guarantees *resolvability* (the ref maps to a live
-  node in the current generation) — not *executability* of the eventual
-  dispatch (e.g. box-model availability), which only the real command proves.
-- **The vault binding (`Env.VAULT`) is a KV namespace holding only AES-256-GCM
-  envelopes, not CF Secrets/Secrets Store**: `fill_secret`'s `secretRef` is
-  chosen per-call at runtime, and CF's Secrets/Secrets Store bindings are
-  static — one binding per fixed secret name — which cannot address an
-  arbitrary runtime-chosen key. KV's `get(key)` can. Because raw KV values are
-  readable back at rest, every value is envelope-encrypted (`src/vault.ts`,
-  format `v1.<iv>.<ct>`, fresh IV per value) under `VAULT_MASTER_KEY` — a
-  Worker secret that never touches KV or wrangler.jsonc — and decrypted only
-  inside the DO via `createVault(env)`. Seed values with
-  `scripts/vault-put.mjs` (same envelope, plain Node), never a raw
-  `wrangler kv key put`; a legacy plaintext value fails closed at read time
-  ("not a recognized envelope"). A per-tenant external KMS (per-tenant
-  *encryption* at rest) remains a possible future swap behind the same
-  `VaultBinding.get` seam (`types.ts`); tenant *authorization* does not wait on
-  it — it is already enforced above the seam by the `vault://<tenantId>/…`
-  namespace check in the `fill_secret` bullet above.
-- **Hibernation cannot lose an in-flight command; only shutdown/restart can**:
-  verified against the Cloudflare Durable Objects docs (2026-07-14) — hibernation
-  requires no pending timer, no in-progress awaited fetch, no active WS use, and no
-  request still being processed, all simultaneously, plus ~10s of subsequent
-  idle. A `send()` awaiting its Event violates two of those (a pending timer, a
-  request being processed) by itself, so the DO cannot hibernate mid-command; that
-  half of the awaiting-marker's job is a platform guarantee, not an assumption.
-  What *can* interrupt a command is shutdown/restart (deploys, runtime updates,
-  host rebalancing — non-deterministic, ~1-2x/day per the Agents SDK docs), which
-  kills the WS outright regardless of hibernation preconditions. The per-command
-  timeout is the caller-side bound for that case. The persisted
-  `awaitingCommandIds` marker's real job is reconciling an orphaned/late
-  `*_result` that arrives for an already-settled (resolved or timed-out)
-  commandId after the DO goes idle and wakes again — it's dropped, not
-  mis-resolved against unrelated bookkeeping.
-- **A fresh `hello` abandons in-flight commands rather than waiting for them**:
-  a `hello` means the extension side just resynced (reconnect, SW restart), so
-  whatever it had in flight is known-gone; `abandonInFlight` rejects every pending
-  command and clears the marker set immediately instead of waiting out their
-  timeouts.
-- **understudy builds no audit sink**: it may emit a structured non-secret log
-  `{ref, secretRef, ok}` for `fill_secret`, but the durable audit trail is
-  flowsafe's, consumer-side. This keeps the service framework-light and avoids a
-  second, redundant audit system.
-
-## Invariants
-
-- Every *successfully dispatched* `Command` produces exactly one `Event`
-  bearing its `commandId`, and the command route returns exactly that Event;
-  a command that cannot dispatch or never resolves maps to a non-2xx JSON
-  error instead (503/504/409/500 — see the failure mapping above).
-- A **write** commandId executes at most once within a session's last 100
-  writes: a repeat of a completed write replays its recorded Event
-  (`completedWrites`, cap 100), a repeat of a still-pending write is refused
-  409, and the extension keeps a matching 100-entry replay + in-flight record
-  for the case where the service times out while the extension is still
-  executing (a duplicate is dropped, not re-run). A retry delayed beyond 100
-  intervening writes degrades to re-execution. Reads never replay.
-- `fill_secret` plaintext never enters `setState`, logs, the Event response, or an
-  error string; the coordinator logs only `{commandId, type}`. A replayed
-  `fill_secret` touches neither the vault nor the wire.
-- A `secretRef` resolves only within its session's own tenant: `fillSecret`
-  requires `vault://<tenantId>/…` (tenant derived from the signed sessionId) and
-  refuses a cross-tenant or tenant-less ref with the same scrubbed `ok:false` an
-  absent secret gets, before any vault read — no cross-tenant plaintext, no
-  existence oracle.
-- The vault at rest holds only `v1.<iv>.<ct>` AES-256-GCM envelopes; a value
-  that does not decrypt under `VAULT_MASTER_KEY` is refused, never served.
-- One Durable Object per `sessionId`; a sessionId whose embedded tenant disagrees
-  with the authenticated caller is refused with 404, never 403 — on the /v1
-  API and on the agent WS/HTTP path alike.
-- Exactly one authenticated extension socket is authoritative per session.
-  Commands and Events use only its persisted `activeConnectionId`; a newer
-  authenticated socket atomically replaces and closes prior sockets, and a
-  late predecessor close cannot detach the replacement.
-- A mid-command DO hibernation cannot happen (see above); an interrupting
-  shutdown/restart is bounded by the per-command timeout, and the persisted
-  awaiting-marker reconciles any orphaned late result rather than mis-resolving it.
-- The service runs no LLM and imports no agent framework.
-- `SessionCoordinator` is the only Cloudflare-coupling seam; `coordinator.ts`
-  itself imports nothing Cloudflare-specific.
-- `dryRun` never dispatches a mutating command and never resolves a secret; it
-  returns a simulated `action_result` from a read-only ref check - or, for a
-  `secretRef` outside the session's tenant, a simulated `ok:false` refusal that
-  matches what the real call would return, with no vault read.
-- An unauthorized WS upgrade is refused at the Worker edge (401/404) before
-  the DO accepts it; any socket that still reaches the DO unauthorized can
-  neither receive a command, have its inbound messages processed, nor change
-  the session's status by closing (see WebSocket security model).
-- Expected delivery failures never cross the DO RPC boundary as rejections
-  (no workerd "Uncaught (in promise)" noise); only genuine bugs throw.
-
-## Deploy
-
-First deployed 2026-07-17 to `https://understudy-backend.gcharang.workers.dev`
-(account `056cbaa6f5c3d8ff5584f1aa84bbe050`). The account id is deliberately
-NOT pinned in `wrangler.jsonc` (public repo, two local accounts): pass it per
-command. Runbook, from `apps/backend`:
-
-```sh
-export CLOUDFLARE_ACCOUNT_ID=056cbaa6f5c3d8ff5584f1aa84bbe050
-
-# One-time: the ciphertext store (id goes into wrangler.jsonc kv_namespaces)
-pnpm exec wrangler kv namespace create VAULT
-
-# Secrets - all four are required; `wrangler deploy` refuses to ship without
-# them (wrangler.jsonc `secrets.required`). Mint strong values:
-openssl rand -hex 32 | pnpm exec wrangler secret put AUTH_HMAC_SECRET
-printf '%s' '{"<caller-token>":{"actor":"<who>","tenantId":"<tenant>"}}' | pnpm exec wrangler secret put CALLER_TOKENS
-printf '%s' '{"<extension-token>":"<tenant>"}' | pnpm exec wrangler secret put EXTENSION_TOKENS
-openssl rand 32 | basenc --base64url | tr -d '=' | pnpm exec wrangler secret put VAULT_MASTER_KEY
-
-pnpm exec wrangler deploy
-curl -s https://understudy-backend.gcharang.workers.dev/health   # {"ok":true}
-
-# Seed a vault secret (encrypts locally; KV never sees plaintext). The key
-# MUST be vault://<tenantId>/<name> where <tenantId> matches the tenant in
-# CALLER_TOKENS/EXTENSION_TOKENS: fillSecret refuses any ref outside the
-# requesting session's own tenant namespace, so a tenant-less key (vault://ref)
-# is unreadable by design.
-printf '%s' 'the-secret' | VAULT_MASTER_KEY=<key> node scripts/vault-put.mjs 'vault://<tenantId>/ref'
+```json
+{
+  "mode": "unattended",
+  "allowedOrigins": ["https://portal.example"],
+  "profileStateKey": "portal_account_a"
+}
 ```
 
-The extension connects to
-`wss://understudy-backend.gcharang.workers.dev/agents/session/<sessionId>?token=<extension-token>`.
+The API canonicalizes origins and hashes the profile key with tenant domain separation. It persists neither raw value in coordinator state.
 
-### Secrets
+Command requests are limited to 128 KiB and parsed against `CommandRequestSchema`. Unknown fields and malformed `dryRun` values return `400` before WebSocket traffic or durable command mutation.
 
-All four are **required** — `wrangler deploy` refuses to ship without them
-(`wrangler.jsonc` `secrets.required`, which is also the `.dev.vars` allowlist
-for local dev). Cloudflare stores them encrypted and **never shows a value
-again** after `wrangler secret put`, so the deployed worker is the canonical
-copy and the only readable backup is the operator-local, gitignored
-`apps/backend/.secrets.production.env` (created out of band, never committed —
-`.secrets*` in the root `.gitignore`). Lose that file and a secret can only be
-*rotated*, not recovered.
+Protocol-2 connectors send `Understudy-Command-Contract: 2`. They can receive `202` and poll the returned status URL. Legacy connectors never receive `202`.
 
-| secret | what it is | regenerate | rotation impact |
-|---|---|---|---|
-| `AUTH_HMAC_SECRET` | HMAC-SHA256 key signing minted sessionIds (stateless tenant scoping) | `openssl rand -hex 32` | invalidates every outstanding sessionId — consumers must re-mint |
-| `CALLER_TOKENS` | JSON map `bearer token → {actor, tenantId}`; a consumer sends the raw token as `Authorization: Bearer …` | token: `printf 'uk_caller_%s\n' "$(openssl rand -hex 24)"` | the affected consumer swaps its `UNDERSTUDY_TOKEN` |
-| `EXTENSION_TOKENS` | JSON map `WS token → tenantId`; the extension sends the raw token as `?token=…` | token: `printf 'uk_ext_%s\n' "$(openssl rand -hex 24)"` | that user pastes the new WS URL into the extension panel |
-| `VAULT_MASTER_KEY` | base64url 32-byte AES-256-GCM key envelope-encrypting every vault value | `openssl rand 32 \| basenc --base64url \| tr -d '='` | **every stored vault value must be re-sealed** (`vault-put.mjs`) — old envelopes become undecryptable |
+## Configure secrets
 
-**When to rotate:** on suspected exposure of that specific secret, when
-offboarding a tenant/user (edit the relevant JSON map and re-put), or on a
-periodic schedule for the two keys. `CALLER_TOKENS`/`EXTENSION_TOKENS` are
-add/remove-an-entry edits — rotating one caller/extension does not disturb the
-others.
+Wrangler requires six secrets:
 
-**Re-push after editing the backup file** (from `apps/backend`) — one at a
-time with `wrangler secret put <NAME>`, or all four via the bulk endpoint (the
-`.secrets.production.env` header carries a ready-made env→JSON one-liner that
-pipes into `wrangler secret bulk`).
+| Secret | Format | Purpose |
+|---|---|---|
+| `AUTH_HMAC_SECRET` | Random HMAC key | Session IDs, profile hashes, request fingerprints, and telemetry pseudonyms |
+| `CALLER_TOKENS` | JSON object | Caller token to actor and tenant |
+| `EXTENSION_TOKENS` | JSON object | Legacy attended extension token to tenant |
+| `DEVICE_TOKENS` | JSON object | SHA-256 device credential digest to tenant-bound device identity |
+| `WS_TICKET_SECRET` | Independent random HMAC key | 60-second single-use WebSocket tickets |
+| `VAULT_MASTER_KEY` | Base64url 32-byte key | AES-256-GCM vault envelope encryption |
+
+`CALLER_TOKENS` uses:
+
+```json
+{
+  "caller_token_here": {
+    "actor": "consumer_worker",
+    "tenantId": "tenant_a"
+  }
+}
+```
+
+`DEVICE_TOKENS` uses:
+
+```json
+{
+  "sha256_device_credential_here": {
+    "tenantId": "tenant_a",
+    "deviceId": "00000000-0000-4000-8000-000000000001",
+    "credentialVersion": 1
+  }
+}
+```
+
+The raw device credential appears only in HTTPS authorization headers and the trusted extension’s local storage. Rotate a device by adding a higher `credentialVersion` entry and removing the old digest. A heartbeat detects revocation and fences the old socket.
+
+Copy `.dev.vars.example` to `.dev.vars` for local development. Never commit `.dev.vars`.
+
+## Configure rollout and quotas
+
+Non-secret Wrangler variables include:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `UNATTENDED_ENABLED_TENANTS` | `[]` | Tenant allowlist for new unattended leases |
+| `SAFE_WRITE_REQUIRED_TENANTS` | `[]` | Tenant allowlist that rejects protocol-1 writes |
+| `QUOTA_POLICY` | Built-in JSON | Exact SQLite quota configuration |
+
+Use `["*"]` only after the protocol-2 extension rollout completes. Keep unattended creation disabled during the initial backend deployment.
+
+The default exact quotas are:
+
+- 10 session creates/min per actor
+- 120 commands/min per session
+- 600 commands/min per tenant
+- 30 credential fills/min per actor
+- 30 device tickets/min per device
+- 10,000 admitted commands per session
+
+The `RATE_LIMITER` binding allows 300 requests/min per credential pseudonym. It is an abuse backstop, not the authoritative quota mechanism.
+
+## Protect WebSocket authority
+
+Long-lived device credentials never enter WebSocket URLs. A device authenticates over HTTPS, receives a signed ticket, and uses it once on the control socket.
+
+The Worker verifies ticket signature, audience, expiry, and path-bound object name before object routing. The target object consumes the JTI hash atomically and validates current tenant, device, lease, and epoch authority.
+
+Attended protocol-1 sockets retain their legacy `EXTENSION_TOKENS` query flow for compatibility. Unattended sockets require tickets.
+
+## Store vault values
+
+KV stores only `v1.<iv>.<ciphertext>` envelopes. Seed a tenant-scoped key through the encryption script:
+
+```bash
+printf '%s' 'secret_value_here' |
+  VAULT_MASTER_KEY=base64url_key_here \
+  node apps/backend/scripts/vault-put.mjs \
+  'vault://tenant_a/portal/password'
+```
+
+`fill_secret` rejects a ref outside the session tenant before a KV read. Plaintext exists only after write readiness and only in the in-memory grant frame.
+
+## Emit telemetry
+
+`src/telemetry.ts` writes content-free dimensions to Analytics Engine and structured logs. HMAC pseudonyms replace tenant, actor, device, and session identifiers.
+
+Never add URL, title, page content, dialog content, text, keys, refs, secret references, credentials, tickets, or full WebSocket URLs to telemetry.
+
+## Develop and verify
+
+Run from the repository root:
+
+```bash
+pnpm --filter @understudy/backend typecheck
+pnpm --filter @understudy/backend test
+pnpm --filter @understudy/backend exec wrangler deploy --dry-run \
+  --outdir /tmp/understudy-unattended-worker
+```
+
+The Miniflare test suite needs permission to bind a loopback port.
+
+## Deploy safely
+
+Deploy the dual-protocol backend with unattended creation disabled:
+
+```bash
+pnpm --filter @understudy/backend exec wrangler deploy
+```
+
+After one canary extension reports protocol 2, enable only its tenant. Complete the production Chromium acceptance suite and 24-hour soak before broad enablement.
+
+A rollback must:
+
+1. Disable new unattended leases
+2. Drain or terminalize active leases and granted commands
+3. Roll back application code
+4. Retain the additive Durable Object migrations
+
+Do not deploy protocol-1-only code while protocol-2 leases exist.

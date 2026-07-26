@@ -31,13 +31,40 @@ export interface SetWsUrlMsg {
   url: string;
 }
 
-export type PanelMsg = GetStateMsg | AttachMsg | DetachMsg | SetWsUrlMsg;
+export interface ConfigureProfileMsg {
+  type: "configureProfile";
+  serviceOrigin: string;
+  enabled: boolean;
+  deviceId: string;
+  deviceCredential: string;
+  originPolicy: string[];
+}
+
+export interface StopAllMsg {
+  type: "stopAll";
+}
+
+export type PanelMsg =
+  | GetStateMsg
+  | AttachMsg
+  | DetachMsg
+  | SetWsUrlMsg
+  | ConfigureProfileMsg
+  | StopAllMsg;
 
 export interface StateMsg {
   type: "state";
   wsStatus: WsStatus;
   wsUrl: string;
   attached: AttachedTab | null;
+  profileStatus: "disabled" | "connecting" | "connected" | "error";
+  controlledTabs: number;
+  profileConfig: {
+    serviceOrigin: string;
+    unattendedEnabled: boolean;
+    deviceId: string;
+    originPolicy: string[];
+  } | null;
   logs: LogEntry[];
 }
 

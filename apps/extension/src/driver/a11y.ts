@@ -1,4 +1,9 @@
-import type { A11yNode } from "@understudy/protocol";
+import {
+  MAX_A11Y_DEPTH,
+  MAX_A11Y_NODES,
+  utf8ByteLength,
+  type A11yNode,
+} from "@understudy/protocol";
 import type { Protocol } from "devtools-protocol";
 
 // AX roles surfaced to the backend. Tunable (seeded from the M0 spike): widen as
@@ -46,13 +51,14 @@ export function buildA11ySnapshot(
   const seen = new Set<string>();
   const refPrefix = a11yRefPrefix(scope);
   let seq = 0;
+  let keptCount = 0;
 
   // DFS pre-order. Returns the kept forest rooted at `nodeId`: a kept node comes
   // back as a single-element list carrying its kept descendants; a dropped node
   // returns its descendants' forest, so they re-parent onto the nearest kept
   // ancestor (drop-but-descend). The ref is assigned before recursing, so a kept
   // parent always precedes its kept children.
-  function walk(nodeId: string): A11yNode[] {
+  function walk(nodeId: string, keptDepth: number): A11yNode[] {
     if (seen.has(nodeId)) return []; // guard against a malformed cyclic tree
     seen.add(nodeId);
 
@@ -70,18 +76,37 @@ export function buildA11ySnapshot(
       !node.ignored &&
       backendId !== undefined
     ) {
+      keptCount += 1;
+      if (keptCount > MAX_A11Y_NODES) {
+        throw new Error(`a11y snapshot exceeds ${MAX_A11Y_NODES} nodes`);
+      }
+      if (keptDepth > MAX_A11Y_DEPTH) {
+        throw new Error(`a11y snapshot exceeds depth ${MAX_A11Y_DEPTH}`);
+      }
       const ref = `${refPrefix}${seq++}`;
       refMap.set(ref, backendId);
       self = { ref, role };
       const name = axString(node.name);
-      if (name !== undefined) self.name = name;
+      if (name !== undefined) {
+        if (utf8ByteLength(name) > 4 * 1024) {
+          throw new Error("a11y name exceeds 4096 bytes");
+        }
+        self.name = name;
+      }
       const value = axString(node.value);
-      if (value !== undefined) self.value = value;
+      if (value !== undefined) {
+        if (utf8ByteLength(value) > 4 * 1024) {
+          throw new Error("a11y value exceeds 4096 bytes");
+        }
+        self.value = value;
+      }
     }
 
     const childForest: A11yNode[] = [];
     for (const childId of node.childIds ?? []) {
-      for (const kept of walk(childId)) childForest.push(kept);
+      for (const kept of walk(childId, keptDepth + (self === undefined ? 0 : 1))) {
+        childForest.push(kept);
+      }
     }
 
     if (self !== undefined) {
@@ -92,6 +117,6 @@ export function buildA11ySnapshot(
   }
 
   const root = axNodes.find((n) => n.role?.value === "RootWebArea");
-  const tree = root === undefined ? [] : walk(root.nodeId);
+  const tree = root === undefined ? [] : walk(root.nodeId, 1);
   return { tree, refMap };
 }

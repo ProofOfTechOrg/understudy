@@ -23,6 +23,9 @@ import {
   callBrowserWrite,
   callConnector,
   createBrowserConnectors,
+  UnderstudyCommandNotStartedError,
+  UnderstudyCommandOutcomeUnknownError,
+  UnderstudyCommandPendingError,
 } from "./index";
 
 const ENV = {
@@ -124,14 +127,13 @@ describe("act", () => {
     const { url, body, headers } = sentRequest(fetchSpy);
     expect(url).toBe("https://understudy.example.com/v1/sessions/s-1/commands");
     expect(headers.authorization).toBe("Bearer caller-token-1");
+    expect(headers["understudy-command-contract"]).toBe("2");
     expect(body).toMatchObject({
       dryRun: false,
-      // The commandId is DERIVED from the idempotency key ("ik_" + key), not
-      // random: a retry after a lost/unparseable response re-runs execute()
-      // under the same key, and only a stable id lets the service replay the
-      // recorded Event instead of executing the write twice.
-      command: { type: "click", ref: "opaque-ref", commandId: "ik_case1:step1:click" },
+      command: { type: "click", ref: "opaque-ref" },
     });
+    const commandId = (body as { command: { commandId: string } }).command.commandId;
+    expect(commandId).toMatch(/^ik_[0-9a-f]{64}$/);
   });
 
   it("dry-run needs no grant, sends dryRun:true, and marks the output simulated", async () => {
@@ -241,6 +243,8 @@ describe("observe (read - no grant, no idempotency)", () => {
   it("get_dialogs returns the recent dialogs from the session status", async () => {
     const dialogs = [
       {
+        dialogId: "5ea854a3-3566-4d92-ae9d-c74a74f3f0fb",
+        occurredAt: "2026-07-26T07:00:00.000Z",
         tabId: 3,
         dialogType: "confirm",
         message: "Delete this item?",
@@ -330,6 +334,71 @@ describe("fill_credential (vaulted write)", () => {
 });
 
 describe("service bridge hardening", () => {
+  it("surfaces a 202 as a typed pending outcome instead of parsing it as an Event", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        eventResponse(
+          {
+            commandId: "pending-1",
+            status: "pending",
+            statusUrl: "https://understudy.example.com/v1/sessions/s-1/commands/pending-1",
+            retryPolicy: "poll_same_command",
+          },
+          202,
+        ),
+      ),
+    );
+    const { act } = createBrowserConnectors(ENV, stores());
+
+    const failure = await callBrowserWrite(
+      act,
+      CLICK,
+      grantFor(BROWSER_ACT_CONNECTOR),
+      "pending-key",
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(UnderstudyCommandPendingError);
+    expect(failure).toMatchObject({
+      pending: {
+        commandId: "pending-1",
+        retryPolicy: "poll_same_command",
+      },
+    });
+  });
+
+  it("exports distinct typed safe-timeout and unknown-outcome failures", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        eventResponse({ code: "command_not_started", safeToRetry: true }, 504),
+      )
+      .mockResolvedValueOnce(
+        eventResponse({ code: "command_outcome_unknown", safeToRetry: false }, 409),
+      );
+    vi.stubGlobal("fetch", fetchSpy);
+    const { act } = createBrowserConnectors(ENV, stores());
+    const grant = grantFor(BROWSER_ACT_CONNECTOR);
+
+    const notStarted = await callBrowserWrite(
+      act,
+      CLICK,
+      grant,
+      "not-started-key",
+    ).catch((error: unknown) => error);
+    const unknown = await callBrowserWrite(
+      act,
+      CLICK,
+      grant,
+      "unknown-key",
+    ).catch((error: unknown) => error);
+
+    expect(notStarted).toBeInstanceOf(UnderstudyCommandNotStartedError);
+    expect(notStarted).toMatchObject({ safeToRetry: true });
+    expect(unknown).toBeInstanceOf(UnderstudyCommandOutcomeUnknownError);
+    expect(unknown).toMatchObject({ safeToRetry: false });
+  });
+
   it("denies a redirect off the understudy host (egress guard, per hop)", async () => {
     const fetchSpy = vi.fn().mockResolvedValue(
       new Response(null, { status: 302, headers: { location: "https://evil.example/exfil" } }),
@@ -514,8 +583,10 @@ describe("write-classification sync with @understudy/protocol", () => {
     );
 
     // #then the wire carries fill_secret under the derived stable id
-    expect(sentRequest(fetchSpy).body).toMatchObject({
-      command: { type: "fill_secret", commandId: "ik_case1:login:fill" },
-    });
+    const body = sentRequest(fetchSpy).body as {
+      command: { type: string; commandId: string };
+    };
+    expect(body.command.type).toBe("fill_secret");
+    expect(body.command.commandId).toMatch(/^ik_[0-9a-f]{64}$/);
   });
 });

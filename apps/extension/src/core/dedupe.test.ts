@@ -111,6 +111,27 @@ describe("WriteDedupe persistence + lifecycle", () => {
     expect(await revived.claim(CLICK)).toEqual({ kind: "replay", event: CLICK_RESULT });
   });
 
+  it("scrubs refs and URLs from the legacy persistence mirror", async () => {
+    const storage = fakeStorage();
+    const dedupe = new WriteDedupe(storage);
+    await dedupe.claim(CLICK);
+    await dedupe.remember(CLICK, {
+      type: "action_result",
+      commandId: CLICK.commandId,
+      ok: false,
+      error: "stale ref s1e1 at https://prior-url.example/",
+      url: "https://prior-url.example/",
+    });
+
+    const serialized = JSON.stringify([...storage.data.values()]);
+    expect(serialized).not.toContain("s1e1");
+    expect(serialized).not.toContain("prior-url.example");
+    expect(await new WriteDedupe(storage).claim(CLICK)).toMatchObject({
+      kind: "replay",
+      event: { error: "browser action failed" },
+    });
+  });
+
   it("clear() drops the record so a new session cannot replay the old one's writes", async () => {
     // #given a recorded write and a session change
     const storage = fakeStorage();

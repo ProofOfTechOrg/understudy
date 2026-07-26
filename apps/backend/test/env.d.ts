@@ -20,7 +20,7 @@ declare namespace Cloudflare {
   interface Env extends BackendEnv {}
   interface GlobalProps {
     mainModule: typeof import("../src/index");
-    durableNamespaces: "SessionAgent";
+    durableNamespaces: "SessionAgent" | "DeviceAgent" | "TenantDeviceCoordinator";
   }
 }
 

@@ -18,6 +18,13 @@ CALLER_TOKENS={"dev-caller-token":{"actor":"stub-consumer","tenantId":"dev-tenan
 # settings.
 EXTENSION_TOKENS={"dev-ext-token":"dev-tenant"}
 
+# JSON map: SHA-256(device credential) -> tenant-bound device identity.
+# The example digest is for the literal credential "dev-device-token".
+DEVICE_TOKENS={"7053fe692ce151a1a4e066d93850420b420ce95d823a0c7e8609fddf5272438d":{"tenantId":"dev-tenant","deviceId":"00000000-0000-4000-8000-000000000001","credentialVersion":1}}
+
+# Independent HMAC key for 60-second, single-use WebSocket tickets.
+WS_TICKET_SECRET=dev-ticket-secret-change-me
+
 # base64url-encoded 32-byte AES-256-GCM key that envelope-encrypts every
 # vault value (src/vault.ts). This dev value decodes to the literal
 # "dev-vault-master-key-0123456789!". Generate a real one with:

@@ -36,11 +36,12 @@ function asSession(mock: MockSession): CdpSession {
   return mock as unknown as CdpSession;
 }
 
-function stubBrowserTabs(): { query: Mock; update: Mock } {
+function stubBrowserTabs(): { get: Mock; query: Mock; update: Mock } {
+  const get = vi.fn();
   const query = vi.fn();
   const update = vi.fn();
-  vi.stubGlobal("browser", { tabs: { query, update } });
-  return { query, update };
+  vi.stubGlobal("browser", { tabs: { get, query, update } });
+  return { get, query, update };
 }
 
 afterEach(() => {
@@ -83,6 +84,30 @@ describe("routeCommand", () => {
 
     expect(mock.screenshot).toHaveBeenCalledWith("c-shot");
     expect(result).toEqual(event);
+  });
+
+  it("rejects a result whose complete WebSocket frame exceeds the session limit", async () => {
+    const mock = createMockSession();
+    mock.screenshot.mockResolvedValue({
+      type: "screenshot_result",
+      commandId: "c-large",
+      mime: "image/png",
+      b64: "a".repeat(16 * 1024 * 1024),
+      tabId: 7,
+      url: "https://example.com/",
+    });
+
+    const result = await routeCommand(
+      { type: "snapshot", commandId: "c-large", mode: "screenshot" },
+      asSession(mock),
+    );
+
+    expect(result).toEqual({
+      type: "action_result",
+      commandId: "c-large",
+      ok: false,
+      error: "command result exceeded protocol limits",
+    });
   });
 
   it("rejects a snapshot requested for a tab other than the attached CDP session", async () => {
@@ -239,36 +264,52 @@ describe("routeCommand", () => {
     });
   });
 
-  it("returns tabs_result with the mapped open tabs for get_tabs", async () => {
-    const { query } = stubBrowserTabs();
-    query.mockResolvedValue([
-      { id: 1, url: "https://a.example/", title: "A", active: true },
-      { id: 2, url: "https://b.example/", title: "B", active: false },
-    ]);
+  it("returns only the session-owned tab for get_tabs", async () => {
+    const { get, query } = stubBrowserTabs();
+    get.mockResolvedValue({
+      id: 7,
+      url: "https://owned.example/",
+      title: "Owned",
+      active: false,
+    });
     const cmd: Command = { type: "get_tabs", commandId: "c-tabs" };
 
-    const result = await routeCommand(cmd, null);
+    const result = await routeCommand(cmd, asSession(createMockSession()));
 
-    expect(query).toHaveBeenCalledWith({});
+    expect(get).toHaveBeenCalledWith(7);
+    expect(query).not.toHaveBeenCalled();
     expect(result).toEqual({
       type: "tabs_result",
       commandId: "c-tabs",
       tabs: [
-        { tabId: 1, url: "https://a.example/", title: "A", active: true },
-        { tabId: 2, url: "https://b.example/", title: "B", active: false },
+        { tabId: 7, url: "https://owned.example/", title: "Owned", active: false },
       ],
     });
   });
 
-  it("activates the tab and returns action_result ok for switch_tab", async () => {
+  it("accepts the owned tab without activating through the tabs API", async () => {
     const { update } = stubBrowserTabs();
-    update.mockResolvedValue(undefined);
     const cmd: Command = { type: "switch_tab", commandId: "c-switch", tabId: 7 };
 
-    const result = await routeCommand(cmd, null);
+    const result = await routeCommand(cmd, asSession(createMockSession()));
 
-    expect(update).toHaveBeenCalledWith(7, { active: true });
+    expect(update).not.toHaveBeenCalled();
     expect(result).toEqual({ type: "action_result", commandId: "c-switch", ok: true });
+  });
+
+  it("rejects switch_tab for every profile tab not owned by the session", async () => {
+    const { update } = stubBrowserTabs();
+    const cmd: Command = { type: "switch_tab", commandId: "c-switch-other", tabId: 8 };
+
+    const result = await routeCommand(cmd, asSession(createMockSession()));
+
+    expect(update).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      type: "action_result",
+      commandId: "c-switch-other",
+      ok: false,
+      error: "tab 8 is not owned by this session",
+    });
   });
 
   it("returns action_result failure for a null session on a session-requiring command", async () => {

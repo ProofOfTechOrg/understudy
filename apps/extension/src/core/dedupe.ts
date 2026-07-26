@@ -88,7 +88,7 @@ export class WriteDedupe {
     const entries = this.entries ?? [];
     const next = [
       ...entries.filter((entry) => entry.commandId !== cmd.commandId),
-      { commandId: cmd.commandId, event },
+      { commandId: cmd.commandId, event: persistenceSafeEvent(event) },
     ];
     while (next.length > CAP) next.shift();
     this.entries = next;
@@ -142,4 +142,17 @@ export class WriteDedupe {
     }
     return this.hydration;
   }
+}
+
+function persistenceSafeEvent(event: Event): Event {
+  if (event.type !== "action_result") {
+    throw new Error("write dedupe accepts action results only");
+  }
+  return {
+    type: "action_result",
+    commandId: event.commandId,
+    ok: event.ok,
+    ...(event.error === undefined ? {} : { error: "browser action failed" }),
+    ...(event.simulated === undefined ? {} : { simulated: event.simulated }),
+  };
 }

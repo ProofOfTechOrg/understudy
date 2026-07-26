@@ -8,8 +8,19 @@
  * state have exactly one definition each.
  */
 
-import type { DialogRecord, Event, TabInfo } from "@understudy/protocol";
+import type {
+  CommandState,
+  DialogDelivery,
+  DialogRecord,
+  Event,
+  PendingCommandResponse,
+  ProtocolCapability,
+  TabInfo,
+  UnattendedSessionLifecycle,
+} from "@understudy/protocol";
 import type { SessionAgent } from "./session";
+import type { DeviceAgent } from "./device";
+import type { TenantDeviceCoordinator } from "./tenant-coordinator";
 
 /**
  * The non-tabs fields of the extension's hello event: what it reports about
@@ -48,6 +59,8 @@ export interface VaultBinding {
 export interface Env {
   /** One Durable Object per sessionId (per tenant/case) - DL-006. */
   SESSION: DurableObjectNamespace<SessionAgent>;
+  DEVICE: DurableObjectNamespace<DeviceAgent>;
+  TENANT_CONTROL: DurableObjectNamespace<TenantDeviceCoordinator>;
   VAULT: VaultBinding;
   /** Signs/verifies server-minted sessionIds so scopeSession can verify tenant ownership statelessly (M-006, DL-008). */
   AUTH_HMAC_SECRET: string;
@@ -61,6 +74,13 @@ export interface Env {
   CALLER_TOKENS: string;
   /** Extension per-user token(s) (JSON), verified independently of caller auth. Required via `secrets.required`, like CALLER_TOKENS. */
   EXTENSION_TOKENS: string;
+  DEVICE_TOKENS: string;
+  WS_TICKET_SECRET: string;
+  QUOTA_POLICY: string;
+  UNATTENDED_ENABLED_TENANTS: string;
+  SAFE_WRITE_REQUIRED_TENANTS: string;
+  RATE_LIMITER?: RateLimit;
+  ANALYTICS?: AnalyticsEngineDataset;
   /**
    * base64url-encoded 32-byte AES-256-GCM key that envelope-encrypts every
    * vault value (vault.ts). KV holds only ciphertext; without this secret a
@@ -115,12 +135,30 @@ export interface SessionState {
    * via GET /v1/sessions/:id so an agent/governance layer sees what a page said
    * and how it was auto-answered. An after-the-fact record, not a response
    * channel: dialogs are answered synchronously extension-side (an open dialog
-   * blocks the CDP channel), never by a consumer round-trip. BEST-EFFORT and
-   * capped: a report emitted while the WS is momentarily down is not replayed
-   * (the dialog is still answered; only its notification is lost), so this is an
-   * observability surface, not a guaranteed audit log.
+   * blocks the CDP channel), never by a consumer round-trip. Protocol 2
+   * acknowledges and replays records within one browser epoch. The public
+   * payload list remains capped, so this is an operational surface rather than
+   * a durable audit log.
    */
   dialogs: DialogRecord[];
+  protocolVersion?: 1 | 2;
+  capabilities?: ProtocolCapability[];
+  mode?: "attended" | "unattended";
+  unattended?: {
+    tenantId: string;
+    deviceId: string;
+    leaseId: string;
+    leaseEpoch: number;
+    browserEpoch: string;
+    status: UnattendedSessionLifecycle;
+    createdAt: string;
+    lastActivityAt: string;
+    idleExpiresAt: string;
+    hardExpiresAt: string;
+    needsReconciliation: boolean;
+    dialogDelivery: DialogDelivery;
+    allowedOrigins: string[];
+  };
 }
 
 /**
@@ -134,6 +172,30 @@ export type DispatchOutcome =
   | { ok: true; event: Event }
   | {
       ok: false;
-      reason: "not_connected" | "timed_out" | "resynced" | "duplicate_in_flight";
+      reason:
+        | "not_connected"
+        | "timed_out"
+        | "resynced"
+        | "duplicate_in_flight"
+        | "session_busy";
       message: string;
     };
+
+export type V2DispatchOutcome =
+  | { kind: "terminal"; event: Event }
+  | { kind: "pending"; pending: PendingCommandResponse }
+  | { kind: "not_started"; commandId: string; safeToRetry: true }
+  | { kind: "timed_out"; commandId: string; safeToRetry: true }
+  | { kind: "unknown"; commandId: string; safeToRetry: false }
+  | { kind: "id_conflict"; commandId: string }
+  | { kind: "busy"; commandId: string }
+  | { kind: "not_connected"; commandId: string }
+  | { kind: "unsupported"; commandId: string }
+  | { kind: "terminal_session"; commandId: string };
+
+export interface CommandStatusRecord {
+  commandId: string;
+  status: CommandState;
+  event?: Event;
+  safeToRetry: boolean;
+}

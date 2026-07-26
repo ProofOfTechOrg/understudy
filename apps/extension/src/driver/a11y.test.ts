@@ -207,4 +207,58 @@ describe("buildA11ySnapshot", () => {
     expect(tree).toEqual([]);
     expect(refMap.size).toBe(0);
   });
+
+  it("rejects more than 5,000 reportable nodes instead of truncating", () => {
+    const children = Array.from({ length: 5_001 }, (_, index) => `node-${index}`);
+    const nodes: Protocol.Accessibility.AXNode[] = [
+      {
+        nodeId: "root",
+        ignored: false,
+        role: { type: "role", value: "RootWebArea" },
+        childIds: children,
+      },
+      ...children.map((nodeId, index) => ({
+        nodeId,
+        ignored: false,
+        role: { type: "role" as const, value: "button" },
+        backendDOMNodeId: index + 1,
+      })),
+    ];
+
+    expect(() =>
+      buildA11ySnapshot(nodes, { scopeId: "limit", generation: 1 }),
+    ).toThrow("a11y snapshot exceeds 5000 nodes");
+  });
+
+  it("rejects reportable depth above 64 and 4 KiB names", () => {
+    const nested: Protocol.Accessibility.AXNode[] = [
+      {
+        nodeId: "root",
+        ignored: false,
+        role: { type: "role", value: "RootWebArea" },
+        childIds: ["button-0"],
+      },
+    ];
+    for (let index = 0; index < 65; index += 1) {
+      nested.push({
+        nodeId: `button-${index}`,
+        ignored: false,
+        role: { type: "role", value: "button" },
+        backendDOMNodeId: index + 1,
+        ...(index === 64 ? {} : { childIds: [`button-${index + 1}`] }),
+      });
+    }
+    expect(() =>
+      buildA11ySnapshot(nested, { scopeId: "depth", generation: 1 }),
+    ).toThrow("a11y snapshot exceeds depth 64");
+
+    const oversizedName = structuredClone(FIXTURE);
+    oversizedName[1]!.name = {
+      type: "computedString",
+      value: "x".repeat(4 * 1024 + 1),
+    };
+    expect(() =>
+      buildA11ySnapshot(oversizedName, { scopeId: "name", generation: 1 }),
+    ).toThrow("a11y name exceeds 4096 bytes");
+  });
 });

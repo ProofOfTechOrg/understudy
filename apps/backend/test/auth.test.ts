@@ -3,11 +3,15 @@ import type { Env } from "../src/types";
 import { base64urlEncode } from "../src/base64url";
 import {
   authenticate,
+  authenticateDevice,
+  deviceCredentialExists,
   isValidTenantId,
   mintSessionId,
+  mintWsTicket,
   scopeSession,
   tenantOf,
   verifyExtensionToken,
+  verifyWsTicket,
   type Actor,
 } from "../src/auth";
 
@@ -24,10 +28,17 @@ const EXTENSION_TOKENS: Record<string, string> = {
 function makeEnv(overrides: Partial<Env> = {}): Env {
   return {
     SESSION: {} as unknown as Env["SESSION"],
+    DEVICE: {} as unknown as Env["DEVICE"],
+    TENANT_CONTROL: {} as unknown as Env["TENANT_CONTROL"],
     VAULT: {} as unknown as Env["VAULT"],
     AUTH_HMAC_SECRET: "test-hmac-secret-do-not-use-in-prod",
     CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),
     EXTENSION_TOKENS: JSON.stringify(EXTENSION_TOKENS),
+    DEVICE_TOKENS: "{}",
+    WS_TICKET_SECRET: "test-ticket-secret",
+    QUOTA_POLICY: "",
+    UNATTENDED_ENABLED_TENANTS: "[]",
+    SAFE_WRITE_REQUIRED_TENANTS: "[]",
     VAULT_MASTER_KEY: "unused-by-auth-tests",
     ...overrides,
   };
@@ -256,4 +267,107 @@ describe("verifyExtensionToken", () => {
       expect(await verifyExtensionToken(token, env)).toBeNull();
     },
   );
+});
+
+describe("device authentication and WebSocket tickets", () => {
+  it("maps only a configured SHA-256 device credential and detects revocation", async () => {
+    const credential = "device-secret";
+    const digest = Array.from(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(credential)),
+      ),
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("");
+    const env = makeEnv({
+      DEVICE_TOKENS: JSON.stringify({
+        [digest]: {
+          tenantId: "tenantA",
+          deviceId: "00000000-0000-4000-8000-000000000001",
+          credentialVersion: 2,
+        },
+      }),
+    });
+    const identity = await authenticateDevice(
+      new Request("https://understudy.example/v1/device/connect-ticket", {
+        headers: { authorization: `Bearer ${credential}` },
+      }),
+      env,
+    );
+    expect(identity).toMatchObject({
+      tenantId: "tenantA",
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      credentialVersion: 2,
+      credentialDigest: digest,
+    });
+    if (identity === null) throw new Error("expected device identity");
+    await expect(deviceCredentialExists(digest, identity, env)).resolves.toBe(true);
+    await expect(
+      deviceCredentialExists(digest, identity, makeEnv({ DEVICE_TOKENS: "{}" })),
+    ).resolves.toBe(false);
+  });
+
+  it("binds signed session tickets to audience, path agent, expiry, and lease claims", async () => {
+    const env = makeEnv();
+    const now = 1_000_000;
+    const ticket = await mintWsTicket(
+      {
+        aud: "session",
+        tenantId: "tenantA",
+        deviceId: "00000000-0000-4000-8000-000000000001",
+        sessionId: "session-1",
+        leaseId: "lease-1",
+        leaseEpoch: 1,
+        browserEpoch: "browser-1",
+        agentName: "session-1",
+      },
+      env,
+      now,
+    );
+
+    await expect(
+      verifyWsTicket(
+        ticket,
+        { aud: "session", agentName: "session-1" },
+        env,
+        now,
+      ),
+    ).resolves.toMatchObject({
+      aud: "session",
+      sessionId: "session-1",
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+    });
+    await expect(
+      verifyWsTicket(
+        ticket,
+        { aud: "device-control", agentName: "session-1" },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      verifyWsTicket(
+        ticket,
+        { aud: "session", agentName: "another-session" },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      verifyWsTicket(
+        ticket,
+        { aud: "session", agentName: "session-1" },
+        env,
+        now + 61_000,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      verifyWsTicket(
+        `${ticket.slice(0, -1)}${ticket.endsWith("A") ? "B" : "A"}`,
+        { aud: "session", agentName: "session-1" },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+  });
 });
