@@ -1,6 +1,7 @@
 import {
   PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
+  WS_CLOSE_SESSION_TERMINAL,
   isWriteCommand,
   safeParseCommand,
   safeParseSessionServerFrame,
@@ -75,6 +76,7 @@ const attendedDialogs = new DialogOutbox(
   "understudy:attendedDialogs",
 );
 let attendedWritesBlocked = false;
+let attendedTerminal = false;
 const commandIngress = new CommandIngress();
 const profileClient = new ProfileClient(() => broadcastState());
 
@@ -156,7 +158,7 @@ function connectWs(): void {
   peer = new ReconnectingWs(getUrl, {
     onCommand: (raw) => onCommand(raw, peer),
     onOpen: () => onOpen(peer),
-    onClose: () => onClose(peer),
+    onClose: (event) => onClose(peer, event),
     onConnecting,
   });
   ws = peer;
@@ -165,7 +167,10 @@ function connectWs(): void {
 
 // ReconnectingWs starts its own pong heartbeat on open, so we only (re)send hello.
 function onOpen(peer: ReconnectingWs): void {
-  if (peer !== ws || wsSwitching) return;
+  if (peer !== ws || wsSwitching || attendedTerminal) {
+    peer.stop();
+    return;
+  }
   wsStatus = "open";
   log("ws connected");
   fireAndForget("hello", () => sendHello(peer));
@@ -177,9 +182,14 @@ function onConnecting(): void {
   broadcastState();
 }
 
-function onClose(peer: ReconnectingWs): void {
+function onClose(peer: ReconnectingWs, event: CloseEvent): void {
   if (peer !== ws) return;
   wsStatus = "closed";
+  if (event.code === WS_CLOSE_SESSION_TERMINAL) {
+    attendedTerminal = true;
+    if (acceptingPeer === peer) acceptingPeer = null;
+    fireAndForget("terminal session detach", detach);
+  }
   broadcastState();
 }
 
@@ -220,7 +230,7 @@ async function sendHello(peer: ReconnectingWs): Promise<void> {
 }
 
 function onCommand(raw: unknown, peer: ReconnectingWs): void {
-  if (peer !== acceptingPeer) return;
+  if (attendedTerminal || peer !== acceptingPeer) return;
   const v2 = safeParseSessionServerFrame(raw);
   if (v2.success) {
     fireAndForget("v2 command ingress", () =>
@@ -237,6 +247,7 @@ async function startV2Frame(
   frame: SessionServerFrame,
   peer: ReconnectingWs,
 ): Promise<StartedCommand | undefined> {
+  if (attendedTerminal || peer !== acceptingPeer) return undefined;
   switch (frame.type) {
     case "command": {
       if (deadline(frame.deadlineAt) <= Date.now()) return undefined;
@@ -319,6 +330,9 @@ async function startV2Frame(
       attendedWritesBlocked = true;
       return undefined;
     case "close_session":
+      attendedTerminal = true;
+      if (acceptingPeer === peer) acceptingPeer = null;
+      peer.stop();
       await detach();
       return undefined;
   }
@@ -432,6 +446,7 @@ async function startCommand(
   raw: unknown,
   peer: ReconnectingWs,
 ): Promise<StartedCommand | undefined> {
+  if (attendedTerminal || peer !== acceptingPeer) return undefined;
   const parsed = safeParseCommand(raw);
   if (!parsed.success) {
     log(`invalid command dropped: ${parsed.error.message}`, "warn");
@@ -729,6 +744,7 @@ async function setWsUrl(url: string): Promise<void> {
       await attendedJournal.clear();
       await attendedDialogs.clear();
       attendedWritesBlocked = false;
+      attendedTerminal = false;
       const active = session;
       if (active !== null) {
         try {
@@ -859,6 +875,9 @@ function onAlarm(alarm: { name: string }): void {
   if (alarm.name === BACKSTOP_ALARM) {
     // Wake-driven reconnect backstop across SW eviction.
     fireAndForget("ensureConnection", ensureConnection);
+    fireAndForget("ensureProfileConnection", () =>
+      profileClient.ensureConnection(),
+    );
   }
 }
 

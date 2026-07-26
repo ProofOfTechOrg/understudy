@@ -6,6 +6,8 @@ export const DEVICE_CONTROL_FRAME_MAX_BYTES = 64 * 1024;
 export const SESSION_RESULT_FRAME_MAX_BYTES = 16 * 1024 * 1024;
 export const MAX_A11Y_NODES = 5_000;
 export const MAX_A11Y_DEPTH = 64;
+export const WS_CLOSE_REPLACED = 4001;
+export const WS_CLOSE_SESSION_TERMINAL = 4003;
 
 const strictObject = <T extends z.ZodRawShape>(shape: T) => z.object(shape).strict();
 const utf8String = (maxBytes: number) =>

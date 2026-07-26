@@ -2,13 +2,21 @@ import {
   DEVICE_CONTROL_FRAME_MAX_BYTES,
   PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
+  WS_CLOSE_REPLACED,
+  WS_CLOSE_SESSION_TERMINAL,
   safeParseDeviceControlServerFrame,
   type DeviceControlClientFrame,
 } from "@understudy/protocol";
+import {
+  SessionManager,
+  StaleProvisionError,
+  type ClosureRecord,
+} from "./session-manager";
 import { ReconnectingWs } from "./ws-client";
-import { SessionManager } from "./session-manager";
 
 const BROWSER_EPOCH_KEY = "understudy:browserEpoch";
+const STAGED_CONFIG_KEY = "understudy:stagedProfile";
+const CREDENTIAL_REVOKED_KEY = "understudy:credentialRevoked";
 const CONFIG_KEYS = [
   "serviceOrigin",
   "unattendedEnabled",
@@ -16,6 +24,17 @@ const CONFIG_KEYS = [
   "deviceCredential",
   "originPolicy",
 ] as const;
+const TICKET_BACKOFF_BASE_MS = 500;
+const TICKET_BACKOFF_CAP_MS = 30_000;
+
+type ControlPurpose = "hosting" | "cleanup";
+
+interface ControlAttempt {
+  generation: number;
+  config: ProfileConfig;
+  purpose: ControlPurpose;
+  controller: AbortController;
+}
 
 export interface ProfileConfig {
   serviceOrigin: string;
@@ -30,10 +49,17 @@ export type ProfileStatus = "disabled" | "connecting" | "connected" | "error";
 export class ProfileClient {
   readonly sessions: SessionManager;
   private config: ProfileConfig | null = null;
+  private stagedConfig: ProfileConfig | null = null;
+  private credentialRevoked = false;
   private epoch = "";
   private control: ReconnectingWs | null = null;
+  private controlAttempt: ControlAttempt | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private ticketBackoffMs = TICKET_BACKOFF_BASE_MS;
+  private generation = 0;
   private status: ProfileStatus = "disabled";
   private controlFrameTail: Promise<void> = Promise.resolve();
+  private configWriteTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly onStatus?: (status: ProfileStatus) => void) {
     this.sessions = new SessionManager(
@@ -43,15 +69,39 @@ export class ProfileClient {
   }
 
   async start(): Promise<void> {
+    const generation = this.invalidateControl();
     await this.restrictLocalStorage();
+    if (!this.isGenerationCurrent(generation)) return;
     this.epoch = await this.loadBrowserEpoch();
-    this.config = await this.loadConfig();
-    await this.sessions.restoreSameEpoch();
-    if (this.config?.unattendedEnabled === true) {
-      await this.connectControl();
-    } else {
+    if (!this.isGenerationCurrent(generation)) return;
+    const stored = await this.loadProfileState();
+    if (!this.isGenerationCurrent(generation)) return;
+    this.config = stored.active;
+    this.stagedConfig = stored.staged;
+    this.credentialRevoked = stored.credentialRevoked;
+
+    const restoreIntent =
+      this.credentialRevoked || this.config === null
+        ? "discard"
+        : this.config.unattendedEnabled && this.stagedConfig === null
+          ? "recover"
+          : "release";
+    await this.sessions.restoreSameEpoch(restoreIntent);
+    if (!this.isGenerationCurrent(generation)) return;
+
+    if (this.config === null) {
+      await this.sessions.discardClosureOutbox();
+      if (!this.isGenerationCurrent(generation)) return;
       this.setStatus("disabled");
+      return;
     }
+    if (this.credentialRevoked) {
+      await this.sessions.discardClosureOutbox();
+      if (!this.isGenerationCurrent(generation)) return;
+      this.setStatus("error");
+      return;
+    }
+    await this.resumeForGeneration(generation);
   }
 
   browserEpoch(): string {
@@ -74,52 +124,158 @@ export class ProfileClient {
 
   async configure(config: ProfileConfig): Promise<void> {
     const normalized = normalizeProfileConfig(config);
-    await browser.storage.local.set(normalized);
-    this.config = normalized;
-    if (!normalized.unattendedEnabled) {
-      await this.closeAllAndAcknowledge();
-      this.control?.stop();
-      this.control = null;
-      this.setStatus("disabled");
+    const generation = this.invalidateControl();
+    const wasCredentialRevoked = this.credentialRevoked;
+    if (wasCredentialRevoked) {
+      this.config = normalized;
+      this.stagedConfig = null;
+      if (!(await this.persistProfileState(normalized, null, generation))) return;
+      await this.sessions.stopAll("discard");
+      if (!this.isGenerationCurrent(generation)) return;
+      await this.sessions.discardClosureOutbox();
+      if (!this.isGenerationCurrent(generation)) return;
+      this.credentialRevoked = false;
+      try {
+        if (!(await this.persistProfileState(normalized, null, generation))) return;
+      } catch (error) {
+        if (this.isGenerationCurrent(generation)) {
+          this.credentialRevoked = true;
+        }
+        throw error;
+      }
+      await this.resumeForGeneration(generation);
       return;
     }
-    this.control?.stop();
-    this.control = null;
-    await this.connectControl();
+    this.credentialRevoked = false;
+    const current = this.config;
+    const identityChanged =
+      current !== null && profileIdentity(current) !== profileIdentity(normalized);
+    const ownsOldWork =
+      current !== null &&
+      (current.unattendedEnabled ||
+        this.sessions.assignments().length > 0 ||
+        this.sessions.closureOutbox().length > 0);
+
+    if (current !== null && identityChanged && ownsOldWork) {
+      this.config = { ...current, unattendedEnabled: false };
+      this.stagedConfig = normalized;
+      if (
+        !(await this.persistProfileState(
+          this.config,
+          this.stagedConfig,
+          generation,
+        ))
+      ) {
+        return;
+      }
+      await this.sessions.stopAll("release");
+      if (!this.isGenerationCurrent(generation)) return;
+      await this.resumeForGeneration(generation);
+      return;
+    }
+
+    this.config = normalized;
+    this.stagedConfig = null;
+    if (!(await this.persistProfileState(normalized, null, generation))) return;
+    if (!normalized.unattendedEnabled) {
+      await this.sessions.stopAll("release");
+      if (!this.isGenerationCurrent(generation)) return;
+    }
+    await this.resumeForGeneration(generation);
   }
 
   async stopAll(): Promise<void> {
-    await this.closeAllAndAcknowledge();
-    this.control?.stop();
-    this.control = null;
+    const generation = this.invalidateControl();
+    this.stagedConfig = null;
     if (this.config !== null) {
       this.config = { ...this.config, unattendedEnabled: false };
-      await browser.storage.local.set({ unattendedEnabled: false });
+      if (!(await this.persistProfileState(this.config, null, generation))) return;
     }
-    this.setStatus("disabled");
+    await this.sessions.stopAll(
+      this.credentialRevoked ? "discard" : "release",
+    );
+    if (!this.isGenerationCurrent(generation)) return;
+    await this.resumeForGeneration(generation);
   }
 
-  private async closeAllAndAcknowledge(): Promise<void> {
-    const assignments = this.sessions.assignments();
-    for (const assignment of assignments) {
-      const closed = await this.sessions.closeLease(assignment);
-      if (!closed) continue;
-      this.sendControl({
-        type: "closed",
-        sessionId: assignment.sessionId,
-        leaseId: assignment.leaseId,
-        leaseEpoch: assignment.leaseEpoch,
-        browserEpoch: assignment.browserEpoch,
-      });
+  async ensureConnection(): Promise<void> {
+    const generation = this.generation;
+    await this.sessions.retryCleanup();
+    if (!this.isGenerationCurrent(generation)) return;
+    const attempt = this.controlAttempt;
+    if (attempt !== null && this.control !== null) {
+      await this.flushClosureOutbox(attempt, this.control);
+      return;
+    }
+    await this.resumeForGeneration(generation);
+  }
+
+  private async resumeForGeneration(generation: number): Promise<void> {
+    if (!this.isGenerationCurrent(generation)) return;
+    if (this.credentialRevoked) {
+      this.setStatus("error");
+      return;
+    }
+    const config = this.config;
+    if (config === null) {
+      this.setStatus("disabled");
+      return;
+    }
+
+    if (
+      this.sessions.closureOutbox().length > 0 ||
+      this.sessions.pendingReleaseCleanup()
+    ) {
+      await this.connectControl(config, "cleanup", generation);
+      return;
+    }
+
+    if (this.sessions.pendingCleanup()) {
+      if (config.unattendedEnabled && this.stagedConfig === null) {
+        await this.connectControl(config, "hosting", generation);
+      } else {
+        this.setStatus("disabled");
+      }
+      return;
+    }
+
+    if (this.stagedConfig !== null) {
+      await this.promoteStaged(generation);
+      return;
+    }
+
+    if (config.unattendedEnabled) {
+      await this.connectControl(config, "hosting", generation);
+    } else {
+      this.setStatus("disabled");
     }
   }
 
-  private async connectControl(): Promise<void> {
-    const config = this.requiredConfig();
+  private async connectControl(
+    config: ProfileConfig,
+    purpose: ControlPurpose,
+    generation: number,
+  ): Promise<void> {
+    if (
+      !this.controlDesired(config, purpose, generation) ||
+      this.control !== null ||
+      this.controlAttempt !== null ||
+      this.retryTimer !== null
+    ) {
+      return;
+    }
+
     this.setStatus("connecting");
-    let ticket: { ticket: string; websocketPath: string };
+    const attempt: ControlAttempt = {
+      generation,
+      config: cloneConfig(config),
+      purpose,
+      controller: new AbortController(),
+    };
+    this.controlAttempt = attempt;
+    let response: Response;
     try {
-      const response = await fetch(
+      response = await fetch(
         new URL("/v1/device/connect-ticket", config.serviceOrigin).toString(),
         {
           method: "POST",
@@ -128,33 +284,71 @@ export class ProfileClient {
             "content-type": "application/json",
           },
           body: JSON.stringify({ browserEpoch: this.epoch }),
+          signal: attempt.controller.signal,
         },
       );
-      if (!response.ok) throw new Error(`device ticket request failed with ${response.status}`);
-      const value = (await response.json()) as Partial<typeof ticket>;
-      if (
-        typeof value.ticket !== "string" ||
-        typeof value.websocketPath !== "string"
-      ) {
-        throw new Error("device ticket response was malformed");
+    } catch (error) {
+      if (!this.isAttemptCurrent(attempt)) return;
+      this.controlAttempt = null;
+      if (isAbortError(error)) return;
+      this.scheduleRetry(attempt);
+      return;
+    }
+    if (!this.isAttemptCurrent(attempt)) return;
+    if (!response.ok) {
+      this.controlAttempt = null;
+      if (isRetryableTicketStatus(response.status)) {
+        this.scheduleRetry(attempt);
+      } else {
+        this.setStatus("error");
       }
-      ticket = { ticket: value.ticket, websocketPath: value.websocketPath };
+      return;
+    }
+
+    let value: unknown;
+    try {
+      value = await response.json();
     } catch {
+      if (!this.isAttemptCurrent(attempt)) return;
+      this.controlAttempt = null;
+      this.setStatus("error");
+      return;
+    }
+    if (!this.isAttemptCurrent(attempt)) return;
+    if (!isTicketResponse(value)) {
+      this.controlAttempt = null;
       this.setStatus("error");
       return;
     }
 
-    const url = new URL(ticket.websocketPath, config.serviceOrigin);
+    let url: URL;
+    try {
+      url = new URL(value.websocketPath, config.serviceOrigin);
+      if (
+        url.origin !== config.serviceOrigin ||
+        (url.protocol !== "https:" && url.protocol !== "http:")
+      ) {
+        throw new Error("ticket websocket path changed service origin");
+      }
+    } catch {
+      this.controlAttempt = null;
+      this.setStatus("error");
+      return;
+    }
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    url.searchParams.set("ticket", ticket.ticket);
+    url.searchParams.set("ticket", value.ticket);
+    if (!this.isAttemptCurrent(attempt)) return;
+
     let peer!: ReconnectingWs;
     peer = new ReconnectingWs(
       () => url.toString(),
       {
         onCommand: (raw) => {
-          if (peer !== this.control) return;
+          if (!this.isPeerCurrent(attempt, peer)) return;
           const handleIfCurrent = async () => {
-            if (peer === this.control) await this.onControlFrame(raw);
+            if (this.isPeerCurrent(attempt, peer)) {
+              await this.onControlFrame(raw, attempt, peer);
+            }
           };
           const handling = this.controlFrameTail.then(
             handleIfCurrent,
@@ -163,9 +357,10 @@ export class ProfileClient {
           this.controlFrameTail = handling.catch(() => {});
         },
         onOpen: () => {
-          if (peer !== this.control) return;
+          if (!this.isPeerCurrent(attempt, peer)) return;
+          this.ticketBackoffMs = TICKET_BACKOFF_BASE_MS;
           this.setStatus("connected");
-          this.sendControl({
+          peer.send({
             type: "device_hello",
             protocolVersion: PROTOCOL_VERSION,
             capabilities: [...PROTOCOL_CAPABILITIES],
@@ -174,79 +369,274 @@ export class ProfileClient {
             browser: navigator.userAgent,
             extVersion: browser.runtime.getManifest().version,
             allowedOrigins: config.originPolicy,
-          });
+          } satisfies DeviceControlClientFrame);
+          void this.flushClosureOutbox(attempt, peer).catch(() => {});
         },
-        onClose: () => {
-          if (peer !== this.control) return;
+        onClose: (event) => {
+          if (!this.isPeerCurrent(attempt, peer)) return;
+          if (
+            event.code === WS_CLOSE_REPLACED ||
+            event.code === WS_CLOSE_SESSION_TERMINAL
+          ) {
+            this.invalidateControl();
+            this.setStatus("error");
+            return;
+          }
           peer.stop();
           this.control = null;
-          this.setStatus("connecting");
-          setTimeout(() => void this.connectControl(), 500);
+          this.controlAttempt = null;
+          if (
+            this.controlDesired(
+              attempt.config,
+              attempt.purpose,
+              attempt.generation,
+            )
+          ) {
+            this.scheduleRetry(attempt);
+          } else {
+            void this.resumeForGeneration(attempt.generation);
+          }
         },
         heartbeatFrame: () => ({
           type: "heartbeat",
           deviceId: config.deviceId,
           browserEpoch: this.epoch,
-          leaseIds: this.sessions.assignments().map((assignment) => assignment.leaseId),
+          leaseIds: this.sessions
+            .assignments()
+            .map((assignment) => assignment.leaseId),
         }),
       },
       DEVICE_CONTROL_FRAME_MAX_BYTES,
     );
+    if (!this.isAttemptCurrent(attempt)) {
+      peer.stop();
+      return;
+    }
     this.control = peer;
   }
 
-  private async onControlFrame(raw: unknown): Promise<void> {
+  private async onControlFrame(
+    raw: unknown,
+    attempt: ControlAttempt,
+    peer: ReconnectingWs,
+  ): Promise<void> {
+    if (!this.isPeerCurrent(attempt, peer)) return;
     const parsed = safeParseDeviceControlServerFrame(raw);
-    if (!parsed.success) return;
+    if (!parsed.success || !this.isPeerCurrent(attempt, peer)) return;
     const frame = parsed.data;
     switch (frame.type) {
       case "provision":
+        if (attempt.purpose !== "hosting") return;
         try {
-          const tab = await this.sessions.provision(frame);
-          this.sendControl({
+          const tab = await this.sessions.provision(
+            frame,
+            () => this.isHostingPeerCurrent(attempt, peer),
+          );
+          if (!this.isHostingPeerCurrent(attempt, peer)) return;
+          peer.send({
             type: "provisioned",
             sessionId: frame.sessionId,
             leaseId: frame.leaseId,
             leaseEpoch: frame.leaseEpoch,
             browserEpoch: frame.browserEpoch,
             tab,
-          });
-        } catch {
-          this.sendControl({
+          } satisfies DeviceControlClientFrame);
+        } catch (error) {
+          if (
+            error instanceof StaleProvisionError ||
+            !this.isHostingPeerCurrent(attempt, peer)
+          ) {
+            await this.ensureConnection();
+            return;
+          }
+          peer.send({
             type: "provision_failed",
             sessionId: frame.sessionId,
             leaseId: frame.leaseId,
             leaseEpoch: frame.leaseEpoch,
             browserEpoch: frame.browserEpoch,
             reason: "local provisioning failed",
-          });
+          } satisfies DeviceControlClientFrame);
         }
         return;
       case "close_lease":
-        if (await this.sessions.closeLease(frame)) {
-          this.sendControl({
-            type: "closed",
-            sessionId: frame.sessionId,
-            leaseId: frame.leaseId,
-            leaseEpoch: frame.leaseEpoch,
-            browserEpoch: frame.browserEpoch,
-          });
-        }
+        await this.sessions.closeLease(frame, "release");
+        if (!this.isPeerCurrent(attempt, peer)) return;
+        await this.flushClosureOutbox(attempt, peer);
         return;
       case "session_ticket":
+        if (attempt.purpose !== "hosting") return;
+        if (!this.isHostingPeerCurrent(attempt, peer)) return;
         this.sessions.connectSessionTicket(frame);
         return;
       case "credential_revoked":
-        this.control?.stop();
-        this.control = null;
-        await this.sessions.stopAll();
-        this.setStatus("error");
+        await this.handleCredentialRevoked(attempt, peer);
         return;
     }
   }
 
-  private sendControl(frame: DeviceControlClientFrame): void {
-    this.control?.send(frame);
+  private async flushClosureOutbox(
+    attempt: ControlAttempt,
+    peer: ReconnectingWs,
+  ): Promise<void> {
+    for (const entry of this.sessions.closureOutbox()) {
+      if (!this.isPeerCurrent(attempt, peer)) return;
+      if (!peer.send(closedFrame(entry))) return;
+      await this.sessions.acknowledgeClosure(entry);
+      if (!this.isPeerCurrent(attempt, peer)) return;
+    }
+    if (
+      attempt.purpose === "cleanup" &&
+      !this.sessions.pendingReleaseCleanup() &&
+      this.sessions.closureOutbox().length === 0
+    ) {
+      peer.stop();
+      if (this.control === peer) this.control = null;
+      if (this.controlAttempt === attempt) this.controlAttempt = null;
+      await this.resumeForGeneration(attempt.generation);
+    }
+  }
+
+  private async promoteStaged(generation: number): Promise<void> {
+    const staged = this.stagedConfig;
+    if (staged === null || !this.isGenerationCurrent(generation)) return;
+    if (!(await this.persistProfileState(staged, null, generation))) return;
+    if (!this.isGenerationCurrent(generation)) return;
+    this.config = staged;
+    this.stagedConfig = null;
+    if (staged.unattendedEnabled) {
+      await this.connectControl(staged, "hosting", generation);
+    } else {
+      this.setStatus("disabled");
+    }
+  }
+
+  private async handleCredentialRevoked(
+    attempt: ControlAttempt,
+    peer: ReconnectingWs,
+  ): Promise<void> {
+    if (!this.isPeerCurrent(attempt, peer)) return;
+    const generation = this.invalidateControl();
+    this.credentialRevoked = true;
+    this.stagedConfig = null;
+    if (this.config !== null) {
+      this.config = { ...this.config, unattendedEnabled: false };
+      if (!(await this.persistProfileState(this.config, null, generation))) return;
+    }
+    await this.sessions.stopAll("discard");
+    if (!this.isGenerationCurrent(generation)) return;
+    await this.sessions.discardClosureOutbox();
+    if (!this.isGenerationCurrent(generation)) return;
+    this.setStatus("error");
+  }
+
+  private scheduleRetry(attempt: ControlAttempt): void {
+    if (!this.controlDesired(attempt.config, attempt.purpose, attempt.generation)) {
+      return;
+    }
+    if (this.retryTimer !== null) return;
+    const delayMs = this.ticketBackoffMs;
+    this.ticketBackoffMs = Math.min(
+      this.ticketBackoffMs * 2,
+      TICKET_BACKOFF_CAP_MS,
+    );
+    this.setStatus("connecting");
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.connectControl(
+        attempt.config,
+        attempt.purpose,
+        attempt.generation,
+      );
+    }, delayMs);
+  }
+
+  private invalidateControl(): number {
+    this.generation += 1;
+    this.controlAttempt?.controller.abort();
+    this.controlAttempt = null;
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    this.ticketBackoffMs = TICKET_BACKOFF_BASE_MS;
+    this.control?.stop();
+    this.control = null;
+    this.controlFrameTail = Promise.resolve();
+    return this.generation;
+  }
+
+  private isGenerationCurrent(generation: number): boolean {
+    return generation === this.generation;
+  }
+
+  private isAttemptCurrent(attempt: ControlAttempt): boolean {
+    return (
+      this.controlAttempt === attempt &&
+      this.controlDesired(
+        attempt.config,
+        attempt.purpose,
+        attempt.generation,
+      )
+    );
+  }
+
+  private isPeerCurrent(
+    attempt: ControlAttempt,
+    peer: ReconnectingWs,
+  ): boolean {
+    return this.control === peer && this.isAttemptCurrent(attempt);
+  }
+
+  private isHostingPeerCurrent(
+    attempt: ControlAttempt,
+    peer: ReconnectingWs,
+  ): boolean {
+    return (
+      attempt.purpose === "hosting" &&
+      this.isPeerCurrent(attempt, peer) &&
+      this.config?.unattendedEnabled === true &&
+      this.stagedConfig === null
+    );
+  }
+
+  private controlDesired(
+    config: ProfileConfig,
+    purpose: ControlPurpose,
+    generation: number,
+  ): boolean {
+    if (!this.isGenerationCurrent(generation) || this.config === null) {
+      return false;
+    }
+    if (profileIdentity(this.config) !== profileIdentity(config)) return false;
+    if (purpose === "hosting") {
+      return this.config.unattendedEnabled && this.stagedConfig === null;
+    }
+    return (
+      this.controlAttempt?.purpose === "cleanup" ||
+      this.sessions.closureOutbox().length > 0 ||
+      this.sessions.pendingReleaseCleanup()
+    );
+  }
+
+  private async persistProfileState(
+    active: ProfileConfig,
+    staged: ProfileConfig | null,
+    generation: number,
+  ): Promise<boolean> {
+    let written = false;
+    const write = this.configWriteTail.then(async () => {
+      if (!this.isGenerationCurrent(generation)) return;
+      await browser.storage.local.set({
+        ...active,
+        [STAGED_CONFIG_KEY]: staged === null ? null : cloneConfig(staged),
+        [CREDENTIAL_REVOKED_KEY]: this.credentialRevoked,
+      });
+      written = this.isGenerationCurrent(generation);
+    });
+    this.configWriteTail = write.catch(() => {});
+    await write;
+    return written;
   }
 
   private async loadBrowserEpoch(): Promise<string> {
@@ -258,8 +648,16 @@ export class ProfileClient {
     return epoch;
   }
 
-  private async loadConfig(): Promise<ProfileConfig | null> {
-    const stored = await browser.storage.local.get([...CONFIG_KEYS]);
+  private async loadProfileState(): Promise<{
+    active: ProfileConfig | null;
+    staged: ProfileConfig | null;
+    credentialRevoked: boolean;
+  }> {
+    const stored = await browser.storage.local.get([
+      ...CONFIG_KEYS,
+      STAGED_CONFIG_KEY,
+      CREDENTIAL_REVOKED_KEY,
+    ]);
     const candidate = {
       serviceOrigin: stored.serviceOrigin,
       unattendedEnabled: stored.unattendedEnabled,
@@ -267,11 +665,27 @@ export class ProfileClient {
       deviceCredential: stored.deviceCredential,
       originPolicy: stored.originPolicy,
     };
+    let active: ProfileConfig | null;
     try {
-      return normalizeProfileConfig(candidate);
+      active = normalizeProfileConfig(candidate);
     } catch {
-      return null;
+      active = null;
     }
+    let staged: ProfileConfig | null;
+    try {
+      staged =
+        stored[STAGED_CONFIG_KEY] === null ||
+        stored[STAGED_CONFIG_KEY] === undefined
+          ? null
+          : normalizeProfileConfig(stored[STAGED_CONFIG_KEY]);
+    } catch {
+      staged = null;
+    }
+    return {
+      active,
+      staged,
+      credentialRevoked: stored[CREDENTIAL_REVOKED_KEY] === true,
+    };
   }
 
   private async restrictLocalStorage(): Promise<void> {
@@ -284,7 +698,9 @@ export class ProfileClient {
   }
 
   private requiredConfig(): ProfileConfig {
-    if (this.config === null) throw new Error("unattended profile is not configured");
+    if (this.config === null) {
+      throw new Error("unattended profile is not configured");
+    }
     return this.config;
   }
 
@@ -295,9 +711,14 @@ export class ProfileClient {
 }
 
 function normalizeProfileConfig(value: unknown): ProfileConfig {
-  if (typeof value !== "object" || value === null) throw new Error("invalid profile config");
+  if (typeof value !== "object" || value === null) {
+    throw new Error("invalid profile config");
+  }
   const input = value as Partial<ProfileConfig>;
-  const origin = typeof input.serviceOrigin === "string" ? new URL(input.serviceOrigin) : null;
+  const origin =
+    typeof input.serviceOrigin === "string"
+      ? new URL(input.serviceOrigin)
+      : null;
   const serviceLoopback =
     origin !== null &&
     (origin.hostname === "localhost" ||
@@ -328,7 +749,9 @@ function normalizeProfileConfig(value: unknown): ProfileConfig {
   ) {
     throw new Error("invalid profile config");
   }
-  const originPolicy = [...new Set(input.originPolicy.map(canonicalOrigin))].sort();
+  const originPolicy = [
+    ...new Set(input.originPolicy.map(canonicalOrigin)),
+  ].sort();
   return {
     serviceOrigin: origin.origin,
     unattendedEnabled: input.unattendedEnabled,
@@ -339,7 +762,12 @@ function normalizeProfileConfig(value: unknown): ProfileConfig {
 }
 
 function canonicalOrigin(value: string): string {
-  if (value !== value.trim() || value.includes("*") || value.includes("?") || value.includes("#")) {
+  if (
+    value !== value.trim() ||
+    value.includes("*") ||
+    value.includes("?") ||
+    value.includes("#")
+  ) {
     throw new Error("invalid local origin policy");
   }
   const url = new URL(value);
@@ -352,9 +780,48 @@ function canonicalOrigin(value: string): string {
     url.username !== "" ||
     url.password !== "" ||
     (url.pathname !== "" && url.pathname !== "/") ||
-    (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+    (url.protocol !== "https:" &&
+      !(url.protocol === "http:" && loopback))
   ) {
     throw new Error("invalid local origin policy");
   }
   return url.origin;
+}
+
+function cloneConfig(config: ProfileConfig): ProfileConfig {
+  return { ...config, originPolicy: [...config.originPolicy] };
+}
+
+function profileIdentity(config: ProfileConfig): string {
+  return JSON.stringify({
+    serviceOrigin: config.serviceOrigin,
+    deviceId: config.deviceId,
+    deviceCredential: config.deviceCredential,
+    originPolicy: config.originPolicy,
+  });
+}
+
+function isTicketResponse(
+  value: unknown,
+): value is { ticket: string; websocketPath: string } {
+  if (typeof value !== "object" || value === null) return false;
+  const ticket = value as { ticket?: unknown; websocketPath?: unknown };
+  return (
+    typeof ticket.ticket === "string" &&
+    ticket.ticket.length > 0 &&
+    typeof ticket.websocketPath === "string" &&
+    ticket.websocketPath.length > 0
+  );
+}
+
+function isRetryableTicketStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function closedFrame(entry: ClosureRecord): DeviceControlClientFrame {
+  return { type: "closed", ...entry };
 }

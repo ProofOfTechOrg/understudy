@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  WS_CLOSE_REPLACED,
+  WS_CLOSE_SESSION_TERMINAL,
+} from "@understudy/protocol";
 import { ReconnectingWs } from "./ws-client";
 
 type Listener = (event: Event & { code?: number; data?: unknown }) => void;
@@ -44,20 +48,28 @@ describe("ReconnectingWs", () => {
     vi.unstubAllGlobals();
   });
 
-  it("does not reconnect after the backend replaces this extension with close code 4001", () => {
-    const onClose = vi.fn();
-    new ReconnectingWs(() => "ws://example.test/session", {
-      onCommand: vi.fn(),
-      onOpen: vi.fn(),
-      onClose,
-    });
+  it.each([WS_CLOSE_REPLACED, WS_CLOSE_SESSION_TERMINAL])(
+    "classifies terminal close code %i before the owner callback and does not reconnect",
+    (code) => {
+      const onClose = vi.fn();
+      let peer!: ReconnectingWs;
+      peer = new ReconnectingWs(() => "ws://example.test/session", {
+        onCommand: vi.fn(),
+        onOpen: vi.fn(),
+        onClose: (event) => {
+          onClose(event);
+          peer.send({ type: "must-not-send" });
+        },
+      });
 
-    FakeWebSocket.instances[0]?.emit("close", { code: 4001 });
-    vi.advanceTimersByTime(60_000);
+      FakeWebSocket.instances[0]?.emit("close", { code });
+      vi.advanceTimersByTime(60_000);
 
-    expect(onClose).toHaveBeenCalledOnce();
-    expect(FakeWebSocket.instances).toHaveLength(1);
-  });
+      expect(onClose).toHaveBeenCalledOnce();
+      expect(onClose.mock.calls[0]?.[0]).toMatchObject({ code });
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    },
+  );
 
   it("reconnects an ordinary close with backoff", () => {
     new ReconnectingWs(() => "ws://example.test/session", {

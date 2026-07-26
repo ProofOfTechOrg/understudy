@@ -300,7 +300,10 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
         return;
       }
       case "provisioned": {
-        const result = await this.coordinator(state.claims.tenantId).markProvisioned(frame);
+        const result = await this.coordinator(state.claims.tenantId).markProvisioned({
+          ...frame,
+          deviceId: this.name,
+        });
         if (!result.accepted) {
           await emitTelemetry(this.env, {
             event: "provisioning",
@@ -330,7 +333,10 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
         return;
       }
       case "provision_failed":
-        await this.coordinator(state.claims.tenantId).markProvisionFailed(frame);
+        await this.coordinator(state.claims.tenantId).markProvisionFailed({
+          ...frame,
+          deviceId: this.name,
+        });
         await emitTelemetry(this.env, {
           event: "provisioning",
           outcome: "failed",
@@ -340,7 +346,10 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
         });
         return;
       case "closed": {
-        const terminal = await this.coordinator(state.claims.tenantId).confirmClosed(frame);
+        const terminal = await this.coordinator(state.claims.tenantId).confirmClosed({
+          ...frame,
+          deviceId: this.name,
+        });
         if (terminal !== null) {
           const session = await getAgentByName(this.env.SESSION, frame.sessionId);
           await session.markLifecycle(terminal, false);

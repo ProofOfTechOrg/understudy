@@ -25,6 +25,12 @@ export interface RuntimeAssignment {
   windowId: number;
 }
 
+export type CleanupIntent = "recover" | "release" | "discard";
+
+export interface ManagedAssignment extends RuntimeAssignment {
+  cleanupIntent?: CleanupIntent;
+}
+
 export interface RuntimeHost {
   serviceOrigin(): string;
   browserEpoch(): string;
@@ -38,14 +44,15 @@ export class SessionRuntime {
   readonly dialogs: DialogOutbox;
   private peer: ReconnectingWs | null = null;
   private cdp: CdpSession | null = null;
-  private accepting = true;
+  private accepting: boolean;
   private writesBlocked = false;
   private closing = false;
 
   constructor(
-    readonly assignment: RuntimeAssignment,
+    readonly assignment: ManagedAssignment,
     private readonly host: RuntimeHost,
   ) {
+    this.accepting = assignment.cleanupIntent === undefined;
     this.journal = new WriteJournal(
       browser.storage.session,
       `understudy:journal:${assignment.sessionId}`,
@@ -101,6 +108,14 @@ export class SessionRuntime {
   }
 
   connect(ticket: string): void {
+    if (
+      !this.accepting ||
+      this.closing ||
+      this.assignment.cleanupIntent !== undefined ||
+      this.cdp === null
+    ) {
+      throw new Error("session runtime is not accepting connections");
+    }
     this.peer?.stop();
     const url = new URL(
       `/agents/session/${encodeURIComponent(this.sessionId)}`,
@@ -154,6 +169,16 @@ export class SessionRuntime {
         return true;
       }
     }
+  }
+
+  beginCleanup(intent: CleanupIntent): void {
+    this.assignment.cleanupIntent = mergeCleanupIntent(
+      this.assignment.cleanupIntent,
+      intent,
+    );
+    this.accepting = false;
+    this.peer?.stop();
+    this.peer = null;
   }
 
   async onCdpEvent(method: string, params: unknown): Promise<void> {
@@ -221,7 +246,7 @@ export class SessionRuntime {
 
   private async onOpen(): Promise<void> {
     const tab = await this.tabInfo();
-    if (!this.host.isCurrent(this)) return;
+    if (!this.canAccept()) return;
     this.send({
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
@@ -235,6 +260,7 @@ export class SessionRuntime {
     } satisfies Event);
 
     for (const record of await this.journal.recover()) {
+      if (!this.canAccept()) return;
       if (record.state === "prepared") {
         this.send({
           type: "write_ready",
@@ -256,12 +282,13 @@ export class SessionRuntime {
       }
     }
     for (const dialog of await this.dialogs.pending()) {
+      if (!this.canAccept()) return;
       this.send({ type: "dialog", ...dialog });
     }
   }
 
   private async onServerFrame(raw: unknown): Promise<void> {
-    if (!this.accepting || !this.host.isCurrent(this)) return;
+    if (!this.canAccept()) return;
     const parsed = safeParseSessionServerFrame(raw);
     if (!parsed.success) return;
     const frame = parsed.data;
@@ -286,6 +313,7 @@ export class SessionRuntime {
           leaseEpoch: frame.leaseEpoch,
           browserEpoch: frame.browserEpoch,
         });
+        if (!this.canAccept()) return;
         this.send({
           type: "write_ready",
           ...this.fence(frame.attemptId, deadline(frame.deadlineAt)),
@@ -318,7 +346,7 @@ export class SessionRuntime {
     frame: Extract<SessionServerFrame, { type: "command" }>,
   ): Promise<void> {
     const event = await this.executeWithDeadline(frame.command, deadline(frame.deadlineAt));
-    if (event !== null && this.host.isCurrent(this)) {
+    if (event !== null && this.canAccept()) {
       this.send({
         type: "command_result",
         attemptId: frame.attemptId,
@@ -341,6 +369,7 @@ export class SessionRuntime {
       return;
     }
     const record = await this.journal.get(frame.attemptId);
+    if (!this.canAccept()) return;
     if (
       record === undefined ||
       record.state !== "prepared" ||
@@ -349,13 +378,15 @@ export class SessionRuntime {
       return;
     }
     await this.journal.markStarted(frame.attemptId);
+    if (!this.canAccept()) return;
     const event = await this.executeWithDeadline(frame.command, deadline(frame.deadlineAt));
-    if (event === null || !this.host.isCurrent(this)) {
+    if (event === null || !this.canAccept()) {
       await this.journal.markUnknown(frame.attemptId);
       this.writesBlocked = true;
       return;
     }
     await this.journal.markCompleted(frame.attemptId, event);
+    if (!this.canAccept()) return;
     this.send({
       type: "command_result",
       attemptId: frame.attemptId,
@@ -425,9 +456,27 @@ export class SessionRuntime {
     };
   }
 
+  private canAccept(): boolean {
+    return (
+      this.accepting &&
+      !this.closing &&
+      this.assignment.cleanupIntent === undefined &&
+      this.host.isCurrent(this)
+    );
+  }
+
   private send(frame: unknown): void {
     this.peer?.send(frame);
   }
+}
+
+function mergeCleanupIntent(
+  current: CleanupIntent | undefined,
+  requested: CleanupIntent,
+): CleanupIntent {
+  if (current === "discard" || requested === "discard") return "discard";
+  if (current === "release" || requested === "release") return "release";
+  return "recover";
 }
 
 function deadline(value: string): number {

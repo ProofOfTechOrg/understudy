@@ -33,6 +33,23 @@ afterEach(() => {
 });
 
 describe("SessionRuntime close fencing", () => {
+  it("never downgrades release or discard cleanup ownership", () => {
+    stubBrowser(async () => {});
+    const release = new SessionRuntime(
+      { ...ASSIGNMENT, cleanupIntent: "release" },
+      host(),
+    );
+    release.beginCleanup("recover");
+    expect(release.assignment.cleanupIntent).toBe("release");
+
+    const discard = new SessionRuntime(
+      { ...ASSIGNMENT, cleanupIntent: "discard" },
+      host(),
+    );
+    discard.beginCleanup("release");
+    expect(discard.assignment.cleanupIntent).toBe("discard");
+  });
+
   it("does not let an intentional debugger detach revoke ownership before tab removal", async () => {
     let confirmRemoval!: () => void;
     stubBrowser(

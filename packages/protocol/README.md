@@ -98,6 +98,17 @@ The guarantee is at-most-once execution with explicit pending and unknown outcom
 
 Device control never carries consumer commands or vaulted plaintext.
 
+## Handle terminal WebSocket closes
+
+The package exports two application close codes:
+
+| Export | Code | Meaning |
+|---|---:|---|
+| `WS_CLOSE_REPLACED` | `4001` | A newer extension connection replaced this connection |
+| `WS_CLOSE_SESSION_TERMINAL` | `4003` | The backend retired the session permanently |
+
+Clients must cancel reconnect state before invoking their close handler for either code. Code `4001` is terminal for that extension instance. Code `4003` also stops command admission and detaches local browser control.
+
 ## Deliver dialogs
 
 Every `dialog` record includes `dialogId` and `occurredAt`. The server answers with `dialog_ack`. The extension can replay unacknowledged records within the same browser epoch while the server deduplicates them.
@@ -131,6 +142,7 @@ The package exports:
 - Command, event, HTTP request, status, device, session, and frame schemas
 - `parseCommand`, `parseEvent`, and safe parser variants
 - Protocol version and capabilities
+- Terminal WebSocket close codes
 - Command classification helpers
 - Byte and tree limits
 - TypeScript types inferred from every public schema

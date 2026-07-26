@@ -2,11 +2,13 @@ import type { TabInfo } from "@understudy/protocol";
 import type { Browser } from "wxt/browser";
 import {
   SessionRuntime,
+  type CleanupIntent,
+  type ManagedAssignment,
   type RuntimeAssignment,
   type RuntimeHost,
 } from "./session-runtime";
 
-const ASSIGNMENTS_KEY = "understudy:assignments";
+const MANAGER_STATE_KEY = "understudy:assignments";
 const CAPACITY = 2;
 
 export interface ProvisionInput {
@@ -18,10 +20,23 @@ export interface ProvisionInput {
   sessionTicket: string;
 }
 
+export type ClosureRecord = Pick<
+  RuntimeAssignment,
+  "sessionId" | "leaseId" | "leaseEpoch" | "browserEpoch"
+>;
+
+interface PersistedManagerState {
+  version: 2;
+  assignments: ManagedAssignment[];
+  closedOutbox: ClosureRecord[];
+}
+
 export class SessionManager implements RuntimeHost {
   private readonly bySession = new Map<string, SessionRuntime>();
   private readonly byLease = new Map<string, SessionRuntime>();
   private readonly byTab = new Map<number, SessionRuntime>();
+  private closedOutbox: ClosureRecord[] = [];
+  private persistTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly getServiceOrigin: () => string,
@@ -45,7 +60,11 @@ export class SessionManager implements RuntimeHost {
     );
   }
 
-  async provision(input: ProvisionInput): Promise<TabInfo> {
+  async provision(
+    input: ProvisionInput,
+    isCurrent: () => boolean = () => true,
+  ): Promise<TabInfo> {
+    if (!isCurrent()) throw new StaleProvisionError();
     const existing = this.byLease.get(input.leaseId);
     if (existing !== undefined) {
       if (
@@ -55,13 +74,20 @@ export class SessionManager implements RuntimeHost {
       ) {
         throw new Error("lease assignment conflict");
       }
+      const tab = await this.tabInfo(existing.tabId);
+      if (!isCurrent()) {
+        await this.cleanup(existing, "release");
+        throw new StaleProvisionError();
+      }
       existing.connect(input.sessionTicket);
-      return this.tabInfo(existing.tabId);
+      return tab;
     }
     if (input.browserEpoch !== this.browserEpoch()) {
       throw new Error("browser epoch mismatch");
     }
-    if (this.byLease.size >= CAPACITY) throw new Error("controlled-tab capacity exhausted");
+    if (this.byLease.size >= CAPACITY) {
+      throw new Error("controlled-tab capacity exhausted");
+    }
 
     const createdWindow = await browser.windows.create({
       focused: false,
@@ -72,7 +98,7 @@ export class SessionManager implements RuntimeHost {
     if (createdWindow?.id === undefined || tab?.id === undefined) {
       throw new Error("Chrome did not return the extension-owned automation tab");
     }
-    const assignment: RuntimeAssignment = {
+    const assignment: ManagedAssignment = {
       sessionId: input.sessionId,
       leaseId: input.leaseId,
       leaseEpoch: input.leaseEpoch,
@@ -84,12 +110,31 @@ export class SessionManager implements RuntimeHost {
     const runtime = new SessionRuntime(assignment, this);
     this.install(runtime);
     await this.persist();
+    if (!isCurrent()) {
+      await this.cleanup(runtime, "release");
+      throw new StaleProvisionError();
+    }
+
     try {
       await runtime.attach();
+      if (!isCurrent()) {
+        await this.cleanup(runtime, "release");
+        throw new StaleProvisionError();
+      }
+      const info = await this.tabInfo(runtime.tabId);
+      if (!isCurrent()) {
+        await this.cleanup(runtime, "release");
+        throw new StaleProvisionError();
+      }
       runtime.connect(input.sessionTicket);
-      return this.tabInfo(runtime.tabId);
+      return info;
     } catch (error) {
-      await this.remove(runtime, true);
+      if (this.isCurrent(runtime) && runtime.assignment.cleanupIntent === undefined) {
+        await this.cleanup(
+          runtime,
+          error instanceof StaleProvisionError ? "release" : "discard",
+        );
+      }
       throw error;
     }
   }
@@ -106,20 +151,23 @@ export class SessionManager implements RuntimeHost {
       runtime === undefined ||
       runtime.sessionId !== input.sessionId ||
       runtime.assignment.leaseEpoch !== input.leaseEpoch ||
-      runtime.assignment.browserEpoch !== input.browserEpoch
+      runtime.assignment.browserEpoch !== input.browserEpoch ||
+      runtime.assignment.cleanupIntent !== undefined
     ) {
       return false;
     }
-    runtime.connect(input.sessionTicket);
-    return true;
+    try {
+      runtime.connect(input.sessionTicket);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
-  async closeLease(input: {
-    sessionId: string;
-    leaseId: string;
-    leaseEpoch: number;
-    browserEpoch: string;
-  }): Promise<boolean> {
+  async closeLease(
+    input: ClosureRecord,
+    intent: CleanupIntent = "release",
+  ): Promise<boolean> {
     const runtime = this.byLease.get(input.leaseId);
     if (
       runtime === undefined ||
@@ -127,29 +175,52 @@ export class SessionManager implements RuntimeHost {
       runtime.assignment.leaseEpoch !== input.leaseEpoch ||
       runtime.assignment.browserEpoch !== input.browserEpoch
     ) {
-      return false;
+      return intent === "release" && this.hasOutboxEntry(input);
     }
-    return this.remove(runtime, true);
+    return this.cleanup(runtime, intent);
   }
 
-  async restoreSameEpoch(): Promise<void> {
-    const stored = await browser.storage.session.get(ASSIGNMENTS_KEY);
-    const value = stored[ASSIGNMENTS_KEY];
-    if (!Array.isArray(value)) return;
+  async restoreSameEpoch(
+    unreconciledIntent: CleanupIntent = "recover",
+  ): Promise<void> {
+    const stored = await browser.storage.session.get(MANAGER_STATE_KEY);
+    const persisted = parseManagerState(stored[MANAGER_STATE_KEY]);
+    this.closedOutbox = persisted.closedOutbox;
     const targets = await browser.debugger.getTargets();
-    for (const raw of value) {
-      if (!isAssignment(raw) || raw.browserEpoch !== this.browserEpoch()) continue;
-      const target = targets.find((candidate) => candidate.tabId === raw.tabId);
-      if (target?.attached !== true) continue;
-      const runtime = new SessionRuntime(raw, this);
+    for (const raw of persisted.assignments) {
+      if (raw.browserEpoch !== this.browserEpoch()) continue;
+      const runtime = new SessionRuntime({ ...raw }, this);
       this.install(runtime);
+      if (runtime.assignment.cleanupIntent !== undefined) {
+        if (
+          unreconciledIntent === "discard" ||
+          (unreconciledIntent === "release" &&
+            runtime.assignment.cleanupIntent === "recover")
+        ) {
+          runtime.beginCleanup(unreconciledIntent);
+        }
+        continue;
+      }
+      const target = targets.find((candidate) => candidate.tabId === raw.tabId);
+      if (target?.attached !== true) {
+        runtime.beginCleanup(unreconciledIntent);
+        continue;
+      }
       try {
         await runtime.reconcileSameEpoch();
       } catch {
-        this.uninstall(runtime);
+        runtime.beginCleanup(unreconciledIntent);
       }
     }
     await this.persist();
+    await this.retryCleanup();
+  }
+
+  async retryCleanup(): Promise<void> {
+    for (const runtime of [...this.byLease.values()]) {
+      const intent = runtime.assignment.cleanupIntent;
+      if (intent !== undefined) await this.cleanup(runtime, intent);
+    }
   }
 
   async onCdpEvent(
@@ -181,20 +252,63 @@ export class SessionManager implements RuntimeHost {
     }
   }
 
-  async stopAll(): Promise<void> {
+  async stopAll(intent: CleanupIntent = "release"): Promise<void> {
     for (const runtime of [...this.byLease.values()]) {
-      await this.remove(runtime, true);
+      await this.cleanup(runtime, intent);
     }
   }
 
-  assignments(): RuntimeAssignment[] {
-    return [...this.byLease.values()].map((runtime) => runtime.assignment);
+  assignments(): ManagedAssignment[] {
+    return [...this.byLease.values()].map((runtime) => ({
+      ...runtime.assignment,
+      allowedOrigins: [...runtime.assignment.allowedOrigins],
+    }));
+  }
+
+  pendingCleanup(): boolean {
+    return [...this.byLease.values()].some(
+      (runtime) => runtime.assignment.cleanupIntent !== undefined,
+    );
+  }
+
+  pendingReleaseCleanup(): boolean {
+    return [...this.byLease.values()].some(
+      (runtime) => runtime.assignment.cleanupIntent === "release",
+    );
+  }
+
+  closureOutbox(): ClosureRecord[] {
+    return this.closedOutbox.map((entry) => ({ ...entry }));
+  }
+
+  async acknowledgeClosure(entry: ClosureRecord): Promise<void> {
+    const previous = this.closedOutbox;
+    this.closedOutbox = previous.filter(
+      (candidate) => !sameClosure(candidate, entry),
+    );
+    try {
+      await this.persist();
+    } catch (error) {
+      this.closedOutbox = previous;
+      throw error;
+    }
+  }
+
+  async discardClosureOutbox(): Promise<void> {
+    if (this.closedOutbox.length === 0) return;
+    const previous = this.closedOutbox;
+    this.closedOutbox = [];
+    try {
+      await this.persist();
+    } catch (error) {
+      this.closedOutbox = previous;
+      throw error;
+    }
   }
 
   async onFenced(runtime: SessionRuntime): Promise<void> {
     if (!this.isCurrent(runtime)) return;
-    this.uninstall(runtime);
-    await this.persist();
+    await this.cleanup(runtime, "recover");
   }
 
   async onTabChanged(_runtime: SessionRuntime): Promise<void> {
@@ -208,22 +322,61 @@ export class SessionManager implements RuntimeHost {
   }
 
   private uninstall(runtime: SessionRuntime): void {
-    if (this.bySession.get(runtime.sessionId) === runtime) this.bySession.delete(runtime.sessionId);
-    if (this.byLease.get(runtime.leaseId) === runtime) this.byLease.delete(runtime.leaseId);
-    if (this.byTab.get(runtime.tabId) === runtime) this.byTab.delete(runtime.tabId);
+    if (this.bySession.get(runtime.sessionId) === runtime) {
+      this.bySession.delete(runtime.sessionId);
+    }
+    if (this.byLease.get(runtime.leaseId) === runtime) {
+      this.byLease.delete(runtime.leaseId);
+    }
+    if (this.byTab.get(runtime.tabId) === runtime) {
+      this.byTab.delete(runtime.tabId);
+    }
   }
 
-  private async remove(runtime: SessionRuntime, closeTab: boolean): Promise<boolean> {
-    if (!(await runtime.close(closeTab))) return false;
+  private async cleanup(
+    runtime: SessionRuntime,
+    intent: CleanupIntent,
+  ): Promise<boolean> {
+    if (!this.isCurrent(runtime)) return false;
+    runtime.beginCleanup(intent);
+    await this.persist();
+    if (!(await runtime.close(true))) {
+      await this.persist();
+      return false;
+    }
+    if (runtime.assignment.cleanupIntent === "release") {
+      this.enqueueClosure(runtime.assignment);
+    }
     this.uninstall(runtime);
-    await this.persist().catch(() => {});
+    await this.persist();
     return true;
   }
 
+  private enqueueClosure(assignment: RuntimeAssignment): void {
+    const entry: ClosureRecord = {
+      sessionId: assignment.sessionId,
+      leaseId: assignment.leaseId,
+      leaseEpoch: assignment.leaseEpoch,
+      browserEpoch: assignment.browserEpoch,
+    };
+    if (!this.hasOutboxEntry(entry)) this.closedOutbox.push(entry);
+  }
+
+  private hasOutboxEntry(entry: ClosureRecord): boolean {
+    return this.closedOutbox.some((candidate) => sameClosure(candidate, entry));
+  }
+
   private async persist(): Promise<void> {
-    await browser.storage.session.set({
-      [ASSIGNMENTS_KEY]: this.assignments(),
+    const write = this.persistTail.then(async () => {
+      const state: PersistedManagerState = {
+        version: 2,
+        assignments: this.assignments(),
+        closedOutbox: this.closureOutbox(),
+      };
+      await browser.storage.session.set({ [MANAGER_STATE_KEY]: state });
     });
+    this.persistTail = write.catch(() => {});
+    await write;
   }
 
   private async tabInfo(tabId: number): Promise<TabInfo> {
@@ -237,9 +390,43 @@ export class SessionManager implements RuntimeHost {
   }
 }
 
-function isAssignment(value: unknown): value is RuntimeAssignment {
+export class StaleProvisionError extends Error {
+  constructor() {
+    super("provisioning was superseded");
+  }
+}
+
+function parseManagerState(value: unknown): PersistedManagerState {
+  if (Array.isArray(value)) {
+    return {
+      version: 2,
+      assignments: value.filter(isManagedAssignment),
+      closedOutbox: [],
+    };
+  }
+  if (typeof value !== "object" || value === null) return emptyManagerState();
+  const candidate = value as Partial<PersistedManagerState>;
+  if (
+    candidate.version !== 2 ||
+    !Array.isArray(candidate.assignments) ||
+    !Array.isArray(candidate.closedOutbox)
+  ) {
+    return emptyManagerState();
+  }
+  return {
+    version: 2,
+    assignments: candidate.assignments.filter(isManagedAssignment),
+    closedOutbox: candidate.closedOutbox.filter(isClosureRecord),
+  };
+}
+
+function emptyManagerState(): PersistedManagerState {
+  return { version: 2, assignments: [], closedOutbox: [] };
+}
+
+function isManagedAssignment(value: unknown): value is ManagedAssignment {
   if (typeof value !== "object" || value === null) return false;
-  const item = value as Partial<RuntimeAssignment>;
+  const item = value as Partial<ManagedAssignment>;
   return (
     typeof item.sessionId === "string" &&
     typeof item.leaseId === "string" &&
@@ -248,6 +435,30 @@ function isAssignment(value: unknown): value is RuntimeAssignment {
     Array.isArray(item.allowedOrigins) &&
     item.allowedOrigins.every((origin) => typeof origin === "string") &&
     typeof item.tabId === "number" &&
-    typeof item.windowId === "number"
+    typeof item.windowId === "number" &&
+    (item.cleanupIntent === undefined ||
+      item.cleanupIntent === "recover" ||
+      item.cleanupIntent === "release" ||
+      item.cleanupIntent === "discard")
+  );
+}
+
+function isClosureRecord(value: unknown): value is ClosureRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Partial<ClosureRecord>;
+  return (
+    typeof item.sessionId === "string" &&
+    typeof item.leaseId === "string" &&
+    typeof item.leaseEpoch === "number" &&
+    typeof item.browserEpoch === "string"
+  );
+}
+
+function sameClosure(left: ClosureRecord, right: ClosureRecord): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.leaseId === right.leaseId &&
+    left.leaseEpoch === right.leaseEpoch &&
+    left.browserEpoch === right.browserEpoch
   );
 }

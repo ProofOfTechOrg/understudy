@@ -26,7 +26,7 @@ All `/v1` caller endpoints require `Authorization: Bearer <caller_token>`. The s
 | `POST /v1/sessions` with an unattended body | Allocate and provision a device lease |
 | `GET /v1/devices` | Read device status and capacity |
 | `GET /v1/sessions/:id` | Read active or terminal session status |
-| `DELETE /v1/sessions/:id` | Detach attended or close unattended |
+| `DELETE /v1/sessions/:id` | Retire attended authority or request unattended cleanup |
 | `POST /v1/sessions/:id/commands` | Admit a strict command request |
 | `GET /v1/sessions/:id/commands/:commandId` | Poll a protocol-2 command |
 | `POST /v1/device/connect-ticket` | Mint a device control ticket |
@@ -46,6 +46,10 @@ The API canonicalizes origins and hashes the profile key with tenant domain sepa
 Command requests are limited to 128 KiB and parsed against `CommandRequestSchema`. Unknown fields and malformed `dryRun` values return `400` before WebSocket traffic or durable command mutation.
 
 Protocol-2 connectors send `Understudy-Command-Contract: 2`. They can receive `202` and poll the returned status URL. Legacy connectors never receive `202`.
+
+Attended deletion persists terminal authority immediately, cancels active attempts, closes the extension socket with code `4003`, and returns `204`. Repeated attended deletion also returns `204`. Later commands return `410`, and reconnecting extensions receive code `4003`.
+
+Unattended deletion remains acknowledgement-driven. It returns `202` while the extension still owns the tab or the matching closure frame is pending, then returns `204` after cleanup confirmation.
 
 ## Configure secrets
 

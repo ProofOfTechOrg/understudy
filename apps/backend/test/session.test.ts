@@ -6,6 +6,7 @@ import type { Command } from "@understudy/protocol";
 import { mintSessionId } from "../src/auth";
 import type { SessionAgent } from "../src/session";
 import type { SessionState } from "../src/types";
+import { requestFingerprint } from "../src/validation";
 import { EXTENSION_TOKEN_A, EXTENSION_TOKEN_B } from "./tokens";
 import { BASE, getSessionStub, getWebSocket } from "./helpers";
 
@@ -348,7 +349,9 @@ describe("dispatch / resolvePending", () => {
 
       // #then only the replacement receives it; there is no broadcast
       expect(previous.send).not.toHaveBeenCalled();
-      expect(replacement.send).toHaveBeenCalledWith(JSON.stringify(cmd));
+      await vi.waitFor(() => {
+        expect(replacement.send).toHaveBeenCalledWith(JSON.stringify(cmd));
+      });
 
       // #when the old socket forges the matching result, it is ignored even
       // though its authorized bit is still true
@@ -389,8 +392,9 @@ describe("dispatch / resolvePending", () => {
       Object.assign(instance, { getConnections: () => [FAKE_CONNECTION] });
       setAuthoritative(instance);
       const dispatchPromise = instance.dispatch(cmd);
-      // The marker is parked synchronously before dispatch() suspends.
-      expect(instance.state.awaitingCommandIds).toContain("s1");
+      await vi.waitFor(() => {
+        expect(instance.state.awaitingCommandIds).toContain("s1");
+      });
 
       // #when the matching result event arrives from the extension
       await instance.onMessage(
@@ -458,6 +462,236 @@ describe("DO eviction resilience (DL-007)", () => {
     // #then it is reconciled (marker cleared) rather than mis-resolving or throwing
     await runInDurableObject(stub, (instance: SessionAgent) => {
       expect(instance.state.awaitingCommandIds).toEqual([]);
+      expect(instance.state.completedWrites).toEqual([]);
+    });
+  });
+});
+
+describe("legacy replay tombstones", () => {
+  it("retains and replays only an exact late write action result", async () => {
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    const command: Command = {
+      type: "click",
+      commandId: "late-write",
+      ref: "owned-ref",
+    };
+    const requestFingerprintValue = await requestFingerprint(command, false);
+    const tombstone = {
+      commandId: command.commandId,
+      commandType: command.type,
+      requestFingerprint: requestFingerprintValue,
+    } as const;
+
+    const outcomes = await runInDurableObject(
+      stub,
+      async (instance: SessionAgent) => {
+        Object.assign(instance, {
+          getConnections: () => [FAKE_CONNECTION],
+        });
+        instance.setState({
+          ...instance.state,
+          activeConnectionId: FAKE_CONNECTION.id,
+          awaitingCommandIds: [command.commandId],
+          awaitingCommands: [tombstone],
+          legacyCommandTombstones: [tombstone],
+        });
+        await instance.onMessage(
+          FAKE_CONNECTION,
+          JSON.stringify({
+            type: "action_result",
+            commandId: command.commandId,
+            ok: true,
+          }),
+        );
+        const replay = await instance.dispatch(command);
+        const conflict = await instance.dispatch({
+          ...command,
+          ref: "changed-ref",
+        });
+        return {
+          replay,
+          conflict,
+          completedWrites: instance.state.completedWrites,
+        };
+      },
+    );
+
+    expect(outcomes.completedWrites).toEqual([
+      {
+        ...tombstone,
+        event: {
+          type: "action_result",
+          commandId: command.commandId,
+          ok: true,
+        },
+      },
+    ]);
+    expect(outcomes.replay).toEqual({
+      ok: true,
+      event: {
+        type: "action_result",
+        commandId: command.commandId,
+        ok: true,
+      },
+    });
+    expect(outcomes.conflict).toMatchObject({
+      ok: false,
+      reason: "id_conflict",
+    });
+  });
+
+  it("never retains a late read result", async () => {
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    const command: Command = {
+      type: "snapshot",
+      commandId: "late-read",
+      mode: "a11y",
+    };
+    const tombstone = {
+      commandId: command.commandId,
+      commandType: command.type,
+      requestFingerprint: await requestFingerprint(command, false),
+    } as const;
+
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      Object.assign(instance, {
+        getConnections: () => [FAKE_CONNECTION],
+      });
+      instance.setState({
+        ...instance.state,
+        activeConnectionId: FAKE_CONNECTION.id,
+        awaitingCommandIds: [command.commandId],
+        awaitingCommands: [tombstone],
+        legacyCommandTombstones: [tombstone],
+      });
+      await instance.onMessage(
+        FAKE_CONNECTION,
+        JSON.stringify({
+          type: "snapshot_result",
+          commandId: command.commandId,
+          tree: [],
+          tabId: 7,
+          url: "https://example.com/",
+        }),
+      );
+      expect(instance.state.completedWrites).toEqual([]);
+      expect(instance.state.awaitingCommandIds).toEqual([]);
+    });
+  });
+
+  it("rejects an oversized late write result from the replay cache", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    const command: Command = {
+      type: "click",
+      commandId: "late-write-oversized",
+      ref: "owned-ref",
+    };
+    const tombstone = {
+      commandId: command.commandId,
+      commandType: command.type,
+      requestFingerprint: await requestFingerprint(command, false),
+    } as const;
+
+    await runInDurableObject(stub, (instance: SessionAgent) => {
+      const harness = instance as unknown as {
+        rememberLegacyLateResult(
+          marker: typeof tombstone,
+          event: {
+            type: "action_result";
+            commandId: string;
+            ok: boolean;
+            error: string;
+          },
+        ): void;
+      };
+      harness.rememberLegacyLateResult(tombstone, {
+        type: "action_result",
+        commandId: command.commandId,
+        ok: false,
+        error: "x".repeat(17 * 1024),
+      });
+      expect(instance.state.completedWrites).toEqual([]);
+    });
+  });
+
+  it("treats a pre-migration completed write as an ID-only conflict", async () => {
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    const outcome = await runInDurableObject(
+      stub,
+      async (instance: SessionAgent) => {
+        instance.setState({
+          ...instance.state,
+          completedWrites: [
+            {
+              commandId: "legacy-completed",
+              event: {
+                type: "action_result",
+                commandId: "legacy-completed",
+                ok: true,
+              },
+            },
+          ],
+        });
+        return instance.dispatch({
+          type: "click",
+          commandId: "legacy-completed",
+          ref: "owned-ref",
+        });
+      },
+    );
+    expect(outcome).toMatchObject({
+      ok: false,
+      reason: "id_conflict",
+    });
+  });
+
+  it("keeps a pre-migration awaiting ID fenced across hello until its late event arrives", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      Object.assign(instance, {
+        getConnections: () => [FAKE_CONNECTION],
+      });
+      instance.setState({
+        ...instance.state,
+        activeConnectionId: FAKE_CONNECTION.id,
+        awaitingCommandIds: ["legacy-awaiting"],
+        awaitingCommands: undefined,
+      });
+
+      await instance.onMessage(
+        FAKE_CONNECTION,
+        JSON.stringify({
+          type: "hello",
+          browser: "chrome",
+          extVersion: "1.0.0",
+          tabs: [],
+        }),
+      );
+      expect(instance.state.awaitingCommandIds).toEqual(["legacy-awaiting"]);
+      await expect(
+        instance.dispatch({
+          type: "click",
+          commandId: "legacy-awaiting",
+          ref: "owned-ref",
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        reason: "id_conflict",
+      });
+
+      await instance.onMessage(
+        FAKE_CONNECTION,
+        JSON.stringify({
+          type: "action_result",
+          commandId: "legacy-awaiting",
+          ok: true,
+        }),
+      );
+      expect(instance.state.awaitingCommandIds).toEqual([]);
+      expect(instance.state.completedWrites).toEqual([]);
     });
   });
 });
@@ -474,11 +708,13 @@ describe("hello resync", () => {
     const cmd: Command = { type: "get_tabs", commandId: "resync-1" };
     let outcome!: ReturnType<SessionAgent["dispatch"]>;
 
-    await runInDurableObject(stub, (instance: SessionAgent) => {
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
       Object.assign(instance, { getConnections: () => [FAKE_CONNECTION] });
       setAuthoritative(instance);
       outcome = instance.dispatch(cmd);
-      expect(instance.state.awaitingCommandIds).toContain("resync-1");
+      await vi.waitFor(() => {
+        expect(instance.state.awaitingCommandIds).toContain("resync-1");
+      });
     });
 
     // #when a fresh `hello` arrives (the extension resynced)

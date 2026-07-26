@@ -450,6 +450,132 @@ describe("command round-trip via a live extension WebSocket", () => {
   });
 });
 
+describe("attended session retirement", () => {
+  it("retires authority on the first DELETE and rejects every later command or reconnect", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const closeFrame = waitForServerFrame(socket, "close_session");
+    const socketClosed = waitForSocketClose(socket);
+
+    const first = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(first.status).toBe(204);
+    expect(await closeFrame).toEqual({
+      type: "close_session",
+      closeTab: false,
+    });
+    expect(await socketClosed).toEqual({
+      code: 4003,
+      reason: "session deleted",
+    });
+
+    const repeated = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(repeated.status).toBe(204);
+
+    const legacy = await postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "get_tabs",
+      commandId: "after-delete-legacy",
+    });
+    expect(legacy.status).toBe(410);
+    expect(await legacy.json()).toEqual({ error: "session is terminal" });
+
+    const v2 = await postCommandV2(sessionId, CALLER_TOKEN_A, {
+      type: "get_tabs",
+      commandId: "after-delete-v2",
+    });
+    expect(v2.status).toBe(410);
+    expect(await v2.json()).toEqual({ error: "session is terminal" });
+
+    const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+    const fill = await postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "fill_secret",
+      commandId: "after-delete-fill",
+      ref: "owned-ref",
+      secretRef: "vault://tenantA/terminal",
+    });
+    expect(fill.status).toBe(410);
+    expect(vaultGetSpy).not.toHaveBeenCalled();
+    vaultGetSpy.mockRestore();
+
+    const reconnectResponse = await exports.default.fetch(
+      new Request(
+        `${BASE}/agents/session/${sessionId}?token=${EXTENSION_TOKEN_A}`,
+        { headers: { Upgrade: "websocket" } },
+      ),
+    );
+    const reconnect = getWebSocket(reconnectResponse);
+    const reconnectClosed = waitForSocketClose(reconnect);
+    reconnect.accept();
+    expect(await reconnectClosed).toEqual({
+      code: 4003,
+      reason: "session deleted",
+    });
+  });
+
+  it("abandons an admitted legacy command as terminal when DELETE races its result", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const incoming = waitForCommand(socket);
+    const command = postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "get_tabs",
+      commandId: "delete-race-legacy",
+    });
+    await incoming;
+
+    const deleted = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(deleted.status).toBe(204);
+    const response = await command;
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: "session is terminal" });
+  });
+
+  it("never grants a prepared v2 write after DELETE", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    const observed: SessionServerFrame[] = [];
+    socket.addEventListener("message", (event: MessageEvent) => {
+      const parsed = safeParseSessionServerFrame(JSON.parse(event.data as string));
+      if (parsed.success) observed.push(parsed.data);
+    });
+    const preparePromise = waitForServerFrame(socket, "write_prepare");
+    const command = postCommandV2(sessionId, CALLER_TOKEN_A, {
+      type: "click",
+      commandId: "delete-race-v2",
+      ref: "owned-ref",
+    });
+    const prepare = await preparePromise;
+
+    const deleted = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(deleted.status).toBe(204);
+    expect(prepare.commandId).toBe("delete-race-v2");
+    const response = await command;
+    expect(response.status).toBe(410);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(
+      observed.filter(
+        (frame) =>
+          frame.type === "write_grant" &&
+          frame.command.commandId === "delete-race-v2",
+      ),
+    ).toEqual([]);
+  });
+});
+
 describe("command contract v2", () => {
   it("durably prepares and grants a write before accepting its result", async () => {
     const sessionId = await openSession(CALLER_TOKEN_A);
@@ -1680,8 +1806,8 @@ describe("idempotent write replay (stable commandId contract)", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       // #then a retry of the same commandId still replays the recorded Event
-      // unchanged - completedWrites is untouched by the resync, and replay is
-      // keyed by commandId alone (no generation dependence)
+      // unchanged: completedWrites survives resync, and the exact command type
+      // and request fingerprint still match.
       const retryRes = await postCommand(sessionId, CALLER_TOKEN_A, {
         type: "click",
         commandId: "ik_resync:click",
@@ -1855,7 +1981,7 @@ describe("two-tenant vault isolation (cross-tenant secretRef scoping, server-sid
     }
   });
 
-  it("refuses a cross-tenant secretRef before replay - a reused commandId cannot serve a cached own-tenant result", async () => {
+  it("rejects a changed cross-tenant fill under a completed commandId", async () => {
     // #given tenantB completed a legitimate OWN-tenant fill under a commandId
     // (caching an ok:true write result), and tenantA's secret is also seeded
     await seedVault("vault://tenantB/own-pw", "tenantB-own");
@@ -1889,14 +2015,10 @@ describe("two-tenant vault isolation (cross-tenant secretRef scoping, server-sid
           secretRef: "vault://tenantA/okta-pw",
         });
 
-        // #then the guard (which runs BEFORE replay) refuses it: the cached
-        // ok:true is NOT served, and tenantA's vault is never read
-        expect(await res.json()).toEqual({
-          type: "action_result",
-          commandId: "ik_shared:fill",
-          ok: false,
-          error: "fill_secret: secret could not be resolved",
-        });
+        // #then exact replay binding rejects the changed request without
+        // serving the cached result or reading tenantA's vault.
+        expect(res.status).toBe(409);
+        expect(await res.json()).toEqual({ code: "command_id_conflict" });
         expect(vaultGetSpy).not.toHaveBeenCalled();
       } finally {
         vaultGetSpy.mockRestore();

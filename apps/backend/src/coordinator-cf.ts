@@ -16,7 +16,11 @@ import {
   SESSION_NOT_CONNECTED,
 } from "./coordinator";
 import type { PendingCommand, PendingMap, SessionCoordinator } from "./coordinator";
-import type { SessionStatus } from "./types";
+import type {
+  LegacyCommandTombstone,
+  PersistedLegacyAwaiting,
+  SessionStatus,
+} from "./types";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -38,14 +42,16 @@ export interface CoordinatorHost {
    * truth).
    */
   hasAuthorizedConnection(): boolean;
-  /** Reads the persisted awaiting-commandId marker (SessionState.awaitingCommandIds). */
-  getAwaitingCommandIds(): string[];
-  /** Persists the awaiting-commandId marker via the DO's setState. */
-  persistAwaitingCommandIds(ids: string[]): void;
+  getAwaitingCommands(): PersistedLegacyAwaiting[];
+  persistAwaitingCommands(commands: PersistedLegacyAwaiting[]): void;
+  persistCommandTombstone(tombstone: LegacyCommandTombstone): void;
   /** Persists the session status via the DO's setState. */
   persistStatus(status: SessionStatus): void;
   /** Persists a result that arrived after the caller's timeout tombstoned it. */
-  persistLateResult(event: Event): void;
+  persistLateResult(
+    tombstone: PersistedLegacyAwaiting,
+    event: Event,
+  ): void;
 }
 
 export class CfSessionCoordinator implements SessionCoordinator {
@@ -81,7 +87,10 @@ export class CfSessionCoordinator implements SessionCoordinator {
    * timeout below is the caller-side guarantee for that case: `send()`
    * always settles even if the WebSocket is gone.
    */
-  send(cmd: Command): Promise<Event> {
+  send(
+    cmd: Command,
+    tombstone: LegacyCommandTombstone,
+  ): Promise<Event> {
     // Fail fast instead of parking a promise that can only time out: with no
     // deliverable socket, sendToExtension writes to nobody, so the 30s
     // timeout (surfacing as an opaque 500) would be the guaranteed outcome -
@@ -102,7 +111,7 @@ export class CfSessionCoordinator implements SessionCoordinator {
         new Error(`${DUPLICATE_COMMAND}: ${cmd.commandId} is already awaiting its event`),
       );
     }
-    if (this.pending.size > 0 || this.host.getAwaitingCommandIds().length > 0) {
+    if (this.pending.size > 0 || this.host.getAwaitingCommands().length > 0) {
       return Promise.reject(
         new Error(`${SESSION_BUSY}: another command owns the session slot`),
       );
@@ -116,9 +125,16 @@ export class CfSessionCoordinator implements SessionCoordinator {
         if (pending !== undefined) pending.timedOut = true;
       }, this.timeoutMs);
 
-      const pendingCommand: PendingCommand = { resolve, reject, timer, timedOut: false };
+      const pendingCommand: PendingCommand = {
+        resolve,
+        reject,
+        timer,
+        timedOut: false,
+        tombstone,
+      };
       this.pending.set(cmd.commandId, pendingCommand);
-      this.addAwaiting(cmd.commandId);
+      this.host.persistCommandTombstone(tombstone);
+      this.addAwaiting(tombstone);
 
       try {
         this.host.sendToExtension(JSON.stringify(cmd));
@@ -141,10 +157,10 @@ export class CfSessionCoordinator implements SessionCoordinator {
    * hibernate, wiping the in-memory `pending` Map. If a stray or duplicate
    * `*_result` for an already-settled commandId arrives after that wake,
    * there is no resolver left to call for it - the persisted marker is the
-   * only remaining record that it was ever outstanding. Recognize that
-   * case, drop the event, and reconcile the marker, instead of leaking a
-   * phantom "awaiting" entry in SessionState forever or mis-resolving some
-   * unrelated later command that happens to reuse pending-map bookkeeping.
+   * only remaining record that it was ever outstanding. Recognize that case,
+   * retain only an eligible bounded write result, and reconcile the marker
+   * instead of leaking a phantom "awaiting" entry in SessionState forever or
+   * mis-resolving an unrelated later command.
    */
   resolvePending(ev: Event): void {
     const commandId = "commandId" in ev ? ev.commandId : undefined;
@@ -153,16 +169,21 @@ export class CfSessionCoordinator implements SessionCoordinator {
     const pendingCommand = this.pending.get(commandId);
     if (pendingCommand) {
       clearTimeout(pendingCommand.timer);
-      if (pendingCommand.timedOut) this.host.persistLateResult(ev);
+      if (pendingCommand.timedOut) {
+        this.host.persistLateResult(pendingCommand.tombstone, ev);
+      }
       pendingCommand.resolve(ev);
       this.pending.delete(commandId);
       this.dropAwaiting(commandId);
       return;
     }
 
-    if (this.host.getAwaitingCommandIds().includes(commandId)) {
+    const awaiting = this.host
+      .getAwaitingCommands()
+      .find((entry) => entry.commandId === commandId);
+    if (awaiting !== undefined) {
       // Orphaned/late result: reconcile the marker, resolve nothing.
-      this.host.persistLateResult(ev);
+      this.host.persistLateResult(awaiting, ev);
       this.dropAwaiting(commandId);
       return;
     }
@@ -175,9 +196,9 @@ export class CfSessionCoordinator implements SessionCoordinator {
   }
 
   /**
-   * Rejects every outstanding command and clears all bookkeeping. M-004
-   * calls this on a fresh `hello` resync, when the extension side is known
-   * to have dropped whatever was in flight.
+   * Rejects every in-memory command and clears typed awaiting metadata.
+   * Pre-migration ID-only markers remain fenced until their late event is
+   * reconciled because their write/read classification is unknown.
    */
   abandonInFlight(reason: string): void {
     for (const pendingCommand of this.pending.values()) {
@@ -185,17 +206,25 @@ export class CfSessionCoordinator implements SessionCoordinator {
       pendingCommand.reject(new Error(reason));
     }
     this.pending.clear();
-    this.host.persistAwaitingCommandIds([]);
+    this.host.persistAwaitingCommands(
+      this.host
+        .getAwaitingCommands()
+        .filter((entry) => !("commandType" in entry)),
+    );
   }
 
-  private addAwaiting(commandId: string): void {
-    const current = this.host.getAwaitingCommandIds();
-    const next = current.includes(commandId) ? current : [...current, commandId];
-    this.host.persistAwaitingCommandIds(next);
+  private addAwaiting(tombstone: LegacyCommandTombstone): void {
+    const current = this.host.getAwaitingCommands();
+    const next = current.some((entry) => entry.commandId === tombstone.commandId)
+      ? current
+      : [...current, tombstone];
+    this.host.persistAwaitingCommands(next);
   }
 
   private dropAwaiting(commandId: string): void {
-    const current = this.host.getAwaitingCommandIds();
-    this.host.persistAwaitingCommandIds(current.filter((id) => id !== commandId));
+    const current = this.host.getAwaitingCommands();
+    this.host.persistAwaitingCommands(
+      current.filter((entry) => entry.commandId !== commandId),
+    );
   }
 }

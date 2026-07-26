@@ -9,6 +9,7 @@
  */
 
 import type {
+  Command,
   CommandState,
   DialogDelivery,
   DialogRecord,
@@ -97,10 +98,29 @@ export interface Env {
  */
 export type SessionStatus = "pending" | "connected" | "detached";
 
+export interface LegacyCommandTombstone {
+  commandId: string;
+  commandType: Command["type"];
+  requestFingerprint: string;
+}
+
+export interface CompletedLegacyWrite extends LegacyCommandTombstone {
+  event: Extract<Event, { type: "action_result" }>;
+}
+
+export type PersistedLegacyAwaiting =
+  | LegacyCommandTombstone
+  | { commandId: string };
+
+export type PersistedCompletedLegacyWrite =
+  | CompletedLegacyWrite
+  | { commandId: string; event: Event };
+
 /**
  * Agents-SDK Durable Object state for one session. Must stay JSON-
- * serializable (setState round-trips through JSON): awaitingCommandIds is a
- * string array standing in for a Set, not a JS Set/Map (DL-007).
+ * serializable because setState round-trips through JSON. Legacy
+ * awaitingCommandIds remain readable while new writes persist typed command
+ * tombstones.
  */
 export interface SessionState {
   browser: HelloBrowserInfo | null;
@@ -109,6 +129,7 @@ export interface SessionState {
   /** The refMap generation; bumped on navigation / hello resync. */
   generation: number;
   awaitingCommandIds: string[];
+  awaitingCommands?: PersistedLegacyAwaiting[];
   status: SessionStatus;
   /**
    * The one authenticated extension connection allowed to receive Commands
@@ -125,10 +146,12 @@ export interface SessionState {
    * a write under the same commandId (the connector derives it from the
    * breakwater idempotency key) gets the recorded Event back instead of a
    * second execution, closing the write-performed-but-response-lost gap.
-   * Only ever holds action_results for writes: small, and plaintext-free by
-   * the DL-004 construction (fill_secret results carry ok/error only).
+   * New entries hold bounded action_results plus the exact command type and
+   * request fingerprint. Legacy ID-only entries remain conflict tombstones.
+   * Fill-secret results carry only ok/error and never plaintext.
    */
-  completedWrites: { commandId: string; event: Event }[];
+  completedWrites: PersistedCompletedLegacyWrite[];
+  legacyCommandTombstones?: LegacyCommandTombstone[];
   /**
    * Recent page dialogs the extension handled (alert/confirm/prompt/
    * beforeunload), oldest first, capped in session.ts. Surfaced to the consumer
@@ -177,7 +200,9 @@ export type DispatchOutcome =
         | "timed_out"
         | "resynced"
         | "duplicate_in_flight"
-        | "session_busy";
+        | "session_busy"
+        | "terminal_session"
+        | "id_conflict";
       message: string;
     };
 

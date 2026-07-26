@@ -1,14 +1,18 @@
+import {
+  WS_CLOSE_REPLACED,
+  WS_CLOSE_SESSION_TERMINAL,
+} from "@understudy/protocol";
+
 interface WsHandlers {
   onCommand: (cmd: unknown) => void;
   onOpen: () => void;
-  onClose?: () => void;
+  onClose?: (event: CloseEvent) => void;
   onConnecting?: () => void;
   heartbeatFrame?: () => unknown | null;
 }
 
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_CAP_MS = 30_000;
-const REPLACED_BY_NEW_EXTENSION_CODE = 4001;
 // The browser WS API exposes no protocol ping frame to JS, so an app-level pong
 // is the only lever; sending one under the MV3 SW's ~30s idle timeout keeps the
 // worker alive as long as the socket stays open (chrome.alarms is the backstop
@@ -30,11 +34,13 @@ export class ReconnectingWs {
     this.connect();
   }
 
-  send(frame: unknown): void {
+  send(frame: unknown): boolean {
     const socket = this.socket;
     if (socket !== null && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(frame));
+      return true;
     }
+    return false;
   }
 
   startHeartbeat(): void {
@@ -100,15 +106,15 @@ export class ReconnectingWs {
       this.clearHeartbeat();
       if (this.socket === socket) this.socket = null;
       if (this.stopped) return;
-      this.handlers.onClose?.();
-      if (event.code === REPLACED_BY_NEW_EXTENSION_CODE) {
-        // The backend has selected another extension connection for this
-        // session. Reconnecting would make the two extensions evict each other.
+      const terminal =
+        event.code === WS_CLOSE_REPLACED ||
+        event.code === WS_CLOSE_SESSION_TERMINAL;
+      if (terminal) {
         this.stopped = true;
         this.clearReconnect();
-        return;
       }
-      this.scheduleReconnect();
+      this.handlers.onClose?.(event);
+      if (!terminal) this.scheduleReconnect();
     });
 
     socket.addEventListener("error", () => {

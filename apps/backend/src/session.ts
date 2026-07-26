@@ -5,9 +5,13 @@ import {
   PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
   SESSION_RESULT_FRAME_MAX_BYTES,
+  WRITE_COMMAND_TYPES,
+  WS_CLOSE_REPLACED,
+  WS_CLOSE_SESSION_TERMINAL,
   isWriteCommand,
   safeParseEvent,
   safeParseSessionClientFrame,
+  utf8ByteLength,
 } from "@understudy/protocol";
 import type {
   Command,
@@ -32,6 +36,7 @@ import {
   SESSION_NOT_CONNECTED,
   SESSION_RESYNCED,
   SESSION_BUSY,
+  SESSION_TERMINAL,
 } from "./coordinator";
 import { CfSessionCoordinator } from "./coordinator-cf";
 import { resolveSecret } from "./secrets";
@@ -40,6 +45,8 @@ import type {
   CommandStatusRecord,
   DispatchOutcome,
   Env,
+  LegacyCommandTombstone,
+  PersistedLegacyAwaiting,
   SessionState,
   SessionStatus,
   V2DispatchOutcome,
@@ -51,10 +58,11 @@ import { emitTelemetry, type TelemetryEvent } from "./telemetry";
 
 type FillSecretCommand = Extract<Command, { type: "fill_secret" }>;
 
-// Bounds SessionState.completedWrites (the idempotent-retry replay record).
-// 100 write results at ~100 bytes each is well under any DO state budget
-// while covering far more retries than a consumer's per-case write count.
+// Bounds SessionState.completedWrites by both count and serialized event size.
+// The FIFO cap covers retries without allowing late results to grow state
+// without a fixed ceiling.
 const COMPLETED_WRITES_CAP = 100;
+const COMPLETED_WRITE_EVENT_MAX_BYTES = 16 * 1024;
 
 // Bounds SessionState.dialogs (the recent-dialogs surface). Dialogs are far
 // rarer than writes; 50 recent covers any realistic burst a consumer polls for.
@@ -101,6 +109,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     currentUrl: null,
     generation: 0,
     awaitingCommandIds: [],
+    awaitingCommands: [],
     status: "pending",
     activeConnectionId: null,
     completedWrites: [],
@@ -125,10 +134,18 @@ export class SessionAgent extends Agent<Env, SessionState> {
         connection.send(payload);
       },
       hasAuthorizedConnection: () => this.hasAuthorizedConnection(),
-      getAwaitingCommandIds: () => this.state.awaitingCommandIds,
-      persistAwaitingCommandIds: (ids) => this.setState({ ...this.state, awaitingCommandIds: ids }),
+      getAwaitingCommands: () => this.awaitingLegacyCommands(),
+      persistAwaitingCommands: (commands) =>
+        this.setState({
+          ...this.state,
+          awaitingCommands: commands,
+          awaitingCommandIds: commands.map((entry) => entry.commandId),
+        }),
+      persistCommandTombstone: (tombstone) =>
+        this.rememberLegacyCommandTombstone(tombstone),
       persistStatus: (status) => this.setState({ ...this.state, status }),
-      persistLateResult: (event) => this.rememberLegacyLateResult(event),
+      persistLateResult: (tombstone, event) =>
+        this.rememberLegacyLateResult(tombstone, event),
     });
     this.sql`
       CREATE TABLE IF NOT EXISTS command_journal (
@@ -171,6 +188,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    if (this.rejectTerminalConnection(connection)) return;
     const url = new URL(ctx.request.url);
     if (this.state.mode === "unattended" && this.state.unattended !== undefined) {
       const ticket = url.searchParams.get("ticket") ?? "";
@@ -179,6 +197,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
         { aud: "session", agentName: this.name },
         this.env,
       );
+      if (this.rejectTerminalConnection(connection)) return;
       const unattended = this.state.unattended;
       if (
         claims === null ||
@@ -187,9 +206,14 @@ export class SessionAgent extends Agent<Env, SessionState> {
         claims.deviceId !== unattended.deviceId ||
         claims.leaseId !== unattended.leaseId ||
         claims.leaseEpoch !== unattended.leaseEpoch ||
-        claims.browserEpoch !== unattended.browserEpoch ||
-        !(await this.consumeSessionTicket(claims))
+        claims.browserEpoch !== unattended.browserEpoch
       ) {
+        connection.close(1008, "invalid or replayed session ticket");
+        return;
+      }
+      const consumed = await this.consumeSessionTicket(claims);
+      if (this.rejectTerminalConnection(connection)) return;
+      if (!consumed) {
         connection.close(1008, "invalid or replayed session ticket");
         return;
       }
@@ -199,11 +223,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
     const token = url.searchParams.get("token") ?? "";
     const verified = await verifyExtensionToken(token, this.env);
+    if (this.rejectTerminalConnection(connection)) return;
     if (verified === null) {
       connection.close(1008, "invalid extension token");
       return;
     }
     const scope = await scopeSession(this.name, verified.tenantId, this.env);
+    if (this.rejectTerminalConnection(connection)) return;
     if (scope !== "ok") {
       connection.close(1008, "tenant mismatch");
       return;
@@ -229,7 +255,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
       if (previous.id === connection.id || !this.isAuthorizedConnection(previous)) continue;
       previous.setState({ authorized: false });
       try {
-        previous.close(4001, "replaced by newer extension connection");
+        previous.close(WS_CLOSE_REPLACED, "replaced by newer extension connection");
       } catch {
         // Authority already moved and the predecessor is demoted. A socket
         // that raced to CLOSED must not make the successful replacement's
@@ -267,6 +293,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   async onMessage(connection: Connection, message: WSMessage): Promise<void> {
+    if (this.rejectTerminalConnection(connection)) return;
     if (!this.isAuthoritativeConnection(connection)) return;
     if (typeof message !== "string") {
       connection.close(1009, "binary session frames are not supported");
@@ -521,22 +548,24 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
   async dispatch(command: Command, dryRun?: boolean): Promise<DispatchOutcome> {
     try {
+      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
+      const fingerprint = await requestFingerprint(command, dryRun === true);
+      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
+      const tombstone = legacyTombstone(command, fingerprint);
+
+      const replay = this.legacyReplay(tombstone);
+      if (replay.kind === "conflict") return this.idConflictDispatchOutcome();
+      if (replay.kind === "replay") return { ok: true, event: replay.event };
+
       if (dryRun === true && isWriteCommand(command)) {
         const probe = await this.checkRefResolves(this.commandRef(command));
+        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
         return { ok: true, event: this.simulatedResult(command.commandId, probe) };
       }
 
-      // Real dispatch (a dry-run READ also lands here: it executes for real).
-      // A write whose Event was already recorded replays it instead of
-      // executing twice - the consumer retries under the same commandId when
-      // its previous attempt's response was lost or unparseable. The
-      // completedWrite helpers no-op for reads (incl. a dry-run read), so no
-      // dryRun guard is needed here: a dry-run write already returned above.
-      const replayed = this.completedWriteEvent(command);
-      if (replayed !== undefined) return { ok: true, event: replayed };
-
-      const event = await this.coordinator.send(command);
-      this.rememberCompletedWrite(command, event);
+      const event = await this.coordinator.send(command, tombstone);
+      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
+      this.rememberCompletedWrite(tombstone, event);
       return { ok: true, event };
     } catch (err) {
       return this.dispatchFailure(err);
@@ -545,6 +574,14 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
   async fillSecret(cmd: FillSecretCommand, dryRun?: boolean): Promise<DispatchOutcome> {
     try {
+      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
+      const fingerprint = await requestFingerprint(cmd, dryRun === true);
+      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
+      const tombstone = legacyTombstone(cmd, fingerprint);
+      const replay = this.legacyReplay(tombstone);
+      if (replay.kind === "conflict") return this.idConflictDispatchOutcome();
+      if (replay.kind === "replay") return { ok: true, event: replay.event };
+
       if (dryRun === true) {
         // A dry-run the real call would refuse for tenant scoping simulates
         // that refusal (before the DOM ref probe), so a governance pre-approval
@@ -552,6 +589,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
         // never dispatch. Still zero vault access and no wire traffic:
         // secretRefInTenant only reads the signed sessionId (this.name).
         if (!(await this.secretRefInTenant(cmd.secretRef))) {
+          if (this.isTerminalSession()) return this.terminalDispatchOutcome();
           return {
             ok: true,
             event: this.simulatedResult(cmd.commandId, {
@@ -560,14 +598,19 @@ export class SessionAgent extends Agent<Env, SessionState> {
             }),
           };
         }
+        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
+        const probe = await this.checkRefResolves(cmd.ref);
+        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
         return {
           ok: true,
-          event: this.simulatedResult(cmd.commandId, await this.checkRefResolves(cmd.ref)),
+          event: this.simulatedResult(cmd.commandId, probe),
         };
       }
 
-      // Tenant scoping FIRST, before replay/gate/vault: a secretRef resolves
-      // only within this session's OWN tenant, derived from the HMAC-signed
+      // Exact replay/conflict binding runs before external work. For a new
+      // request, tenant scoping precedes the connection gate and vault: a
+      // secretRef resolves only within this session's OWN tenant, derived from
+      // the HMAC-signed
       // sessionId (this.name) - never a caller claim - so tenantB driving its
       // own session can never read vault://tenantA/... understudy owns one
       // shared vault across tenants, so this check lives here, not in a
@@ -576,13 +619,10 @@ export class SessionAgent extends Agent<Env, SessionState> {
       // dispatch, and no oracle telling "not yours" from "does not exist"
       // (DL-008).
       if (!(await this.secretRefInTenant(cmd.secretRef))) {
+        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
         return { ok: true, event: this.unresolvableSecretResult(cmd.commandId) };
       }
-
-      // Replay BEFORE the connection gate and the vault: a retry of an
-      // already-performed fill needs neither liveness nor plaintext.
-      const replayed = this.completedWriteEvent(cmd);
-      if (replayed !== undefined) return { ok: true, event: replayed };
+      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
 
       // Gate BEFORE the vault: resolving a secret for a command that cannot
       // dispatch would materialize plaintext (and emit a vault access) for
@@ -599,17 +639,23 @@ export class SessionAgent extends Agent<Env, SessionState> {
       try {
         secret = await resolveSecret(createVault(this.env), cmd.secretRef);
       } catch {
+        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
         return { ok: true, event: this.unresolvableSecretResult(cmd.commandId) };
       }
+      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
 
-      const event = await this.coordinator.send({
-        type: "type",
-        commandId: cmd.commandId,
-        ref: cmd.ref,
-        text: secret,
-        submit: cmd.submit,
-      });
-      this.rememberCompletedWrite(cmd, event);
+      const event = await this.coordinator.send(
+        {
+          type: "type",
+          commandId: cmd.commandId,
+          ref: cmd.ref,
+          text: secret,
+          submit: cmd.submit,
+        },
+        tombstone,
+      );
+      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
+      this.rememberCompletedWrite(tombstone, event);
       return { ok: true, event };
     } catch (err) {
       return this.dispatchFailure(err);
@@ -623,7 +669,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
     statusUrl: string,
   ): Promise<V2DispatchOutcome> {
     const startedAt = Date.now();
+    if (this.isTerminalSession()) {
+      return { kind: "terminal_session", commandId: command.commandId };
+    }
     const fingerprint = await requestFingerprint(command, dryRun);
+    if (this.isTerminalSession()) {
+      return { kind: "terminal_session", commandId: command.commandId };
+    }
     const existing = this.command(command.commandId);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
@@ -634,9 +686,6 @@ export class SessionAgent extends Agent<Env, SessionState> {
       }
     }
 
-    if (this.isTerminalSession()) {
-      return { kind: "terminal_session", commandId: command.commandId };
-    }
     if (!this.hasAuthorizedConnection()) {
       return { kind: "not_connected", commandId: command.commandId };
     }
@@ -709,6 +758,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
         actorPseudonym,
         credentialFill: command.type === "fill_secret" && !dryRun,
       });
+      const continuation = this.continuationOutcome(
+        attemptId,
+        "preparing",
+        command.commandId,
+        statusUrl,
+      );
+      if (continuation !== null) return continuation;
       if (!admission.ok) {
         this.sql`
           UPDATE command_journal SET state = 'not_started', updated_at = ${Date.now()}
@@ -730,6 +786,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
       }
     } else {
       const tenantId = await tenantOf(this.name, this.env);
+      const scopedContinuation = this.continuationOutcome(
+        attemptId,
+        "preparing",
+        command.commandId,
+        statusUrl,
+      );
+      if (scopedContinuation !== null) return scopedContinuation;
       if (tenantId === null) {
         this.markAttempt(attemptId, "not_started");
         return { kind: "terminal_session", commandId: command.commandId };
@@ -739,6 +802,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
         actorPseudonym,
         credentialFill: command.type === "fill_secret" && !dryRun,
       });
+      const admittedContinuation = this.continuationOutcome(
+        attemptId,
+        "preparing",
+        command.commandId,
+        statusUrl,
+      );
+      if (admittedContinuation !== null) return admittedContinuation;
       if (!admitted) {
         this.markAttempt(attemptId, "not_started");
         return { kind: "busy", commandId: command.commandId };
@@ -746,13 +816,23 @@ export class SessionAgent extends Agent<Env, SessionState> {
     }
 
     if (dryRun && isWriteCommand(command)) {
-      if (command.type === "fill_secret" && !(await this.secretRefInTenant(command.secretRef))) {
-        const event = this.simulatedResult(command.commandId, {
-          ok: false,
-          reason: "secret could not be resolved",
-        });
-        this.completeAttempt(attemptId, event);
-        return { kind: "terminal", event };
+      if (command.type === "fill_secret") {
+        const scoped = await this.secretRefInTenant(command.secretRef);
+        const continuation = this.continuationOutcome(
+          attemptId,
+          "preparing",
+          command.commandId,
+          statusUrl,
+        );
+        if (continuation !== null) return continuation;
+        if (!scoped) {
+          const event = this.simulatedResult(command.commandId, {
+            ok: false,
+            reason: "secret could not be resolved",
+          });
+          this.completeAttempt(attemptId, event);
+          return { kind: "terminal", event };
+        }
       }
       const ref = this.commandRef(command);
       if (ref === undefined) {
@@ -778,6 +858,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
       { attemptId },
       { idempotent: true },
     );
+    const prepareContinuation = this.continuationOutcome(
+      attemptId,
+      "preparing",
+      command.commandId,
+      statusUrl,
+    );
+    if (prepareContinuation !== null) return prepareContinuation;
     try {
       this.sendSessionFrame({
         type: "write_prepare",
@@ -787,6 +874,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
         requestFingerprint: fingerprint,
       });
       await this.emitSessionTelemetry("command_prepare", "sent", command.type);
+      const telemetryContinuation = this.continuationOutcome(
+        attemptId,
+        "preparing",
+        command.commandId,
+        statusUrl,
+      );
+      if (telemetryContinuation !== null) return telemetryContinuation;
     } catch {
       const won = this.markAttempt(attemptId, "not_started", "preparing");
       if (won) return { kind: "not_started", commandId: command.commandId, safeToRetry: true };
@@ -798,6 +892,10 @@ export class SessionAgent extends Agent<Env, SessionState> {
       (candidate) => candidate.state !== "preparing",
       Math.max(0, readyDeadlineAt - Date.now()),
     );
+    if (this.isTerminalSession()) {
+      return { kind: "terminal_session", commandId: command.commandId };
+    }
+    row = this.commandByAttempt(attemptId) ?? row;
     if (row.state === "preparing") {
       const won = this.markAttempt(attemptId, "not_started", "preparing");
       if (won) {
@@ -814,7 +912,15 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
     let grantedCommand: Command = command;
     if (command.type === "fill_secret") {
-      if (!(await this.secretRefInTenant(command.secretRef))) {
+      const scoped = await this.secretRefInTenant(command.secretRef);
+      const scopedContinuation = this.continuationOutcome(
+        attemptId,
+        "ready",
+        command.commandId,
+        statusUrl,
+      );
+      if (scopedContinuation !== null) return scopedContinuation;
+      if (!scoped) {
         const event = this.unresolvableSecretResult(command.commandId);
         const completed = this.completeAttempt(attemptId, event, "ready");
         this.trySendSessionFrame({ type: "attempt_cancel", attemptId, commandId: command.commandId });
@@ -826,6 +932,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
         resolveSecret(createVault(this.env), command.secretRef),
         readyDeadlineAt,
       );
+      const vaultContinuation = this.continuationOutcome(
+        attemptId,
+        "ready",
+        command.commandId,
+        statusUrl,
+      );
+      if (vaultContinuation !== null) return vaultContinuation;
       if (resolution.kind === "timeout") {
         const won = this.markAttempt(attemptId, "not_started", "ready");
         this.trySendSessionFrame({ type: "attempt_cancel", attemptId, commandId: command.commandId });
@@ -870,12 +983,28 @@ export class SessionAgent extends Agent<Env, SessionState> {
       return this.outcomeForRow(this.commandByAttempt(attemptId) ?? row, statusUrl);
     }
     await this.emitSessionTelemetry("command_grant", "persisted", command.type);
+    const grantTelemetryContinuation = this.continuationOutcome(
+      attemptId,
+      "granted",
+      command.commandId,
+      statusUrl,
+    );
+    if (grantTelemetryContinuation !== null) {
+      return grantTelemetryContinuation;
+    }
     await this.schedule(
       new Date(executionDeadlineAt),
       "expireAttempt",
       { attemptId },
       { idempotent: true },
     );
+    const grantContinuation = this.continuationOutcome(
+      attemptId,
+      "granted",
+      command.commandId,
+      statusUrl,
+    );
+    if (grantContinuation !== null) return grantContinuation;
     try {
       this.sendSessionFrame({
         type: "write_grant",
@@ -1076,18 +1205,48 @@ export class SessionAgent extends Agent<Env, SessionState> {
       INSERT INTO session_flag (key, value) VALUES ('closed', '1')
       ON CONFLICT(key) DO UPDATE SET value = '1'
     `;
+    this.terminalizeActiveAttempts();
+    this.coordinator.abandonInFlight(`${SESSION_TERMINAL}: session deleted`);
     const connection = this.authoritativeConnection();
-    if (connection === undefined) {
-      this.setState({ ...this.state, status: "detached", activeConnectionId: null });
-      return true;
+    if (connection !== undefined) {
+      try {
+        connection.send(
+          JSON.stringify({
+            type: "close_session",
+            closeTab: false,
+          } satisfies SessionServerFrame),
+        );
+      } catch {
+        // The terminal flag remains authoritative.
+      }
+      connection.setState(null);
     }
-    connection.send(
-      JSON.stringify({ type: "close_session", closeTab: false } satisfies SessionServerFrame),
-    );
-    return false;
+    this.setState({
+      ...this.state,
+      status: "detached",
+      activeConnectionId: null,
+    });
+    if (connection !== undefined) {
+      try {
+        connection.close(
+          WS_CLOSE_SESSION_TERMINAL,
+          "session deleted",
+        );
+      } catch {
+        // The connection was already closed after authority was retired.
+      }
+    }
+    for (const resolve of [...this.connectionWaiters]) resolve(false);
+    this.connectionWaiters.clear();
+    return true;
+  }
+
+  async isTerminal(): Promise<boolean> {
+    return this.isTerminalSession();
   }
 
   async waitForProtocolV2Connection(timeoutMs: number): Promise<boolean> {
+    if (this.isTerminalSession()) return false;
     if (
       this.state.status === "connected" &&
       this.state.protocolVersion === PROTOCOL_VERSION &&
@@ -1119,6 +1278,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
     startedAt: number,
     statusUrl: string,
   ): Promise<V2DispatchOutcome> {
+    const preparing = this.continuationOutcome(
+      attemptId,
+      "preparing",
+      command.commandId,
+      statusUrl,
+    );
+    if (preparing !== null) return preparing;
     const executionDeadlineAt = Date.now() + EXECUTION_DEADLINE_MS;
     this.sql`
       UPDATE command_journal
@@ -1132,6 +1298,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
       { attemptId },
       { idempotent: true },
     );
+    const continuation = this.continuationOutcome(
+      attemptId,
+      "granted",
+      command.commandId,
+      statusUrl,
+    );
+    if (continuation !== null) return continuation;
     try {
       this.sendSessionFrame({
         type: "command",
@@ -1161,10 +1334,18 @@ export class SessionAgent extends Agent<Env, SessionState> {
         candidate.state === "unknown",
       remaining,
     );
-    if (row.state === "granted" || row.state === "ready" || row.state === "preparing") {
+    if (this.isTerminalSession()) {
+      return { kind: "terminal_session", commandId };
+    }
+    const current = this.commandByAttempt(attemptId) ?? row;
+    if (
+      current.state === "granted" ||
+      current.state === "ready" ||
+      current.state === "preparing"
+    ) {
       return this.pendingOutcome(commandId, statusUrl);
     }
-    return this.outcomeForRow(row, statusUrl);
+    return this.outcomeForRow(current, statusUrl);
   }
 
   private outcomeForRow(row: CommandRow, statusUrl: string): V2DispatchOutcome {
@@ -1184,6 +1365,20 @@ export class SessionAgent extends Agent<Env, SessionState> {
       case "granted":
         return this.pendingOutcome(row.command_id, statusUrl);
     }
+  }
+
+  private continuationOutcome(
+    attemptId: string,
+    expected: CommandState,
+    commandId: string,
+    statusUrl: string,
+  ): V2DispatchOutcome | null {
+    if (this.isTerminalSession()) {
+      return { kind: "terminal_session", commandId };
+    }
+    const row = this.commandByAttempt(attemptId);
+    if (row === undefined) throw new Error("command attempt disappeared");
+    return row.state === expected ? null : this.outcomeForRow(row, statusUrl);
   }
 
   private pendingOutcome(commandId: string, statusUrl: string): V2DispatchOutcome {
@@ -1327,6 +1522,9 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   private sendSessionFrame(frame: SessionServerFrame): void {
+    if (this.isTerminalSession()) {
+      throw new Error(`${SESSION_TERMINAL}: session deleted`);
+    }
     const connection = this.authoritativeConnection();
     if (connection === undefined) throw new Error("session connection unavailable");
     connection.send(JSON.stringify(frame));
@@ -1364,6 +1562,47 @@ export class SessionAgent extends Agent<Env, SessionState> {
       status === "expired" ||
       status === "lost"
     );
+  }
+
+  private rejectTerminalConnection(connection: Connection): boolean {
+    if (!this.isTerminalSession()) return false;
+    connection.setState(null);
+    try {
+      connection.close(WS_CLOSE_SESSION_TERMINAL, "session deleted");
+    } catch {
+      // The durable terminal flag remains authoritative.
+    }
+    return true;
+  }
+
+  private terminalizeActiveAttempts(): void {
+    const active = this.sql<{
+      attempt_id: string;
+      state: "preparing" | "ready" | "granted";
+      is_write: number;
+      dry_run: number;
+    }>`
+      SELECT attempt_id, state, is_write, dry_run
+      FROM command_journal
+      WHERE state IN ('preparing','ready','granted')
+    `;
+    let blocked = false;
+    for (const row of active) {
+      const terminal: CommandState =
+        row.state === "granted"
+          ? row.is_write === 1 && row.dry_run === 0
+            ? "unknown"
+            : "timed_out"
+          : "not_started";
+      if (terminal === "unknown") blocked = true;
+      this.markAttempt(row.attempt_id, terminal, row.state);
+    }
+    if (blocked) {
+      this.sql`
+        INSERT INTO session_flag (key, value) VALUES ('writes_blocked', '1')
+        ON CONFLICT(key) DO UPDATE SET value = '1'
+      `;
+    }
   }
 
   private terminalizeGrantedAttempts(): void {
@@ -1470,33 +1709,125 @@ export class SessionAgent extends Agent<Env, SessionState> {
     if (message.startsWith(SESSION_BUSY)) {
       return { ok: false, reason: "session_busy", message };
     }
+    if (message.startsWith(SESSION_TERMINAL)) {
+      return this.terminalDispatchOutcome(message);
+    }
     throw err;
   }
 
-  /** The recorded Event for an already-completed write commandId, if any. */
-  private completedWriteEvent(command: Command): Event | undefined {
-    if (!isWriteCommand(command)) return undefined;
-    return this.completedWrites().find((entry) => entry.commandId === command.commandId)?.event;
+  private terminalDispatchOutcome(
+    message = `${SESSION_TERMINAL}: session deleted`,
+  ): DispatchOutcome {
+    return { ok: false, reason: "terminal_session", message };
   }
 
-  private rememberCompletedWrite(command: Command, event: Event): void {
-    if (!isWriteCommand(command)) return;
+  private idConflictDispatchOutcome(): DispatchOutcome {
+    return {
+      ok: false,
+      reason: "id_conflict",
+      message: "command id was already used for a different request",
+    };
+  }
+
+  private legacyReplay(tombstone: LegacyCommandTombstone):
+    | { kind: "none" }
+    | { kind: "conflict" }
+    | {
+        kind: "replay";
+      event: Extract<Event, { type: "action_result" }>;
+      } {
+    const awaiting = this.awaitingLegacyCommands().find(
+      (entry) => entry.commandId === tombstone.commandId,
+    );
+    if (awaiting !== undefined) {
+      if (!isLegacyCommandTombstone(awaiting)) return { kind: "conflict" };
+      return sameLegacyCommand(awaiting, tombstone)
+        ? { kind: "none" }
+        : { kind: "conflict" };
+    }
+
+    const completed = this.completedWrites().find(
+      (entry) => entry.commandId === tombstone.commandId,
+    );
+    if (completed !== undefined) {
+      if (!isCompletedLegacyWrite(completed)) return { kind: "conflict" };
+      return sameLegacyCommand(completed, tombstone)
+        ? { kind: "replay", event: completed.event }
+        : { kind: "conflict" };
+    }
+
+    const sent = this.legacyCommandTombstones().find(
+      (entry) => entry.commandId === tombstone.commandId,
+    );
+    return sent === undefined ? { kind: "none" } : { kind: "conflict" };
+  }
+
+  private rememberCompletedWrite(
+    tombstone: LegacyCommandTombstone,
+    event: Event,
+  ): void {
+    if (
+      !isWriteCommandType(tombstone.commandType) ||
+      event.type !== "action_result" ||
+      utf8ByteLength(JSON.stringify(event)) > COMPLETED_WRITE_EVENT_MAX_BYTES
+    ) {
+      return;
+    }
     const next = [
-      ...this.completedWrites().filter((entry) => entry.commandId !== command.commandId),
-      { commandId: command.commandId, event },
+      ...this.completedWrites().filter(
+        (entry) => entry.commandId !== tombstone.commandId,
+      ),
+      { ...tombstone, event },
     ];
     while (next.length > COMPLETED_WRITES_CAP) next.shift();
     this.setState({ ...this.state, completedWrites: next });
   }
 
-  private rememberLegacyLateResult(event: Event): void {
-    if (!("commandId" in event)) return;
+  private rememberLegacyLateResult(
+    tombstone: PersistedLegacyAwaiting,
+    event: Event,
+  ): void {
+    if (
+      !isLegacyCommandTombstone(tombstone) ||
+      !isWriteCommandType(tombstone.commandType) ||
+      event.type !== "action_result" ||
+      event.commandId !== tombstone.commandId ||
+      utf8ByteLength(JSON.stringify(event)) > COMPLETED_WRITE_EVENT_MAX_BYTES
+    ) {
+      return;
+    }
+    this.rememberCompletedWrite(tombstone, event);
+  }
+
+  private rememberLegacyCommandTombstone(
+    tombstone: LegacyCommandTombstone,
+  ): void {
+    if (!isWriteCommandType(tombstone.commandType)) return;
+
     const next = [
-      ...this.completedWrites().filter((entry) => entry.commandId !== event.commandId),
-      { commandId: event.commandId, event },
+      ...this.legacyCommandTombstones().filter(
+        (entry) => entry.commandId !== tombstone.commandId,
+      ),
+      tombstone,
     ];
     while (next.length > COMPLETED_WRITES_CAP) next.shift();
-    this.setState({ ...this.state, completedWrites: next });
+    this.setState({ ...this.state, legacyCommandTombstones: next });
+  }
+
+  private awaitingLegacyCommands(): PersistedLegacyAwaiting[] {
+    const typed = this.state.awaitingCommands;
+    if (Array.isArray(typed) && typed.length > 0) {
+      return typed.filter(isPersistedLegacyAwaiting);
+    }
+    return (this.state.awaitingCommandIds ?? []).map((commandId) => ({
+      commandId,
+    }));
+  }
+
+  private legacyCommandTombstones(): LegacyCommandTombstone[] {
+    return (this.state.legacyCommandTombstones ?? []).filter(
+      isLegacyCommandTombstone,
+    );
   }
 
   // Persisted before this field existed, a session's state can lack it;
@@ -1618,13 +1949,27 @@ export class SessionAgent extends Agent<Env, SessionState> {
   private async checkRefResolves(
     ref: string | undefined,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (this.isTerminalSession()) {
+      throw new Error(`${SESSION_TERMINAL}: session deleted`);
+    }
     if (ref === undefined) return { ok: true };
 
-    const ev = await this.coordinator.send({
+    const probe: Command = {
       type: "resolve_ref",
       commandId: crypto.randomUUID(),
       ref,
-    });
+    };
+    const fingerprint = await requestFingerprint(probe, false);
+    if (this.isTerminalSession()) {
+      throw new Error(`${SESSION_TERMINAL}: session deleted`);
+    }
+    const ev = await this.coordinator.send(
+      probe,
+      legacyTombstone(probe, fingerprint),
+    );
+    if (this.isTerminalSession()) {
+      throw new Error(`${SESSION_TERMINAL}: session deleted`);
+    }
     if (ev.type !== "action_result") {
       return { ok: false, reason: `unexpected probe response '${ev.type}'` };
     }
@@ -1669,7 +2014,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   private hasAuthorizedConnection(): boolean {
-    return this.authoritativeConnection() !== undefined;
+    return !this.isTerminalSession() && this.authoritativeConnection() !== undefined;
   }
 
   private isAuthoritativeConnection(connection: Connection): boolean {
@@ -1720,6 +2065,105 @@ export class SessionAgent extends Agent<Env, SessionState> {
       }
     ).activeConnectionId;
   }
+}
+
+const WRITE_COMMAND_TYPE_SET = new Set<Command["type"]>(
+  WRITE_COMMAND_TYPES,
+);
+
+function legacyTombstone(
+  command: Command,
+  requestFingerprint: string,
+): LegacyCommandTombstone {
+  return {
+    commandId: command.commandId,
+    commandType: command.type,
+    requestFingerprint,
+  };
+}
+
+function isWriteCommandType(
+  commandType: Command["type"],
+): boolean {
+  return WRITE_COMMAND_TYPE_SET.has(commandType);
+}
+
+function isPersistedLegacyAwaiting(
+  value: unknown,
+): value is PersistedLegacyAwaiting {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as {
+    commandId?: unknown;
+    commandType?: unknown;
+    requestFingerprint?: unknown;
+  };
+  if (typeof candidate.commandId !== "string") return false;
+  if (
+    candidate.commandType === undefined &&
+    candidate.requestFingerprint === undefined
+  ) {
+    return true;
+  }
+  return isLegacyCommandTombstone(value);
+}
+
+function isLegacyCommandTombstone(
+  value: unknown,
+): value is LegacyCommandTombstone {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as {
+    commandId?: unknown;
+    commandType?: unknown;
+    requestFingerprint?: unknown;
+  };
+  return (
+    typeof candidate.commandId === "string" &&
+    typeof candidate.commandType === "string" &&
+    isCommandType(candidate.commandType) &&
+    typeof candidate.requestFingerprint === "string" &&
+    candidate.requestFingerprint.length === 64
+  );
+}
+
+function isCompletedLegacyWrite(
+  value: unknown,
+): value is LegacyCommandTombstone & {
+  event: Extract<Event, { type: "action_result" }>;
+} {
+  if (!isLegacyCommandTombstone(value)) return false;
+  const event = (value as { event?: unknown }).event;
+  return (
+    typeof event === "object" &&
+    event !== null &&
+    (event as { type?: unknown }).type === "action_result"
+  );
+}
+
+function sameLegacyCommand(
+  left: LegacyCommandTombstone,
+  right: LegacyCommandTombstone,
+): boolean {
+  return (
+    left.commandId === right.commandId &&
+    left.commandType === right.commandType &&
+    left.requestFingerprint === right.requestFingerprint
+  );
+}
+
+function isCommandType(value: string): value is Command["type"] {
+  return (
+    value === "snapshot" ||
+    value === "navigate" ||
+    value === "click" ||
+    value === "type" ||
+    value === "fill_secret" ||
+    value === "key" ||
+    value === "scroll" ||
+    value === "wait" ||
+    value === "resolve_ref" ||
+    value === "get_tabs" ||
+    value === "switch_tab"
+  );
 }
 
 function isTerminalLifecycle(status: UnattendedSessionLifecycle): boolean {

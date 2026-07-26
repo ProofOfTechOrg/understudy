@@ -52,19 +52,23 @@ The local origin policy is the maximum this profile will host. Each session requ
 
 ## Understand storage
 
-`chrome.storage.local` contains only:
+`chrome.storage.local` contains:
 
 - Service origin
 - Enabled state
 - Device ID
 - Raw device credential
 - Local origin policy
+- A staged replacement profile while old lease cleanup is incomplete
+- A credential-revocation marker that suppresses reconnects
 
 The extension restricts local-storage access to trusted extension contexts.
 
-`chrome.storage.session` contains browser epoch, lease assignments, tab IDs, ref generations, write journal entries, and dialog outbox records. It never contains command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, prior URLs, or restoration tasks.
+`chrome.storage.session` contains browser epoch, versioned lease assignments, cleanup intent, queued closure fences, tab IDs, ref generations, write journal entries, and dialog outbox records. It never contains command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, or prior URLs.
 
 Browser restart clears execution authority. The extension creates fresh blank tabs for live recovering leases and never restores old URLs.
+
+Changing the service origin, device ID, credential, or origin policy fences hosting immediately. The extension disables the old profile, closes its owned tabs, queues closure frames through the old control identity, then promotes the staged profile. If the old service is unavailable, the replacement stays inactive until cleanup can finish.
 
 ## Control tabs safely
 
@@ -103,7 +107,13 @@ The outbox holds at most 256 records and 256 KiB. Overflow still answers the bro
 
 ## Stop automation
 
-**Stop all** closes only tabs proven to belong to current leases and disables unattended hosting. It does not close unrelated or restored tabs.
+**Stop all** durably disables hosting before tab cleanup. It closes only tabs proven to belong to current leases and does not close unrelated tabs.
+
+Tab removal is confirmation-based. If Chrome reports a failed removal and the tab still exists, the extension retains lease ownership and its heartbeat fence. The 30-second backstop alarm retries cleanup. Release cleanup queues a `closed` frame only after confirmed removal, while recovery cleanup omits the lease so the backend can provision a fresh blank tab.
+
+Cleanup-only control connections send device hello, heartbeat, and queued closure frames through the retired profile. They reject provision and session-ticket frames.
+
+Credential revocation persists a terminal local marker, discards backend-terminal lease ownership, and suppresses control-ticket reconnects across service-worker restarts.
 
 Attended **Detach tab** detaches CDP but never closes the selected user tab.
 

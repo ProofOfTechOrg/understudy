@@ -400,24 +400,27 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     leaseId: string;
     leaseEpoch: number;
     browserEpoch: string;
+    deviceId: string;
     now?: number;
   }): Promise<{ accepted: boolean; close: boolean }> {
     const now = input.now ?? Date.now();
-    const changed = this.ctx.storage.sql.exec(
+    const changed = this.ctx.storage.sql.exec<{ status: string }>(
       `UPDATE lease
        SET status = 'connected', needs_reconciliation = 0
-       WHERE session_id = ? AND lease_id = ? AND lease_epoch = ?
+       WHERE session_id = ? AND lease_id = ? AND device_id = ? AND lease_epoch = ?
          AND browser_epoch = ? AND status IN ('provisioning','recovering')
-         AND release_at IS NULL AND hard_expires_at > ? AND idle_expires_at > ?`,
+         AND release_at IS NULL AND hard_expires_at > ? AND idle_expires_at > ?
+       RETURNING status`,
       input.sessionId,
       input.leaseId,
+      input.deviceId,
       input.leaseEpoch,
       input.browserEpoch,
       now,
       now,
-    ).rowsWritten;
+    ).toArray();
     await this.scheduleNextAlarm();
-    return { accepted: changed === 1, close: changed !== 1 };
+    return { accepted: changed.length === 1, close: changed.length !== 1 };
   }
 
   async markProvisionFailed(input: {
@@ -425,13 +428,16 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     leaseId: string;
     leaseEpoch: number;
     browserEpoch: string;
+    deviceId: string;
   }): Promise<void> {
     this.ctx.storage.sql.exec(
       `UPDATE lease SET status = 'closing', needs_reconciliation = 1
-       WHERE session_id = ? AND lease_id = ? AND lease_epoch = ? AND browser_epoch = ?
+       WHERE session_id = ? AND lease_id = ? AND device_id = ?
+         AND lease_epoch = ? AND browser_epoch = ?
          AND status IN ('provisioning','recovering') AND release_at IS NULL`,
       input.sessionId,
       input.leaseId,
+      input.deviceId,
       input.leaseEpoch,
       input.browserEpoch,
     );
@@ -574,20 +580,21 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     now?: number;
   }): Promise<boolean> {
     const now = input.now ?? Date.now();
-    const changed = this.ctx.storage.sql.exec(
+    const changed = this.ctx.storage.sql.exec<{ status: string }>(
       `UPDATE lease
        SET status = 'recovering', needs_reconciliation = 1,
            provisioning_deadline_at = ?
        WHERE session_id = ? AND lease_id = ? AND lease_epoch = ?
-         AND browser_epoch = ? AND status = 'connected' AND release_at IS NULL`,
+         AND browser_epoch = ? AND status = 'connected' AND release_at IS NULL
+       RETURNING status`,
       now + DEVICE_LOST_MS,
       input.sessionId,
       input.leaseId,
       input.leaseEpoch,
       input.browserEpoch,
-    ).rowsWritten;
+    ).toArray();
     await this.scheduleNextAlarm();
-    return changed === 1;
+    return changed.length === 1;
   }
 
   async closeLease(
@@ -620,6 +627,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     leaseId: string;
     leaseEpoch: number;
     browserEpoch: string;
+    deviceId: string;
     now?: number;
   }): Promise<UnattendedSessionLifecycle | null> {
     const now = input.now ?? Date.now();
@@ -627,29 +635,42 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     if (
       before === undefined ||
       before.lease_id !== input.leaseId ||
+      before.device_id !== input.deviceId ||
       before.lease_epoch !== input.leaseEpoch ||
       before.browser_epoch !== input.browserEpoch ||
       before.release_at !== null ||
-      (before.status !== "closing" && before.status !== "expired")
+      !(
+        before.status === "allocating" ||
+        before.status === "provisioning" ||
+        before.status === "connected" ||
+        before.status === "recovering" ||
+        before.status === "closing" ||
+        before.status === "expired"
+      )
     ) {
       return null;
     }
     const terminalStatus: UnattendedSessionLifecycle =
       before.status === "expired" ? "expired" : "closed";
-    const changed = this.ctx.storage.sql.exec(
+    const changed = this.ctx.storage.sql.exec<{ status: UnattendedSessionLifecycle }>(
       `UPDATE lease SET status = ?, release_at = ?, needs_reconciliation = 0
-       WHERE session_id = ? AND lease_id = ? AND lease_epoch = ? AND browser_epoch = ?
-         AND release_at IS NULL AND status = ?`,
+       WHERE session_id = ? AND lease_id = ? AND device_id = ?
+         AND lease_epoch = ? AND browser_epoch = ?
+         AND release_at IS NULL
+         AND status IN ('allocating','provisioning','connected','recovering','closing','expired')
+       RETURNING status`,
       terminalStatus,
       now,
       input.sessionId,
       input.leaseId,
+      input.deviceId,
       input.leaseEpoch,
       input.browserEpoch,
-      before.status,
-    ).rowsWritten;
+    ).toArray();
     await this.scheduleNextAlarm();
-    return changed === 1 ? terminalStatus : null;
+    return changed.length === 1 && changed[0]?.status === terminalStatus
+      ? terminalStatus
+      : null;
   }
 
   async setDialogDelivery(

@@ -155,6 +155,7 @@ app.post("/v1/sessions", async (c) => {
           await coordinator.markProvisionFailed({
             sessionId,
             leaseId: allocation.lease.leaseId,
+            deviceId: allocation.lease.deviceId,
             leaseEpoch: allocation.lease.leaseEpoch,
             browserEpoch: allocation.lease.browserEpoch,
           });
@@ -284,6 +285,9 @@ app.post("/v1/sessions/:sessionId/commands", async (c) => {
   }
   const dryRun = body.dryRun ?? false;
   const stub = await getSessionStub(c.env, sessionId);
+  if (await stub.isTerminal()) {
+    return c.json({ error: "session is terminal" }, 410);
+  }
   const contractV2 = c.req.header("understudy-command-contract") === "2";
 
   if (contractV2 || (await stub.usesV2CommandProtocol())) {
@@ -343,6 +347,10 @@ app.post("/v1/sessions/:sessionId/commands", async (c) => {
       return c.json({ error: "command already in flight" }, 409);
     case "session_busy":
       return c.json({ code: "session_busy" }, 429);
+    case "terminal_session":
+      return c.json({ error: "session is terminal" }, 410);
+    case "id_conflict":
+      return c.json({ code: "command_id_conflict" }, 409);
   }
 });
 

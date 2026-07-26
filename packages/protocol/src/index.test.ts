@@ -9,6 +9,8 @@ import {
   PROTOCOL_VERSION,
   SessionClientFrameSchema,
   SessionServerFrameSchema,
+  WS_CLOSE_REPLACED,
+  WS_CLOSE_SESSION_TERMINAL,
   isWriteCommand,
   parseCommand,
   safeParseCommand,
@@ -16,6 +18,13 @@ import {
   WRITE_COMMAND_TYPES,
   type Command,
 } from "./index";
+
+describe("WebSocket close codes", () => {
+  it("exports the stable replacement and terminal-session codes", () => {
+    expect(WS_CLOSE_REPLACED).toBe(4001);
+    expect(WS_CLOSE_SESSION_TERMINAL).toBe(4003);
+  });
+});
 
 describe("CommandSchema", () => {
   it("parses a valid snapshot command", () => {

@@ -117,11 +117,64 @@ describe("TenantDeviceCoordinator allocation", () => {
     await stub.confirmClosed({
       sessionId: first.lease.sessionId,
       leaseId: first.lease.leaseId,
+      deviceId: first.lease.deviceId,
       leaseEpoch: first.lease.leaseEpoch,
       browserEpoch: first.lease.browserEpoch,
       now: 1_000_100,
     });
     expect(await stub.createLease(input)).toEqual({ kind: "terminal", status: "closed" });
+  });
+
+  it("accepts an authenticated active host closure and rejects stale fences", async () => {
+    const stub = coordinator();
+    const now = Date.now();
+    await register(stub, DEVICE_A, now);
+    const created = await stub.createLease(
+      { ...leaseInput(1, "https://one.example"), now: now + 1 },
+    );
+    if (created.kind !== "created") throw new Error("expected created lease");
+    expect(await stub.getLease(created.lease.sessionId, now + 2)).toMatchObject({
+      status: "provisioning",
+      leaseEpoch: created.lease.leaseEpoch,
+      browserEpoch: created.lease.browserEpoch,
+    });
+
+    expect(
+      await stub.confirmClosed({
+        sessionId: created.lease.sessionId,
+        leaseId: created.lease.leaseId,
+        deviceId: DEVICE_B,
+        leaseEpoch: created.lease.leaseEpoch,
+        browserEpoch: created.lease.browserEpoch,
+        now: now + 2,
+      }),
+    ).toBeNull();
+    expect(
+      await stub.confirmClosed({
+        sessionId: created.lease.sessionId,
+        leaseId: created.lease.leaseId,
+        deviceId: created.lease.deviceId,
+        leaseEpoch: created.lease.leaseEpoch + 1,
+        browserEpoch: created.lease.browserEpoch,
+        now: now + 2,
+      }),
+    ).toBeNull();
+    expect(await stub.getLease(created.lease.sessionId, now + 3)).toMatchObject({
+      status: "provisioning",
+    });
+    expect(
+      await stub.confirmClosed({
+        sessionId: created.lease.sessionId,
+        leaseId: created.lease.leaseId,
+        deviceId: created.lease.deviceId,
+        leaseEpoch: created.lease.leaseEpoch,
+        browserEpoch: created.lease.browserEpoch,
+        now: now + 3,
+      }),
+    ).toBe("closed");
+    expect((await stub.listDevices(now + 4))[0]).toMatchObject({
+      used: 0,
+    });
   });
 
   it("never falls back from an explicit full device and auto-selects by used capacity", async () => {
@@ -156,6 +209,7 @@ describe("TenantDeviceCoordinator allocation", () => {
     await stub.markProvisioned({
       sessionId: created.lease.sessionId,
       leaseId: created.lease.leaseId,
+      deviceId: created.lease.deviceId,
       leaseEpoch: created.lease.leaseEpoch,
       browserEpoch: created.lease.browserEpoch,
       now: 1_000_010,
@@ -177,6 +231,41 @@ describe("TenantDeviceCoordinator allocation", () => {
     });
   });
 
+  it("returns the durable CAS result for provisioning and recovery transitions", async () => {
+    const stub = coordinator();
+    await register(stub, DEVICE_A);
+    const created = await stub.createLease(leaseInput(1, "https://one.example"));
+    if (created.kind !== "created") throw new Error("expected created lease");
+    const fence = {
+      sessionId: created.lease.sessionId,
+      leaseId: created.lease.leaseId,
+      deviceId: created.lease.deviceId,
+      leaseEpoch: created.lease.leaseEpoch,
+      browserEpoch: created.lease.browserEpoch,
+    };
+
+    expect(
+      await stub.markProvisioned({
+        ...fence,
+        deviceId: DEVICE_B,
+        now: 1_000_009,
+      }),
+    ).toEqual({
+      accepted: false,
+      close: true,
+    });
+    expect(await stub.markProvisioned({ ...fence, now: 1_000_010 })).toEqual({
+      accepted: true,
+      close: false,
+    });
+    expect(await stub.markProvisioned({ ...fence, now: 1_000_011 })).toEqual({
+      accepted: false,
+      close: true,
+    });
+    expect(await stub.markRecovering({ ...fence, now: 1_000_012 })).toBe(true);
+    expect(await stub.markRecovering({ ...fence, now: 1_000_013 })).toBe(false);
+  });
+
   it("does not count provisioning as activity and materializes expiry on status reads", async () => {
     const stub = coordinator();
     await register(stub, DEVICE_A);
@@ -186,6 +275,7 @@ describe("TenantDeviceCoordinator allocation", () => {
     await stub.markProvisioned({
       sessionId: created.lease.sessionId,
       leaseId: created.lease.leaseId,
+      deviceId: created.lease.deviceId,
       leaseEpoch: created.lease.leaseEpoch,
       browserEpoch: created.lease.browserEpoch,
       now: created.lease.createdAt + 30_000,
