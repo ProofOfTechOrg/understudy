@@ -43,9 +43,11 @@ import { resolveSecret } from "./secrets";
 import { createVault } from "./vault";
 import type {
   CommandStatusRecord,
+  CompletedLegacyWrite,
   DispatchOutcome,
   Env,
   LegacyCommandTombstone,
+  PersistedLegacyCommandTombstone,
   PersistedLegacyAwaiting,
   SessionState,
   SessionStatus,
@@ -1769,6 +1771,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     if (
       !isWriteCommandType(tombstone.commandType) ||
       event.type !== "action_result" ||
+      event.commandId !== tombstone.commandId ||
       utf8ByteLength(JSON.stringify(event)) > COMPLETED_WRITE_EVENT_MAX_BYTES
     ) {
       return;
@@ -1787,6 +1790,11 @@ export class SessionAgent extends Agent<Env, SessionState> {
     tombstone: PersistedLegacyAwaiting,
     event: Event,
   ): void {
+    this.rememberLegacyCommandTombstone(
+      isLegacyCommandTombstone(tombstone)
+        ? tombstone
+        : { commandId: tombstone.commandId },
+    );
     if (
       !isLegacyCommandTombstone(tombstone) ||
       !isWriteCommandType(tombstone.commandType) ||
@@ -1800,10 +1808,14 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   private rememberLegacyCommandTombstone(
-    tombstone: LegacyCommandTombstone,
+    tombstone: PersistedLegacyCommandTombstone,
   ): void {
-    if (!isWriteCommandType(tombstone.commandType)) return;
-
+    if (
+      isLegacyCommandTombstone(tombstone) &&
+      !isWriteCommandType(tombstone.commandType)
+    ) {
+      return;
+    }
     const next = [
       ...this.legacyCommandTombstones().filter(
         (entry) => entry.commandId !== tombstone.commandId,
@@ -1824,16 +1836,94 @@ export class SessionAgent extends Agent<Env, SessionState> {
     }));
   }
 
-  private legacyCommandTombstones(): LegacyCommandTombstone[] {
+  private legacyCommandTombstones(): PersistedLegacyCommandTombstone[] {
+    this.sanitizeLegacyReplayState();
     return (this.state.legacyCommandTombstones ?? []).filter(
-      isLegacyCommandTombstone,
+      isPersistedLegacyAwaiting,
     );
   }
 
   // Persisted before this field existed, a session's state can lack it;
   // initialState only seeds brand-new DOs.
-  private completedWrites(): SessionState["completedWrites"] {
-    return this.state.completedWrites ?? [];
+  private completedWrites(): CompletedLegacyWrite[] {
+    this.sanitizeLegacyReplayState();
+    return (this.state.completedWrites ?? []).filter(isCompletedLegacyWrite);
+  }
+
+  private sanitizeLegacyReplayState(): void {
+    const persistedCompleted = Array.isArray(this.state.completedWrites)
+      ? this.state.completedWrites
+      : [];
+    const persistedTombstones = Array.isArray(
+      this.state.legacyCommandTombstones,
+    )
+      ? this.state.legacyCommandTombstones
+      : [];
+    const completed: CompletedLegacyWrite[] = [];
+    const tombstones: PersistedLegacyCommandTombstone[] = [];
+    let changed =
+      persistedCompleted !== this.state.completedWrites ||
+      persistedTombstones !== this.state.legacyCommandTombstones;
+
+    for (const entry of persistedTombstones) {
+      if (!isPersistedLegacyAwaiting(entry)) {
+        changed = true;
+        continue;
+      }
+      const existingIndex = tombstones.findIndex(
+        (candidate) => candidate.commandId === entry.commandId,
+      );
+      if (existingIndex >= 0) {
+        tombstones.splice(existingIndex, 1);
+        changed = true;
+      }
+      tombstones.push(entry);
+    }
+
+    for (const entry of persistedCompleted) {
+      if (isCompletedLegacyWrite(entry)) {
+        const existingIndex = completed.findIndex(
+          (candidate) => candidate.commandId === entry.commandId,
+        );
+        if (existingIndex >= 0) {
+          completed.splice(existingIndex, 1);
+          changed = true;
+        }
+        completed.push(entry);
+        continue;
+      }
+      changed = true;
+      const commandId = persistedCommandId(entry);
+      if (commandId === null) continue;
+      const existingIndex = tombstones.findIndex(
+        (candidate) => candidate.commandId === commandId,
+      );
+      if (existingIndex >= 0) tombstones.splice(existingIndex, 1);
+      tombstones.push({ commandId });
+    }
+
+    if (completed.length > COMPLETED_WRITES_CAP) {
+      completed.splice(0, completed.length - COMPLETED_WRITES_CAP);
+      changed = true;
+    }
+    if (tombstones.length > COMPLETED_WRITES_CAP) {
+      tombstones.splice(0, tombstones.length - COMPLETED_WRITES_CAP);
+      changed = true;
+    }
+    if (
+      !changed &&
+      (completed.length !== persistedCompleted.length ||
+        tombstones.length !== persistedTombstones.length)
+    ) {
+      changed = true;
+    }
+    if (changed) {
+      this.setState({
+        ...this.state,
+        completedWrites: completed,
+        legacyCommandTombstones: tombstones,
+      });
+    }
   }
 
   /** Records a handled page dialog (capped) for the GET /v1/sessions/:id surface. */
@@ -2097,7 +2187,13 @@ function isPersistedLegacyAwaiting(
     commandType?: unknown;
     requestFingerprint?: unknown;
   };
-  if (typeof candidate.commandId !== "string") return false;
+  if (
+    typeof candidate.commandId !== "string" ||
+    candidate.commandId.length < 1 ||
+    candidate.commandId.length > 128
+  ) {
+    return false;
+  }
   if (
     candidate.commandType === undefined &&
     candidate.requestFingerprint === undefined
@@ -2118,6 +2214,8 @@ function isLegacyCommandTombstone(
   };
   return (
     typeof candidate.commandId === "string" &&
+    candidate.commandId.length >= 1 &&
+    candidate.commandId.length <= 128 &&
     typeof candidate.commandType === "string" &&
     isCommandType(candidate.commandType) &&
     typeof candidate.requestFingerprint === "string" &&
@@ -2127,16 +2225,28 @@ function isLegacyCommandTombstone(
 
 function isCompletedLegacyWrite(
   value: unknown,
-): value is LegacyCommandTombstone & {
-  event: Extract<Event, { type: "action_result" }>;
-} {
+): value is CompletedLegacyWrite {
   if (!isLegacyCommandTombstone(value)) return false;
   const event = (value as { event?: unknown }).event;
+  const parsed = safeParseEvent(event);
   return (
-    typeof event === "object" &&
-    event !== null &&
-    (event as { type?: unknown }).type === "action_result"
+    isWriteCommandType(value.commandType) &&
+    parsed.success &&
+    parsed.data.type === "action_result" &&
+    parsed.data.commandId === value.commandId &&
+    utf8ByteLength(JSON.stringify(parsed.data)) <=
+      COMPLETED_WRITE_EVENT_MAX_BYTES
   );
+}
+
+function persistedCommandId(value: unknown): string | null {
+  if (typeof value !== "object" || value === null) return null;
+  const commandId = (value as { commandId?: unknown }).commandId;
+  return typeof commandId === "string" &&
+    commandId.length > 0 &&
+    commandId.length <= 128
+    ? commandId
+    : null;
 }
 
 function sameLegacyCommand(

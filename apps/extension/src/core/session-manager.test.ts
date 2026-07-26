@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe("SessionManager cleanup ownership", () => {
-  it("retains failed recover cleanup and removes it on a later retry without a closure frame", async () => {
+  it("retains failed recover cleanup and records a vacated lease after confirmed removal", async () => {
     const sessionState: Record<string, unknown> = {
       "understudy:assignments": {
         version: 2,
@@ -43,11 +43,20 @@ describe("SessionManager cleanup ownership", () => {
       expect.objectContaining({ cleanupIntent: "recover" }),
     ]);
     expect(manager.closureOutbox()).toEqual([]);
+    expect(manager.vacatedLeases()).toEqual([]);
 
     tabExists = false;
     await manager.retryCleanup();
     expect(manager.assignments()).toEqual([]);
     expect(manager.closureOutbox()).toEqual([]);
+    expect(manager.vacatedLeases()).toEqual([
+      {
+        sessionId: ASSIGNMENT.sessionId,
+        leaseId: ASSIGNMENT.leaseId,
+        leaseEpoch: ASSIGNMENT.leaseEpoch,
+        browserEpoch: ASSIGNMENT.browserEpoch,
+      },
+    ]);
   });
 
   it("upgrades pending recovery to release and queues closure only after removal", async () => {
@@ -80,6 +89,49 @@ describe("SessionManager cleanup ownership", () => {
     tabExists = false;
     await manager.retryCleanup();
     expect(manager.assignments()).toEqual([]);
+    expect(manager.closureOutbox()).toEqual([
+      {
+        sessionId: ASSIGNMENT.sessionId,
+        leaseId: ASSIGNMENT.leaseId,
+        leaseEpoch: ASSIGNMENT.leaseEpoch,
+        browserEpoch: ASSIGNMENT.browserEpoch,
+      },
+    ]);
+    expect(manager.vacatedLeases()).toEqual([]);
+  });
+
+  it("promotes a vacated lease when the server requests closure", async () => {
+    const sessionState: Record<string, unknown> = {
+      "understudy:assignments": {
+        version: 3,
+        assignments: [],
+        closedOutbox: [],
+        vacatedLeases: [
+          {
+            sessionId: ASSIGNMENT.sessionId,
+            leaseId: ASSIGNMENT.leaseId,
+            leaseEpoch: ASSIGNMENT.leaseEpoch,
+            browserEpoch: ASSIGNMENT.browserEpoch,
+          },
+        ],
+      },
+    };
+    installBrowser(
+      sessionState,
+      async () => {},
+      async () => {
+        throw new Error("tab not found");
+      },
+    );
+    const manager = new SessionManager(
+      () => "https://service.example",
+      () => EPOCH,
+    );
+
+    await manager.restoreSameEpoch();
+    await expect(manager.closeLease(ASSIGNMENT)).resolves.toBe(true);
+
+    expect(manager.vacatedLeases()).toEqual([]);
     expect(manager.closureOutbox()).toEqual([
       {
         sessionId: ASSIGNMENT.sessionId,

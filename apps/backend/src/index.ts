@@ -398,6 +398,7 @@ app.post("/v1/device/connect-ticket", async (c) => {
       aud: "device-control",
       tenantId: device.tenantId,
       deviceId: device.deviceId,
+      credentialVersion: device.credentialVersion,
       leaseEpoch: 0,
       browserEpoch: body.browserEpoch,
       agentName: device.deviceId,

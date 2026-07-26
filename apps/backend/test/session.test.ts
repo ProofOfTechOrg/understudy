@@ -594,7 +594,7 @@ describe("legacy replay tombstones", () => {
       requestFingerprint: await requestFingerprint(command, false),
     } as const;
 
-    await runInDurableObject(stub, (instance: SessionAgent) => {
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
       const harness = instance as unknown as {
         rememberLegacyLateResult(
           marker: typeof tombstone,
@@ -613,13 +613,18 @@ describe("legacy replay tombstones", () => {
         error: "x".repeat(17 * 1024),
       });
       expect(instance.state.completedWrites).toEqual([]);
+      expect(instance.state.legacyCommandTombstones).toEqual([tombstone]);
+      await expect(instance.dispatch(command)).resolves.toMatchObject({
+        ok: false,
+        reason: "id_conflict",
+      });
     });
   });
 
-  it("treats a pre-migration completed write as an ID-only conflict", async () => {
+  it("strips a pre-migration oversized read payload to an ID-only conflict", async () => {
     const sessionId = crypto.randomUUID();
     const stub = await getSessionStub(sessionId);
-    const outcome = await runInDurableObject(
+    const result = await runInDurableObject(
       stub,
       async (instance: SessionAgent) => {
         instance.setState({
@@ -628,24 +633,34 @@ describe("legacy replay tombstones", () => {
             {
               commandId: "legacy-completed",
               event: {
-                type: "action_result",
+                type: "screenshot_result",
                 commandId: "legacy-completed",
-                ok: true,
+                mime: "image/png",
+                b64: "x".repeat(17 * 1024),
+                tabId: 7,
+                url: "https://example.com/",
               },
             },
           ],
         });
-        return instance.dispatch({
+        const outcome = await instance.dispatch({
           type: "click",
           commandId: "legacy-completed",
           ref: "owned-ref",
         });
+        return {
+          outcome,
+          completedWrites: instance.state.completedWrites,
+          tombstones: instance.state.legacyCommandTombstones,
+        };
       },
     );
-    expect(outcome).toMatchObject({
+    expect(result.outcome).toMatchObject({
       ok: false,
       reason: "id_conflict",
     });
+    expect(result.completedWrites).toEqual([]);
+    expect(result.tombstones).toEqual([{ commandId: "legacy-completed" }]);
   });
 
   it("keeps a pre-migration awaiting ID fenced across hello until its late event arrives", async () => {
@@ -692,6 +707,58 @@ describe("legacy replay tombstones", () => {
       );
       expect(instance.state.awaitingCommandIds).toEqual([]);
       expect(instance.state.completedWrites).toEqual([]);
+      expect(instance.state.legacyCommandTombstones).toContainEqual({
+        commandId: "legacy-awaiting",
+      });
+      await expect(
+        instance.dispatch({
+          type: "click",
+          commandId: "legacy-awaiting",
+          ref: "owned-ref",
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        reason: "id_conflict",
+      });
+    });
+  });
+
+  it("converts a mismatched typed replay payload into an ID-only tombstone", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    const command: Command = {
+      type: "click",
+      commandId: "mismatched-result",
+      ref: "owned-ref",
+    };
+    const tombstone = {
+      commandId: command.commandId,
+      commandType: command.type,
+      requestFingerprint: await requestFingerprint(command, false),
+    } as const;
+
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      instance.setState({
+        ...instance.state,
+        completedWrites: [
+          {
+            ...tombstone,
+            event: {
+              type: "action_result",
+              commandId: "another-command",
+              ok: true,
+            },
+          },
+        ],
+      });
+
+      await expect(instance.dispatch(command)).resolves.toMatchObject({
+        ok: false,
+        reason: "id_conflict",
+      });
+      expect(instance.state.completedWrites).toEqual([]);
+      expect(instance.state.legacyCommandTombstones).toEqual([
+        { commandId: command.commandId },
+      ]);
     });
   });
 });

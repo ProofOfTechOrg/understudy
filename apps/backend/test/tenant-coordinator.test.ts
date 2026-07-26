@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import type { TenantDeviceCoordinator } from "../src/tenant-coordinator";
+import type {
+  RegisterDeviceInput,
+  TenantDeviceCoordinator,
+} from "../src/tenant-coordinator";
 
 const DEVICE_A = "00000000-0000-4000-8000-000000000001";
 const DEVICE_B = "00000000-0000-4000-8000-000000000002";
@@ -56,6 +59,69 @@ function leaseInput(
 }
 
 describe("TenantDeviceCoordinator allocation", () => {
+  it("rejects stale or conflicting credential registrations monotonically", async () => {
+    const stub = coordinator();
+    const base = {
+      deviceId: DEVICE_A,
+      browser: "Chrome/125",
+      extVersion: "0.1.0",
+      browserEpoch: BROWSER_EPOCH,
+      credentialDigest: "b".repeat(64),
+      credentialVersion: 2,
+      allowedOrigins: ["https://one.example"],
+      capabilities: ["safe-write-v2"],
+      now: 1_000_000,
+    } satisfies RegisterDeviceInput;
+
+    await expect(stub.registerDevice(base)).resolves.toEqual({
+      accepted: true,
+      epochChanged: false,
+    });
+    await expect(
+      stub.registerDevice({
+        ...base,
+        browserEpoch: "stale-epoch",
+        credentialDigest: "a".repeat(64),
+        credentialVersion: 1,
+      }),
+    ).resolves.toEqual({ accepted: false, epochChanged: false });
+    await expect(
+      stub.registerDevice({
+        ...base,
+        browserEpoch: "conflicting-epoch",
+        credentialDigest: "c".repeat(64),
+      }),
+    ).resolves.toEqual({ accepted: false, epochChanged: false });
+    await expect(
+      stub.registerDevice({
+        ...base,
+        browserEpoch: "browser-epoch-2",
+        credentialDigest: "d".repeat(64),
+        credentialVersion: 3,
+      }),
+    ).resolves.toEqual({ accepted: true, epochChanged: true });
+
+    await expect(
+      stub.heartbeat(DEVICE_A, "conflicting-epoch", [], 1_000_001),
+    ).resolves.toMatchObject({ ok: false });
+    await expect(
+      stub.heartbeat(DEVICE_A, "browser-epoch-2", [], 1_000_001),
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      stub.revokeDevice(
+        DEVICE_A,
+        {
+          credentialDigest: base.credentialDigest,
+          credentialVersion: base.credentialVersion,
+        },
+        1_000_002,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      stub.heartbeat(DEVICE_A, "browser-epoch-2", [], 1_000_003),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
   it("atomically admits two disjoint leases on one device and rejects a third", async () => {
     const stub = coordinator();
     await register(stub, DEVICE_A);

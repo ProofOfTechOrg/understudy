@@ -112,6 +112,8 @@ export type PersistedLegacyAwaiting =
   | LegacyCommandTombstone
   | { commandId: string };
 
+export type PersistedLegacyCommandTombstone = PersistedLegacyAwaiting;
+
 export type PersistedCompletedLegacyWrite =
   | CompletedLegacyWrite
   | { commandId: string; event: Event };
@@ -151,7 +153,7 @@ export interface SessionState {
    * Fill-secret results carry only ok/error and never plaintext.
    */
   completedWrites: PersistedCompletedLegacyWrite[];
-  legacyCommandTombstones?: LegacyCommandTombstone[];
+  legacyCommandTombstones?: PersistedLegacyCommandTombstone[];
   /**
    * Recent page dialogs the extension handled (alert/confirm/prompt/
    * beforeunload), oldest first, capped in session.ts. Surfaced to the consumer

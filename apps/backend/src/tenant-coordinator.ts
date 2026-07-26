@@ -27,6 +27,13 @@ interface DeviceRow {
   capabilities_json: string;
 }
 
+interface DeviceCredentialRow {
+  [key: string]: string | number;
+  device_id: string;
+  credential_digest: string;
+  credential_version: number;
+}
+
 interface LeaseRow {
   [key: string]: string | number | null;
   session_id: string;
@@ -122,6 +129,11 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
         origin_policy_json TEXT NOT NULL,
         capabilities_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS device_credential_fence (
+        device_id TEXT PRIMARY KEY,
+        credential_digest TEXT NOT NULL,
+        credential_version INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS lease (
         session_id TEXT PRIMARY KEY,
         lease_id TEXT NOT NULL UNIQUE,
@@ -157,7 +169,20 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     `);
   }
 
-  async registerDevice(input: RegisterDeviceInput): Promise<{ epochChanged: boolean }> {
+  async advanceDeviceCredential(input: {
+    deviceId: string;
+    credentialDigest: string;
+    credentialVersion: number;
+  }): Promise<{ accepted: boolean }> {
+    return { accepted: this.advanceCredentialFence(input) };
+  }
+
+  async registerDevice(
+    input: RegisterDeviceInput,
+  ): Promise<{ accepted: boolean; epochChanged: boolean }> {
+    if (!this.advanceCredentialFence(input)) {
+      return { accepted: false, epochChanged: false };
+    }
     const now = input.now ?? Date.now();
     const previous = this.device(input.deviceId);
     const epochChanged =
@@ -216,7 +241,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       );
     }
     await this.scheduleNextAlarm();
-    return { epochChanged };
+    return { accepted: true, epochChanged };
   }
 
   async heartbeat(
@@ -692,7 +717,20 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     );
   }
 
-  async revokeDevice(deviceId: string, now = Date.now()): Promise<void> {
+  async revokeDevice(
+    deviceId: string,
+    expectedCredential?: {
+      credentialDigest: string;
+      credentialVersion: number;
+    },
+    now = Date.now(),
+  ): Promise<boolean> {
+    if (
+      expectedCredential !== undefined &&
+      !this.credentialFenceMatches(deviceId, expectedCredential)
+    ) {
+      return false;
+    }
     const leases = this.activeLeasesForDevice(deviceId);
     this.ctx.storage.sql.exec(
       "UPDATE device SET enabled = 0 WHERE device_id = ?",
@@ -714,6 +752,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
         // The coordinator's terminal lease remains authoritative.
       }
     }
+    return true;
   }
 
   async listDevices(now = Date.now()): Promise<DeviceStatus[]> {
@@ -909,6 +948,58 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
        WHERE device_id = ? AND release_at IS NULL
          AND status IN ('allocating','provisioning','connected','recovering','closing','expired')`,
       deviceId,
+    );
+  }
+
+  private advanceCredentialFence(input: {
+    deviceId: string;
+    credentialDigest: string;
+    credentialVersion: number;
+  }): boolean {
+    const existing = this.ctx.storage.sql
+      .exec<DeviceCredentialRow>(
+        "SELECT * FROM device_credential_fence WHERE device_id = ?",
+        input.deviceId,
+      )
+      .toArray()[0];
+    if (
+      existing !== undefined &&
+      (input.credentialVersion < existing.credential_version ||
+        (input.credentialVersion === existing.credential_version &&
+          input.credentialDigest !== existing.credential_digest))
+    ) {
+      return false;
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO device_credential_fence (
+         device_id, credential_digest, credential_version
+       ) VALUES (?, ?, ?)
+       ON CONFLICT(device_id) DO UPDATE SET
+         credential_digest = excluded.credential_digest,
+         credential_version = excluded.credential_version`,
+      input.deviceId,
+      input.credentialDigest,
+      input.credentialVersion,
+    );
+    return true;
+  }
+
+  private credentialFenceMatches(
+    deviceId: string,
+    expected: {
+      credentialDigest: string;
+      credentialVersion: number;
+    },
+  ): boolean {
+    const row = this.ctx.storage.sql
+      .exec<DeviceCredentialRow>(
+        "SELECT * FROM device_credential_fence WHERE device_id = ?",
+        deviceId,
+      )
+      .toArray()[0];
+    return (
+      row?.credential_digest === expected.credentialDigest &&
+      row.credential_version === expected.credentialVersion
     );
   }
 

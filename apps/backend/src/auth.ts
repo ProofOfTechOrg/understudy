@@ -31,6 +31,7 @@ export interface WsTicketClaims {
   aud: "device-control" | "session";
   tenantId: string;
   deviceId: string;
+  credentialVersion?: number;
   sessionId?: string;
   leaseId?: string;
   leaseEpoch: number;
@@ -325,6 +326,7 @@ export async function verifyWsTicket(
       "aud",
       "tenantId",
       "deviceId",
+      "credentialVersion",
       "sessionId",
       "leaseId",
       "leaseEpoch",
@@ -364,12 +366,22 @@ export async function verifyWsTicket(
       return null;
     }
     if (
+      claims.credentialVersion !== undefined &&
+      (typeof claims.credentialVersion !== "number" ||
+        !Number.isInteger(claims.credentialVersion) ||
+        claims.credentialVersion < 1)
+    ) {
+      return null;
+    }
+    if (
       (claims.aud === "device-control" &&
-        (claims.sessionId !== undefined ||
+        (claims.credentialVersion === undefined ||
+          claims.sessionId !== undefined ||
           claims.leaseId !== undefined ||
           claims.leaseEpoch !== 0)) ||
       (claims.aud === "session" &&
-        (typeof claims.sessionId !== "string" ||
+        (claims.credentialVersion !== undefined ||
+          typeof claims.sessionId !== "string" ||
           claims.sessionId.length < 1 ||
           typeof claims.leaseId !== "string" ||
           claims.leaseId.length < 1 ||

@@ -60,6 +60,8 @@ class FakeWebSocket {
 interface BrowserFixture {
   local: Record<string, unknown>;
   session: Record<string, unknown>;
+  localArea: ReturnType<typeof storageArea>;
+  sessionArea: ReturnType<typeof storageArea>;
   removeTab: ReturnType<typeof vi.fn>;
   getTab: ReturnType<typeof vi.fn>;
   createWindow: ReturnType<typeof vi.fn>;
@@ -90,12 +92,33 @@ function installBrowser(
       getTargets: vi.fn(async () => []),
       attach: vi.fn(async () => {}),
       detach: vi.fn(async () => {}),
-      sendCommand: vi.fn(async () => ({})),
+      sendCommand: vi.fn(
+        async (_target: unknown, method: string) =>
+          method === "Page.getFrameTree"
+            ? {
+                frameTree: {
+                  frame: {
+                    id: "main-frame",
+                    loaderId: "loader-1",
+                    url: "about:blank",
+                  },
+                },
+              }
+            : {},
+      ),
     },
     tabs: { remove: removeTab, get: getTab },
     windows: { create: createWindow },
   });
-  return { local, session, removeTab, getTab, createWindow };
+  return {
+    local,
+    session,
+    localArea,
+    sessionArea,
+    removeTab,
+    getTab,
+    createWindow,
+  };
 }
 
 function storageArea(state: Record<string, unknown>) {
@@ -255,6 +278,165 @@ describe("ProfileClient generation fencing", () => {
     expect(client.currentStatus()).toBe("error");
   });
 
+  it("persists replacement fencing across alarms and service-worker restart until an explicit save", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        ticketResponse(),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    FakeWebSocket.instances[0]?.open();
+
+    FakeWebSocket.instances[0]?.emit("close", { code: 4001 });
+    await vi.waitFor(() =>
+      expect(fixture.local["understudy:controlBlock"]).toMatchObject({
+        version: 1,
+        reason: "replaced",
+      }),
+    );
+    await client.ensureConnection();
+
+    const restarted = new ProfileClient();
+    await restarted.start();
+    await restarted.ensureConnection();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(restarted.currentStatus()).toBe("error");
+
+    await restarted.configure(CONFIG);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fixture.local["understudy:controlBlock"]).toBeNull();
+  });
+
+  it("lets an explicit save queued behind replacement cleanup clear the terminal latch", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL) => ticketResponse(),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    FakeWebSocket.instances[0]?.open();
+
+    FakeWebSocket.instances[0]?.emit("close", { code: 4001 });
+    const replacement = {
+      ...CONFIG,
+      deviceCredential: "replacement-credential",
+    };
+    await client.configure(replacement);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fixture.local.deviceCredential).toBe("replacement-credential");
+    expect(fixture.local["understudy:controlBlock"]).toBeNull();
+    expect(client.currentStatus()).toBe("connecting");
+  });
+
+  it("completes epoch initialization before a concurrent configure request", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    const originalGet = fixture.sessionArea.get.getMockImplementation();
+    if (originalGet === undefined) throw new Error("storage get mock missing");
+    let releaseEpoch!: () => void;
+    const epochGate = new Promise<void>((resolve) => {
+      releaseEpoch = resolve;
+    });
+    fixture.sessionArea.get.mockImplementation(
+      async (keys: string | string[]) => {
+        const requested = Array.isArray(keys) ? keys : [keys];
+        if (requested.includes("understudy:browserEpoch")) await epochGate;
+        return originalGet(keys);
+      },
+    );
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        ticketResponse(),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+
+    const starting = client.start();
+    await vi.waitFor(() => expect(fixture.sessionArea.get).toHaveBeenCalled());
+    const configuring = client.configure(CONFIG);
+    releaseEpoch();
+    await Promise.all([starting, configuring]);
+
+    expect(client.browserEpoch()).toBe(EPOCH);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toEqual({
+      browserEpoch: EPOCH,
+    });
+  });
+
+  it("restores ownership before a Stop All request that arrives during startup", async () => {
+    const assignment = {
+      sessionId: "session-startup",
+      leaseId: "lease-startup",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      tabId: 7,
+      windowId: 3,
+    };
+    const fixture = installBrowser({
+      local: persistedConfig(CONFIG),
+      session: {
+        "understudy:browserEpoch": EPOCH,
+        "understudy:assignments": {
+          version: 2,
+          assignments: [assignment],
+          closedOutbox: [],
+        },
+      },
+    });
+    const originalGet = fixture.sessionArea.get.getMockImplementation();
+    if (originalGet === undefined) throw new Error("storage get mock missing");
+    let releaseEpoch!: () => void;
+    const epochGate = new Promise<void>((resolve) => {
+      releaseEpoch = resolve;
+    });
+    fixture.sessionArea.get.mockImplementation(
+      async (keys: string | string[]) => {
+        const requested = Array.isArray(keys) ? keys : [keys];
+        if (requested.includes("understudy:browserEpoch")) await epochGate;
+        return originalGet(keys);
+      },
+    );
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        ticketResponse(),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+
+    const starting = client.start();
+    await vi.waitFor(() => expect(fixture.sessionArea.get).toHaveBeenCalled());
+    const stopping = client.stopAll();
+    releaseEpoch();
+    await Promise.all([starting, stopping]);
+
+    expect(client.browserEpoch()).toBe(EPOCH);
+    expect(fixture.removeTab).toHaveBeenCalledWith(assignment.tabId);
+    expect(client.sessions.assignments()).toEqual([]);
+    expect(client.sessions.vacatedLeases()).toEqual([]);
+    expect(client.sessions.closureOutbox()).toEqual([
+      {
+        sessionId: assignment.sessionId,
+        leaseId: assignment.leaseId,
+        leaseEpoch: assignment.leaseEpoch,
+        browserEpoch: assignment.browserEpoch,
+      },
+    ]);
+    expect(JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string)).toEqual({
+      browserEpoch: EPOCH,
+    });
+  });
+
   it("rejects a ticket websocket URL that changes the configured service origin", async () => {
     installBrowser();
     const fetchMock = vi.fn(async () =>
@@ -276,7 +458,9 @@ describe("ProfileClient generation fencing", () => {
 
   it("persists credential revocation and cancels all ticket reconnects", async () => {
     const fixture = installBrowser();
-    const fetchMock = vi.fn(async () => ticketResponse());
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL) => ticketResponse(),
+    );
     vi.stubGlobal("fetch", fetchMock);
     const client = new ProfileClient();
     await client.configure(CONFIG);
@@ -354,6 +538,109 @@ describe("ProfileClient generation fencing", () => {
 });
 
 describe("ProfileClient startup cleanup", () => {
+  it("consumes a vacated lease only after its replacement runtime is installed", async () => {
+    const vacated = {
+      sessionId: "session-vacated",
+      leaseId: "lease-vacated",
+      leaseEpoch: 2,
+      browserEpoch: EPOCH,
+    };
+    const fixture = installBrowser({
+      local: persistedConfig(CONFIG),
+      session: {
+        "understudy:browserEpoch": EPOCH,
+        "understudy:assignments": {
+          version: 3,
+          assignments: [],
+          closedOutbox: [],
+          vacatedLeases: [vacated],
+        },
+      },
+    });
+    fixture.createWindow.mockResolvedValue({
+      id: 3,
+      tabs: [{ id: 7 }],
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.start();
+    const control = FakeWebSocket.instances[0];
+    control?.open();
+
+    control?.message({
+      type: "provision",
+      ...vacated,
+      allowedOrigins: ["https://app.example"],
+      sessionTicket: "session-ticket",
+    });
+
+    await vi.waitFor(() =>
+      expect(control?.sent).toContainEqual(
+        expect.objectContaining({
+          type: "provisioned",
+          sessionId: vacated.sessionId,
+          leaseId: vacated.leaseId,
+        }),
+      ),
+    );
+    expect(client.sessions.vacatedLeases()).toEqual([]);
+    expect(client.sessions.assignments()).toEqual([
+      expect.objectContaining({
+        sessionId: vacated.sessionId,
+        leaseId: vacated.leaseId,
+      }),
+    ]);
+  });
+
+  it("promotes a vacated lease through the old profile before committing a replacement", async () => {
+    const vacated = {
+      sessionId: "session-vacated",
+      leaseId: "lease-vacated",
+      leaseEpoch: 2,
+      browserEpoch: EPOCH,
+    };
+    const fixture = installBrowser({
+      local: persistedConfig(CONFIG),
+      session: {
+        "understudy:browserEpoch": EPOCH,
+        "understudy:assignments": {
+          version: 3,
+          assignments: [],
+          closedOutbox: [],
+          vacatedLeases: [vacated],
+        },
+      },
+    });
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL) => ticketResponse(),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+    await client.start();
+    const hosting = FakeWebSocket.instances[0];
+    hosting?.open();
+
+    const replacement: ProfileConfig = {
+      ...CONFIG,
+      serviceOrigin: "https://new.example",
+      deviceCredential: "new-credential",
+    };
+    await client.configure(replacement);
+    const cleanup = FakeWebSocket.instances[1];
+    cleanup?.open();
+
+    await vi.waitFor(() =>
+      expect(cleanup?.sent).toContainEqual({ type: "closed", ...vacated }),
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "https://old.example/v1/device/connect-ticket",
+      "https://old.example/v1/device/connect-ticket",
+      "https://new.example/v1/device/connect-ticket",
+    ]);
+    expect(fixture.local.serviceOrigin).toBe("https://new.example");
+  });
+
   it("discards local ownership without ticket churn after durable credential revocation", async () => {
     const assignment = {
       sessionId: "session-1",

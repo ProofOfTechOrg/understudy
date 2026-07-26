@@ -370,4 +370,63 @@ describe("device authentication and WebSocket tickets", () => {
       ),
     ).resolves.toBeNull();
   });
+
+  it("requires credential versions only on device-control tickets", async () => {
+    const env = makeEnv();
+    const now = 1_000_000;
+    const deviceClaims = {
+      aud: "device-control" as const,
+      tenantId: "tenantA",
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      leaseEpoch: 0,
+      browserEpoch: "browser-1",
+      agentName: "00000000-0000-4000-8000-000000000001",
+    };
+    const versioned = await mintWsTicket(
+      { ...deviceClaims, credentialVersion: 2 },
+      env,
+      now,
+    );
+    const unversioned = await mintWsTicket(deviceClaims, env, now);
+    const sessionWithVersion = await mintWsTicket(
+      {
+        aud: "session",
+        tenantId: "tenantA",
+        deviceId: deviceClaims.deviceId,
+        credentialVersion: 2,
+        sessionId: "session-1",
+        leaseId: "lease-1",
+        leaseEpoch: 1,
+        browserEpoch: "browser-1",
+        agentName: "session-1",
+      },
+      env,
+      now,
+    );
+
+    await expect(
+      verifyWsTicket(
+        versioned,
+        { aud: "device-control", agentName: deviceClaims.agentName },
+        env,
+        now,
+      ),
+    ).resolves.toMatchObject({ credentialVersion: 2 });
+    await expect(
+      verifyWsTicket(
+        unversioned,
+        { aud: "device-control", agentName: deviceClaims.agentName },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      verifyWsTicket(
+        sessionWithVersion,
+        { aud: "session", agentName: "session-1" },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+  });
 });

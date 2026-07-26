@@ -17,6 +17,7 @@ import { ReconnectingWs } from "./ws-client";
 const BROWSER_EPOCH_KEY = "understudy:browserEpoch";
 const STAGED_CONFIG_KEY = "understudy:stagedProfile";
 const CREDENTIAL_REVOKED_KEY = "understudy:credentialRevoked";
+const CONTROL_BLOCK_KEY = "understudy:controlBlock";
 const CONFIG_KEYS = [
   "serviceOrigin",
   "unattendedEnabled",
@@ -28,6 +29,17 @@ const TICKET_BACKOFF_BASE_MS = 500;
 const TICKET_BACKOFF_CAP_MS = 30_000;
 
 type ControlPurpose = "hosting" | "cleanup";
+type ControlBlockReason =
+  | "replaced"
+  | "terminal_close"
+  | "ticket_rejected"
+  | "invalid_ticket";
+
+interface ControlBlock {
+  version: 1;
+  profileKey: string;
+  reason: ControlBlockReason;
+}
 
 interface ControlAttempt {
   generation: number;
@@ -51,6 +63,9 @@ export class ProfileClient {
   private config: ProfileConfig | null = null;
   private stagedConfig: ProfileConfig | null = null;
   private credentialRevoked = false;
+  private controlBlock: ControlBlock | null = null;
+  private blockedProfileIdentity: string | null = null;
+  private activeProfileKey: string | null = null;
   private epoch = "";
   private control: ReconnectingWs | null = null;
   private controlAttempt: ControlAttempt | null = null;
@@ -60,6 +75,8 @@ export class ProfileClient {
   private status: ProfileStatus = "disabled";
   private controlFrameTail: Promise<void> = Promise.resolve();
   private configWriteTail: Promise<void> = Promise.resolve();
+  private initialization: Promise<void> | null = null;
+  private lifecycleTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly onStatus?: (status: ProfileStatus) => void) {
     this.sessions = new SessionManager(
@@ -68,40 +85,63 @@ export class ProfileClient {
     );
   }
 
-  async start(): Promise<void> {
-    const generation = this.invalidateControl();
+  start(): Promise<void> {
+    return this.startRequest(this.generation);
+  }
+
+  private async startRequest(generation: number): Promise<void> {
+    await this.enqueueLifecycle(async () => {
+      await this.ensureInitialized();
+    });
+    await this.resumeForGeneration(generation);
+  }
+
+  private ensureInitialized(): Promise<void> {
+    return (this.initialization ??= this.initialize());
+  }
+
+  private async initialize(): Promise<void> {
     await this.restrictLocalStorage();
-    if (!this.isGenerationCurrent(generation)) return;
     this.epoch = await this.loadBrowserEpoch();
-    if (!this.isGenerationCurrent(generation)) return;
     const stored = await this.loadProfileState();
-    if (!this.isGenerationCurrent(generation)) return;
     this.config = stored.active;
     this.stagedConfig = stored.staged;
     this.credentialRevoked = stored.credentialRevoked;
+    this.controlBlock = stored.controlBlock;
+    if (this.config !== null) {
+      this.activeProfileKey = await profileKey(this.config);
+    }
+    if (this.config !== null && this.controlBlock !== null) {
+      if (this.activeProfileKey === this.controlBlock.profileKey) {
+        this.blockedProfileIdentity = profileIdentity(this.config);
+      } else {
+        this.controlBlock = null;
+        await browser.storage.local.remove(CONTROL_BLOCK_KEY);
+      }
+    } else if (this.controlBlock !== null) {
+      this.controlBlock = null;
+      await browser.storage.local.remove(CONTROL_BLOCK_KEY);
+    }
 
     const restoreIntent =
-      this.credentialRevoked || this.config === null
+      this.credentialRevoked ||
+      this.blockedProfileIdentity !== null ||
+      this.config === null
         ? "discard"
         : this.config.unattendedEnabled && this.stagedConfig === null
           ? "recover"
           : "release";
     await this.sessions.restoreSameEpoch(restoreIntent);
-    if (!this.isGenerationCurrent(generation)) return;
 
     if (this.config === null) {
-      await this.sessions.discardClosureOutbox();
-      if (!this.isGenerationCurrent(generation)) return;
+      await this.sessions.discardServerState();
       this.setStatus("disabled");
       return;
     }
-    if (this.credentialRevoked) {
-      await this.sessions.discardClosureOutbox();
-      if (!this.isGenerationCurrent(generation)) return;
+    if (this.credentialRevoked || this.blockedProfileIdentity !== null) {
+      await this.sessions.discardServerState();
       this.setStatus("error");
-      return;
     }
-    await this.resumeForGeneration(generation);
   }
 
   browserEpoch(): string {
@@ -122,17 +162,41 @@ export class ProfileClient {
     };
   }
 
-  async configure(config: ProfileConfig): Promise<void> {
+  configure(config: ProfileConfig): Promise<void> {
     const normalized = normalizeProfileConfig(config);
     const generation = this.invalidateControl();
+    return this.configureRequest(normalized, generation);
+  }
+
+  private async configureRequest(
+    normalized: ProfileConfig,
+    generation: number,
+  ): Promise<void> {
+    await this.enqueueLifecycle(async () => {
+      await this.ensureInitialized();
+      if (!this.isGenerationCurrent(generation)) return;
+      await this.configureInitialized(normalized, generation);
+    });
+    await this.resumeForGeneration(generation);
+  }
+
+  private async configureInitialized(
+    normalized: ProfileConfig,
+    generation: number,
+  ): Promise<void> {
+    const normalizedKey = await profileKey(normalized);
+    if (!this.isGenerationCurrent(generation)) return;
+    this.blockedProfileIdentity = null;
+    this.controlBlock = null;
     const wasCredentialRevoked = this.credentialRevoked;
     if (wasCredentialRevoked) {
       this.config = normalized;
+      this.activeProfileKey = normalizedKey;
       this.stagedConfig = null;
       if (!(await this.persistProfileState(normalized, null, generation))) return;
       await this.sessions.stopAll("discard");
       if (!this.isGenerationCurrent(generation)) return;
-      await this.sessions.discardClosureOutbox();
+      await this.sessions.discardServerState();
       if (!this.isGenerationCurrent(generation)) return;
       this.credentialRevoked = false;
       try {
@@ -143,7 +207,6 @@ export class ProfileClient {
         }
         throw error;
       }
-      await this.resumeForGeneration(generation);
       return;
     }
     this.credentialRevoked = false;
@@ -154,7 +217,8 @@ export class ProfileClient {
       current !== null &&
       (current.unattendedEnabled ||
         this.sessions.assignments().length > 0 ||
-        this.sessions.closureOutbox().length > 0);
+        this.sessions.closureOutbox().length > 0 ||
+        this.sessions.vacatedLeases().length > 0);
 
     if (current !== null && identityChanged && ownsOldWork) {
       this.config = { ...current, unattendedEnabled: false };
@@ -170,22 +234,34 @@ export class ProfileClient {
       }
       await this.sessions.stopAll("release");
       if (!this.isGenerationCurrent(generation)) return;
-      await this.resumeForGeneration(generation);
       return;
     }
 
     this.config = normalized;
+    this.activeProfileKey = normalizedKey;
     this.stagedConfig = null;
     if (!(await this.persistProfileState(normalized, null, generation))) return;
     if (!normalized.unattendedEnabled) {
       await this.sessions.stopAll("release");
       if (!this.isGenerationCurrent(generation)) return;
     }
+  }
+
+  stopAll(): Promise<void> {
+    const generation = this.invalidateControl();
+    return this.stopAllRequest(generation);
+  }
+
+  private async stopAllRequest(generation: number): Promise<void> {
+    await this.enqueueLifecycle(async () => {
+      await this.ensureInitialized();
+      if (!this.isGenerationCurrent(generation)) return;
+      await this.stopAllInitialized(generation);
+    });
     await this.resumeForGeneration(generation);
   }
 
-  async stopAll(): Promise<void> {
-    const generation = this.invalidateControl();
+  private async stopAllInitialized(generation: number): Promise<void> {
     this.stagedConfig = null;
     if (this.config !== null) {
       this.config = { ...this.config, unattendedEnabled: false };
@@ -195,12 +271,19 @@ export class ProfileClient {
       this.credentialRevoked ? "discard" : "release",
     );
     if (!this.isGenerationCurrent(generation)) return;
-    await this.resumeForGeneration(generation);
   }
 
-  async ensureConnection(): Promise<void> {
-    const generation = this.generation;
-    await this.sessions.retryCleanup();
+  ensureConnection(): Promise<void> {
+    return this.ensureConnectionRequest();
+  }
+
+  private async ensureConnectionRequest(): Promise<void> {
+    let generation = this.generation;
+    await this.enqueueLifecycle(async () => {
+      await this.ensureInitialized();
+      generation = this.generation;
+      await this.sessions.retryCleanup();
+    });
     if (!this.isGenerationCurrent(generation)) return;
     const attempt = this.controlAttempt;
     if (attempt !== null && this.control !== null) {
@@ -212,7 +295,7 @@ export class ProfileClient {
 
   private async resumeForGeneration(generation: number): Promise<void> {
     if (!this.isGenerationCurrent(generation)) return;
-    if (this.credentialRevoked) {
+    if (this.credentialRevoked || this.isControlBlocked()) {
       this.setStatus("error");
       return;
     }
@@ -300,7 +383,10 @@ export class ProfileClient {
       if (isRetryableTicketStatus(response.status)) {
         this.scheduleRetry(attempt);
       } else {
-        this.setStatus("error");
+        await this.blockControlAfterTicketError(
+          attempt.config,
+          "ticket_rejected",
+        );
       }
       return;
     }
@@ -311,13 +397,19 @@ export class ProfileClient {
     } catch {
       if (!this.isAttemptCurrent(attempt)) return;
       this.controlAttempt = null;
-      this.setStatus("error");
+      await this.blockControlAfterTicketError(
+        attempt.config,
+        "invalid_ticket",
+      );
       return;
     }
     if (!this.isAttemptCurrent(attempt)) return;
     if (!isTicketResponse(value)) {
       this.controlAttempt = null;
-      this.setStatus("error");
+      await this.blockControlAfterTicketError(
+        attempt.config,
+        "invalid_ticket",
+      );
       return;
     }
 
@@ -332,7 +424,10 @@ export class ProfileClient {
       }
     } catch {
       this.controlAttempt = null;
-      this.setStatus("error");
+      await this.blockControlAfterTicketError(
+        attempt.config,
+        "invalid_ticket",
+      );
       return;
     }
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -378,8 +473,22 @@ export class ProfileClient {
             event.code === WS_CLOSE_REPLACED ||
             event.code === WS_CLOSE_SESSION_TERMINAL
           ) {
+            const reason =
+              event.code === WS_CLOSE_REPLACED
+                ? "replaced"
+                : "terminal_close";
+            this.blockedProfileIdentity = profileIdentity(attempt.config);
             this.invalidateControl();
             this.setStatus("error");
+            void this.enqueueLifecycle(async () => {
+              await this.ensureInitialized();
+              await this.persistControlBlockAndDiscard(
+                attempt.config,
+                reason,
+              );
+            }).catch(() => {
+              this.setStatus("error");
+            });
             return;
           }
           peer.stop();
@@ -470,7 +579,10 @@ export class ProfileClient {
         this.sessions.connectSessionTicket(frame);
         return;
       case "credential_revoked":
-        await this.handleCredentialRevoked(attempt, peer);
+        this.invalidateControl();
+        await this.enqueueLifecycle(async () => {
+          await this.handleCredentialRevoked();
+        });
         return;
     }
   }
@@ -500,9 +612,12 @@ export class ProfileClient {
   private async promoteStaged(generation: number): Promise<void> {
     const staged = this.stagedConfig;
     if (staged === null || !this.isGenerationCurrent(generation)) return;
+    const stagedKey = await profileKey(staged);
+    if (!this.isGenerationCurrent(generation)) return;
     if (!(await this.persistProfileState(staged, null, generation))) return;
     if (!this.isGenerationCurrent(generation)) return;
     this.config = staged;
+    this.activeProfileKey = stagedKey;
     this.stagedConfig = null;
     if (staged.unattendedEnabled) {
       await this.connectControl(staged, "hosting", generation);
@@ -511,22 +626,59 @@ export class ProfileClient {
     }
   }
 
-  private async handleCredentialRevoked(
-    attempt: ControlAttempt,
-    peer: ReconnectingWs,
-  ): Promise<void> {
-    if (!this.isPeerCurrent(attempt, peer)) return;
-    const generation = this.invalidateControl();
+  private async handleCredentialRevoked(): Promise<void> {
     this.credentialRevoked = true;
+    this.blockedProfileIdentity = null;
+    this.controlBlock = null;
     this.stagedConfig = null;
     if (this.config !== null) {
       this.config = { ...this.config, unattendedEnabled: false };
-      if (!(await this.persistProfileState(this.config, null, generation))) return;
+      if (!(await this.persistProfileState(this.config, null))) return;
     }
     await this.sessions.stopAll("discard");
-    if (!this.isGenerationCurrent(generation)) return;
-    await this.sessions.discardClosureOutbox();
-    if (!this.isGenerationCurrent(generation)) return;
+    await this.sessions.discardServerState();
+    this.setStatus("error");
+  }
+
+  private async blockControlAfterTicketError(
+    config: ProfileConfig,
+    reason: ControlBlockReason,
+  ): Promise<void> {
+    this.blockedProfileIdentity = profileIdentity(config);
+    this.invalidateControl();
+    await this.enqueueLifecycle(async () => {
+      await this.persistControlBlockAndDiscard(config, reason);
+    });
+  }
+
+  private async persistControlBlockAndDiscard(
+    config: ProfileConfig,
+    reason: ControlBlockReason,
+  ): Promise<void> {
+    if (
+      this.config === null ||
+      profileIdentity(this.config) !== profileIdentity(config)
+    ) {
+      if (this.blockedProfileIdentity === profileIdentity(config)) {
+        this.blockedProfileIdentity = null;
+      }
+      return;
+    }
+    this.blockedProfileIdentity = profileIdentity(config);
+    const key = this.activeProfileKey;
+    if (key === null) return;
+    const block: ControlBlock = {
+      version: 1,
+      profileKey: key,
+      reason,
+    };
+    this.controlBlock = block;
+    await browser.storage.local.set({ [CONTROL_BLOCK_KEY]: block });
+    if (!this.isControlBlocked()) return;
+    await this.sessions.stopAll("discard");
+    if (!this.isControlBlocked()) return;
+    await this.sessions.discardServerState();
+    if (!this.isControlBlocked()) return;
     this.setStatus("error");
   }
 
@@ -605,7 +757,11 @@ export class ProfileClient {
     purpose: ControlPurpose,
     generation: number,
   ): boolean {
-    if (!this.isGenerationCurrent(generation) || this.config === null) {
+    if (
+      !this.isGenerationCurrent(generation) ||
+      this.config === null ||
+      this.isControlBlocked()
+    ) {
       return false;
     }
     if (profileIdentity(this.config) !== profileIdentity(config)) return false;
@@ -622,17 +778,24 @@ export class ProfileClient {
   private async persistProfileState(
     active: ProfileConfig,
     staged: ProfileConfig | null,
-    generation: number,
+    generation?: number,
   ): Promise<boolean> {
     let written = false;
     const write = this.configWriteTail.then(async () => {
-      if (!this.isGenerationCurrent(generation)) return;
+      if (
+        generation !== undefined &&
+        !this.isGenerationCurrent(generation)
+      ) {
+        return;
+      }
       await browser.storage.local.set({
         ...active,
         [STAGED_CONFIG_KEY]: staged === null ? null : cloneConfig(staged),
         [CREDENTIAL_REVOKED_KEY]: this.credentialRevoked,
+        [CONTROL_BLOCK_KEY]: this.controlBlock,
       });
-      written = this.isGenerationCurrent(generation);
+      written =
+        generation === undefined || this.isGenerationCurrent(generation);
     });
     this.configWriteTail = write.catch(() => {});
     await write;
@@ -652,11 +815,13 @@ export class ProfileClient {
     active: ProfileConfig | null;
     staged: ProfileConfig | null;
     credentialRevoked: boolean;
+    controlBlock: ControlBlock | null;
   }> {
     const stored = await browser.storage.local.get([
       ...CONFIG_KEYS,
       STAGED_CONFIG_KEY,
       CREDENTIAL_REVOKED_KEY,
+      CONTROL_BLOCK_KEY,
     ]);
     const candidate = {
       serviceOrigin: stored.serviceOrigin,
@@ -685,6 +850,7 @@ export class ProfileClient {
       active,
       staged,
       credentialRevoked: stored[CREDENTIAL_REVOKED_KEY] === true,
+      controlBlock: parseControlBlock(stored[CONTROL_BLOCK_KEY]),
     };
   }
 
@@ -702,6 +868,19 @@ export class ProfileClient {
       throw new Error("unattended profile is not configured");
     }
     return this.config;
+  }
+
+  private isControlBlocked(): boolean {
+    return (
+      this.config !== null &&
+      this.blockedProfileIdentity === profileIdentity(this.config)
+    );
+  }
+
+  private enqueueLifecycle(operation: () => Promise<void>): Promise<void> {
+    const run = this.lifecycleTail.then(operation, operation);
+    this.lifecycleTail = run.catch(() => {});
+    return run;
   }
 
   private setStatus(status: ProfileStatus): void {
@@ -799,6 +978,33 @@ function profileIdentity(config: ProfileConfig): string {
     deviceCredential: config.deviceCredential,
     originPolicy: config.originPolicy,
   });
+}
+
+async function profileKey(config: ProfileConfig): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(profileIdentity(config)),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+function parseControlBlock(value: unknown): ControlBlock | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = value as Partial<ControlBlock>;
+  if (
+    candidate.version !== 1 ||
+    typeof candidate.profileKey !== "string" ||
+    !/^[0-9a-f]{64}$/.test(candidate.profileKey) ||
+    (candidate.reason !== "replaced" &&
+      candidate.reason !== "terminal_close" &&
+      candidate.reason !== "ticket_rejected" &&
+      candidate.reason !== "invalid_ticket")
+  ) {
+    return null;
+  }
+  return candidate as ControlBlock;
 }
 
 function isTicketResponse(
