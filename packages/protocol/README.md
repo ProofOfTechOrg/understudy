@@ -106,7 +106,7 @@ Session closure uses a reciprocal acknowledgement:
 persist closed -> send closed -> confirm backend lifecycle -> closed_ack
 ```
 
-The device retains each `closed` record until it receives a `closed_ack` with the exact session, lease, lease epoch, and browser epoch. It resends unacknowledged records after reconnects. The backend accepts an exact replay after a successful closure, but it never acknowledges a missing, stale, mismatched, or lost lease.
+The device retains each `closed` record until it receives a `closed_ack` with the exact session, lease, lease epoch, and browser epoch. It resends unacknowledged records after reconnects. The backend accepts exact replays after a successful closure and exact lost-fence replays while preserving `lost`. It never acknowledges a missing lease or a stale or mismatched fence.
 
 Deploy the backend before the extension. An older extension ignores the additive `closed_ack` frame. A newer extension connected to an older backend retains the closure record and does not promote a staged profile.
 

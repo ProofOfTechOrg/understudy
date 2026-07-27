@@ -96,6 +96,41 @@ async function openIdempotentSession(callerToken: string, idempotencyKey: string
   );
 }
 
+async function initializeUnattendedSession() {
+  const sessionId = await openSession(CALLER_TOKEN_A);
+  const deviceId = crypto.randomUUID();
+  const browserEpoch = `browser-${crypto.randomUUID()}`;
+  const allowedOrigin = `https://${deviceId}.example`;
+  const coordinator = env.TENANT_CONTROL.getByName("tenantA");
+  expect(
+    await coordinator.registerDevice({
+      deviceId,
+      browser: "Chrome/125",
+      extVersion: "0.1.0",
+      browserEpoch,
+      credentialDigest: "a".repeat(64),
+      credentialVersion: 1,
+      allowedOrigins: [allowedOrigin],
+      capabilities: ["safe-write-v2"],
+    }),
+  ).toMatchObject({ accepted: true });
+  const allocation = await coordinator.createLease({
+    idempotencyKey: crypto.randomUUID(),
+    fingerprint: crypto.randomUUID().replaceAll("-", "").repeat(2),
+    sessionId,
+    deviceId,
+    allowedOrigins: [allowedOrigin],
+    profileStateHash: crypto.randomUUID(),
+    actorPseudonym: "actor",
+  });
+  if (allocation.kind !== "created") {
+    throw new Error("expected created lease");
+  }
+  const session = await getSessionStub(sessionId);
+  await session.initializeUnattended("tenantA", allocation.lease);
+  return { coordinator, sessionId, deviceId, lease: allocation.lease };
+}
+
 /** Opens the fake-extension WS at the real onConnect-authed route (DL-006 critical fact). */
 async function connectFakeExtension(sessionId: string, token = EXTENSION_TOKEN_A): Promise<WebSocket> {
   const res = await exports.default.fetch(
@@ -340,6 +375,63 @@ describe("GET /v1/sessions/:sessionId", () => {
     expect(res.status).not.toBe(403);
     expect(await res.json()).toEqual({ error: "not found" });
   });
+
+  it("keeps an unattended closing session pollable after DELETE", async () => {
+    const { sessionId } = await initializeUnattendedSession();
+
+    const deleted = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(deleted.status).toBe(202);
+    expect(deleted.headers.get("Location")).toBe(
+      new URL(`/v1/sessions/${encodeURIComponent(sessionId)}`, BASE).toString(),
+    );
+
+    const status = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A),
+    );
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({
+      mode: "unattended",
+      status: "closing",
+    });
+  });
+
+  it.each(["closed", "expired", "lost"] as const)(
+    "returns 410 for an unattended %s session",
+    async (terminalStatus) => {
+      const { coordinator, sessionId, deviceId, lease } =
+        await initializeUnattendedSession();
+      if (terminalStatus === "closed") {
+        expect(
+          await coordinator.confirmClosed({
+            sessionId,
+            leaseId: lease.leaseId,
+            deviceId,
+            leaseEpoch: lease.leaseEpoch,
+            browserEpoch: lease.browserEpoch,
+          }),
+        ).toEqual({ status: "closed", newlyClosed: true });
+      } else if (terminalStatus === "expired") {
+        expect(
+          await coordinator.getLease(sessionId, lease.idleExpiresAt),
+        ).toMatchObject({ status: "expired" });
+      } else {
+        expect(await coordinator.revokeDevice(deviceId)).toBe(true);
+      }
+
+      const status = await exports.default.fetch(
+        authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A),
+      );
+      expect(status.status).toBe(410);
+      expect(await status.json()).toMatchObject({
+        mode: "unattended",
+        status: terminalStatus,
+      });
+    },
+  );
 });
 
 describe("command parsing", () => {

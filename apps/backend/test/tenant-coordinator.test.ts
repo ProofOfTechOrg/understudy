@@ -287,7 +287,10 @@ describe("TenantDeviceCoordinator allocation", () => {
         browserEpoch: lost.lease.browserEpoch,
         now: now + 7,
       }),
-    ).toBeNull();
+    ).toEqual({ status: "lost", newlyClosed: false });
+    expect(await stub.getLease(lost.lease.sessionId, now + 8)).toMatchObject({
+      status: "lost",
+    });
   });
 
   it("never falls back from an explicit full device and auto-selects by used capacity", async () => {

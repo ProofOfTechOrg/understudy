@@ -129,7 +129,7 @@ describe("DeviceAgent authority fencing", () => {
     expect(second.close).not.toHaveBeenCalled();
   });
 
-  it("acknowledges closure only after durable lifecycle processing and emits release telemetry once", async () => {
+  it("acknowledges first, replayed, and lost closures while emitting release telemetry only once", async () => {
     const deviceId = crypto.randomUUID();
     const browserEpoch = "browser-closure";
     const stub = await getAgentByName(env.DEVICE, deviceId);
@@ -211,6 +211,46 @@ describe("DeviceAgent authority fencing", () => {
         acknowledgement,
         acknowledgement,
       ]);
+
+      const lostAllocation = await coordinator.createLease({
+        idempotencyKey: crypto.randomUUID(),
+        fingerprint: "e".repeat(64),
+        sessionId: `session-${crypto.randomUUID()}`,
+        deviceId,
+        allowedOrigins: ["https://app.example"],
+        profileStateHash: crypto.randomUUID(),
+        actorPseudonym: "actor",
+      });
+      if (lostAllocation.kind !== "created") {
+        throw new Error("expected created lease");
+      }
+      const lostSession = await getAgentByName(
+        env.SESSION,
+        lostAllocation.lease.sessionId,
+      );
+      await lostSession.initializeUnattended(TENANT_ID, lostAllocation.lease);
+      await coordinator.revokeDevice(deviceId);
+      const lostFrame = {
+        type: "closed",
+        sessionId: lostAllocation.lease.sessionId,
+        leaseId: lostAllocation.lease.leaseId,
+        leaseEpoch: lostAllocation.lease.leaseEpoch,
+        browserEpoch: lostAllocation.lease.browserEpoch,
+      } as const;
+      await runInDurableObject(stub, async (instance: DeviceAgent) => {
+        await instance.onMessage(
+          candidate.connection,
+          JSON.stringify(lostFrame),
+        );
+      });
+      expect(await lostSession.getStatus()).toMatchObject({
+        mode: "unattended",
+        status: "lost",
+      });
+      expect(candidate.send).toHaveBeenLastCalledWith(
+        JSON.stringify({ ...lostFrame, type: "closed_ack" }),
+      );
+
       const releaseTelemetry = log.mock.calls
         .map(([raw]) => JSON.parse(raw as string) as {
           telemetry?: { event?: string };

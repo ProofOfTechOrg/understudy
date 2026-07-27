@@ -200,6 +200,13 @@ app.get("/v1/sessions/:sessionId", async (c) => {
   }
   const session = await getSessionStub(c.env, sessionId);
   const status = await session.getStatus();
+  if ("mode" in status && status.mode === "unattended") {
+    return status.status === "closed" ||
+      status.status === "expired" ||
+      status.status === "lost"
+      ? c.json(status, 410)
+      : c.json(status);
+  }
   if (await session.isTerminal()) return c.json(status, 410);
   return c.json(status);
 });

@@ -71,7 +71,7 @@ export interface LeaseResource {
 }
 
 export interface ClosureConfirmation {
-  status: "closed" | "expired";
+  status: "closed" | "expired" | "lost";
   newlyClosed: boolean;
 }
 
@@ -672,7 +672,11 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       return null;
     }
     if (before.release_at !== null) {
-      return before.status === "closed" || before.status === "expired"
+      return (
+        before.status === "closed" ||
+        before.status === "expired" ||
+        before.status === "lost"
+      )
         ? { status: before.status, newlyClosed: false }
         : null;
     }
