@@ -16,7 +16,7 @@ Read [`docs/technical-plan.md`](docs/technical-plan.md) for the architecture, sa
 | `apps/extension` | WXT and React extension with attended and two-tab unattended hosting |
 | `apps/cdp-spike` | Historical Manifest V3 CDP capability harness |
 
-`@understudy/protocol@0.7.0` and `@understudy/connector@0.5.0` are prepared in this repository. A local build does not publish them.
+`@understudy/protocol@0.8.0` and `@understudy/connector@0.5.1` are the current published versions. A local build does not publish them.
 
 ## Understand the isolation boundary
 
@@ -62,13 +62,21 @@ Load `apps/extension/.output/chrome-mv3/` through `chrome://extensions`. Follow 
 
 ## Release published packages
 
-Changesets and GitHub Actions manage releases from `master`. A pull request that changes a published package adds a changeset with:
+Use `dev` as the integration branch and `master` as the default release branch. Target feature and fix pull requests at `dev`. Add a changeset when a pull request changes a published package:
 
 ```bash
 pnpm changeset
 ```
 
-The release workflow opens or updates the **Version Packages** pull request. Merging that pull request publishes approved versions with npm provenance. `NPM_TOKEN` needs publish access to the `@understudy` scope.
+The Version workflow opens or updates the `Version Packages` pull request against `dev`. Release an approved version in this order:
+
+1. Merge `Version Packages` into `dev`.
+2. Verify the versioned `dev` commit.
+3. Open and merge a promotion pull request from `dev` to `master`.
+
+The Release workflow publishes the promoted versions with npm provenance. It rejects `master` commits that contain pending changesets. If another changeset reaches `dev` before promotion, merge the regenerated `Version Packages` pull request and update the promotion.
+
+Do not merge `master` back into `dev`. `NPM_TOKEN` needs publish access to the `@understudy` scope.
 
 Backend deployment remains a separate Wrangler operation. Keep `UNATTENDED_ENABLED_TENANTS=[]` until the canary extension passes the production acceptance suite.
 

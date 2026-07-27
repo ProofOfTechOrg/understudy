@@ -1,0 +1,52 @@
+name: Version
+
+# Version packages on dev before promotion to master. Pending changesets cause
+# the action to open or update changeset-release/dev. With no pending
+# changesets, the workflow is a clean no-op.
+#
+# Merge the Version Packages PR into dev, verify that commit, then promote dev
+# to master. The release workflow rejects a promotion that still contains a
+# pending changeset.
+
+on:
+  push:
+    branches: [dev]
+
+concurrency: version-${{ github.ref }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # v5/v6 majors run on the node24 action runtime (changesets/action@v1
+      # already does); the v4 majors ran on node20, which GitHub now flags
+      # with a deprecation annotation.
+      - uses: actions/checkout@v5
+        with:
+          # Changesets reads history to compute what changed.
+          fetch-depth: 0
+
+      # Reads the pnpm version from package.json "packageManager".
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # No publish input: versioning happens on dev, while master publishes.
+      - name: Open or update the Version Packages PR (base dev)
+        uses: changesets/action@v1
+        with:
+          title: 'release: version packages'
+          commit: 'release: version packages'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
