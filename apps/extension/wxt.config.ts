@@ -10,7 +10,7 @@ export default defineConfig({
     ),
   },
   manifest: {
-    minimum_chrome_version: '116',
+    minimum_chrome_version: '125',
     permissions: ['debugger', 'tabs', 'activeTab', 'storage', 'alarms'],
     host_permissions: ['<all_urls>'],
   },

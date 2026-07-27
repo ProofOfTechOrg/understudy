@@ -5,7 +5,10 @@ import type { DialogDisposition, DialogRecord, DialogType } from "@understudy/pr
 // The reportable fields of a `dialog` protocol Event, minus the wire-level
 // `type`/`tabId` the background worker adds (it owns the tabId). Derived from
 // the protocol's DialogRecord so it can never drift from the wire shape.
-export type DialogEventFields = Omit<DialogRecord, "tabId">;
+export type DialogEventFields = Omit<
+  DialogRecord,
+  "tabId" | "dialogId" | "occurredAt"
+>;
 
 // The effects the background service worker must apply for a raw CDP event. Every
 // field is optional so an empty decision ({}) is a valid no-op and the consumer
@@ -129,19 +132,4 @@ export function classifyCdpEvent(
     default:
       return {};
   }
-}
-
-// Answer a dialog, then report it. Extracted from the background worker's
-// onCdpEvent so the ordering guarantee is directly testable: `answer` is awaited
-// FIRST and unconditionally, so an open dialog can never wedge the single CDP
-// channel even when the report path is a no-op (WS down) or there is no event to
-// emit (an unclassifiable dialog type). `report` runs only for a classifiable
-// dialog and never blocks the answer.
-export async function applyDialogDecision(
-  dialog: NonNullable<CdpDecision["dialog"]>,
-  answer: (accept: boolean) => Promise<unknown>,
-  report: (event: DialogEventFields) => void,
-): Promise<void> {
-  await answer(dialog.accept);
-  if (dialog.event !== undefined) report(dialog.event);
 }

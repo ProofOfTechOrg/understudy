@@ -8,8 +8,20 @@
  * state have exactly one definition each.
  */
 
-import type { DialogRecord, Event, TabInfo } from "@understudy/protocol";
+import type {
+  Command,
+  CommandState,
+  DialogDelivery,
+  DialogRecord,
+  Event,
+  PendingCommandResponse,
+  ProtocolCapability,
+  TabInfo,
+  UnattendedSessionLifecycle,
+} from "@understudy/protocol";
 import type { SessionAgent } from "./session";
+import type { DeviceAgent } from "./device";
+import type { TenantDeviceCoordinator } from "./tenant-coordinator";
 
 /**
  * The non-tabs fields of the extension's hello event: what it reports about
@@ -48,6 +60,8 @@ export interface VaultBinding {
 export interface Env {
   /** One Durable Object per sessionId (per tenant/case) - DL-006. */
   SESSION: DurableObjectNamespace<SessionAgent>;
+  DEVICE: DurableObjectNamespace<DeviceAgent>;
+  TENANT_CONTROL: DurableObjectNamespace<TenantDeviceCoordinator>;
   VAULT: VaultBinding;
   /** Signs/verifies server-minted sessionIds so scopeSession can verify tenant ownership statelessly (M-006, DL-008). */
   AUTH_HMAC_SECRET: string;
@@ -61,6 +75,13 @@ export interface Env {
   CALLER_TOKENS: string;
   /** Extension per-user token(s) (JSON), verified independently of caller auth. Required via `secrets.required`, like CALLER_TOKENS. */
   EXTENSION_TOKENS: string;
+  DEVICE_TOKENS: string;
+  WS_TICKET_SECRET: string;
+  QUOTA_POLICY: string;
+  UNATTENDED_ENABLED_TENANTS: string;
+  SAFE_WRITE_REQUIRED_TENANTS: string;
+  RATE_LIMITER?: RateLimit;
+  ANALYTICS?: AnalyticsEngineDataset;
   /**
    * base64url-encoded 32-byte AES-256-GCM key that envelope-encrypts every
    * vault value (vault.ts). KV holds only ciphertext; without this secret a
@@ -77,10 +98,31 @@ export interface Env {
  */
 export type SessionStatus = "pending" | "connected" | "detached";
 
+export interface LegacyCommandTombstone {
+  commandId: string;
+  commandType: Command["type"];
+  requestFingerprint: string;
+}
+
+export interface CompletedLegacyWrite extends LegacyCommandTombstone {
+  event: Extract<Event, { type: "action_result" }>;
+}
+
+export type PersistedLegacyAwaiting =
+  | LegacyCommandTombstone
+  | { commandId: string };
+
+export type PersistedLegacyCommandTombstone = PersistedLegacyAwaiting;
+
+export type PersistedCompletedLegacyWrite =
+  | CompletedLegacyWrite
+  | { commandId: string; event: Event };
+
 /**
  * Agents-SDK Durable Object state for one session. Must stay JSON-
- * serializable (setState round-trips through JSON): awaitingCommandIds is a
- * string array standing in for a Set, not a JS Set/Map (DL-007).
+ * serializable because setState round-trips through JSON. Legacy
+ * awaitingCommandIds remain readable while new writes persist typed command
+ * tombstones.
  */
 export interface SessionState {
   browser: HelloBrowserInfo | null;
@@ -89,6 +131,7 @@ export interface SessionState {
   /** The refMap generation; bumped on navigation / hello resync. */
   generation: number;
   awaitingCommandIds: string[];
+  awaitingCommands?: PersistedLegacyAwaiting[];
   status: SessionStatus;
   /**
    * The one authenticated extension connection allowed to receive Commands
@@ -105,22 +148,42 @@ export interface SessionState {
    * a write under the same commandId (the connector derives it from the
    * breakwater idempotency key) gets the recorded Event back instead of a
    * second execution, closing the write-performed-but-response-lost gap.
-   * Only ever holds action_results for writes: small, and plaintext-free by
-   * the DL-004 construction (fill_secret results carry ok/error only).
+   * New entries hold bounded action_results plus the exact command type and
+   * request fingerprint. Legacy ID-only entries remain conflict tombstones.
+   * Fill-secret results carry only ok/error and never plaintext.
    */
-  completedWrites: { commandId: string; event: Event }[];
+  completedWrites: PersistedCompletedLegacyWrite[];
+  legacyCommandTombstones?: PersistedLegacyCommandTombstone[];
   /**
    * Recent page dialogs the extension handled (alert/confirm/prompt/
    * beforeunload), oldest first, capped in session.ts. Surfaced to the consumer
    * via GET /v1/sessions/:id so an agent/governance layer sees what a page said
    * and how it was auto-answered. An after-the-fact record, not a response
    * channel: dialogs are answered synchronously extension-side (an open dialog
-   * blocks the CDP channel), never by a consumer round-trip. BEST-EFFORT and
-   * capped: a report emitted while the WS is momentarily down is not replayed
-   * (the dialog is still answered; only its notification is lost), so this is an
-   * observability surface, not a guaranteed audit log.
+   * blocks the CDP channel), never by a consumer round-trip. Protocol 2
+   * acknowledges and replays records within one browser epoch. The public
+   * payload list remains capped, so this is an operational surface rather than
+   * a durable audit log.
    */
   dialogs: DialogRecord[];
+  protocolVersion?: 1 | 2;
+  capabilities?: ProtocolCapability[];
+  mode?: "attended" | "unattended";
+  unattended?: {
+    tenantId: string;
+    deviceId: string;
+    leaseId: string;
+    leaseEpoch: number;
+    browserEpoch: string;
+    status: UnattendedSessionLifecycle;
+    createdAt: string;
+    lastActivityAt: string;
+    idleExpiresAt: string;
+    hardExpiresAt: string;
+    needsReconciliation: boolean;
+    dialogDelivery: DialogDelivery;
+    allowedOrigins: string[];
+  };
 }
 
 /**
@@ -134,6 +197,32 @@ export type DispatchOutcome =
   | { ok: true; event: Event }
   | {
       ok: false;
-      reason: "not_connected" | "timed_out" | "resynced" | "duplicate_in_flight";
+      reason:
+        | "not_connected"
+        | "timed_out"
+        | "resynced"
+        | "duplicate_in_flight"
+        | "session_busy"
+        | "terminal_session"
+        | "id_conflict";
       message: string;
     };
+
+export type V2DispatchOutcome =
+  | { kind: "terminal"; event: Event }
+  | { kind: "pending"; pending: PendingCommandResponse }
+  | { kind: "not_started"; commandId: string; safeToRetry: true }
+  | { kind: "timed_out"; commandId: string; safeToRetry: true }
+  | { kind: "unknown"; commandId: string; safeToRetry: false }
+  | { kind: "id_conflict"; commandId: string }
+  | { kind: "busy"; commandId: string }
+  | { kind: "not_connected"; commandId: string }
+  | { kind: "unsupported"; commandId: string }
+  | { kind: "terminal_session"; commandId: string };
+
+export interface CommandStatusRecord {
+  commandId: string;
+  status: CommandState;
+  event?: Event;
+  safeToRetry: boolean;
+}

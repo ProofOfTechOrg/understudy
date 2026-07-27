@@ -1,7 +1,12 @@
-import type { Command, Event } from "@understudy/protocol";
+import {
+  SESSION_RESULT_FRAME_MAX_BYTES,
+  safeParseEvent,
+  utf8ByteLength,
+  type Command,
+  type Event,
+} from "@understudy/protocol";
 import type { CdpSession } from "../driver/cdp";
 import { actionError, errorMessage } from "../events";
-import { queryTabInfos } from "../tabs";
 
 async function withSession(
   session: CdpSession | null,
@@ -21,17 +26,51 @@ async function withSession(
   return run(session);
 }
 
-async function routeGetTabs(commandId: string): Promise<Event> {
-  const tabs = await queryTabInfos();
-  return { type: "tabs_result", commandId, tabs };
+async function routeGetTabs(commandId: string, session: CdpSession | null): Promise<Event> {
+  if (session === null) return actionError(commandId, "no active CDP session");
+  const tab = await browser.tabs.get(session.tabId);
+  return {
+    type: "tabs_result",
+    commandId,
+    tabs: [
+      {
+        tabId: session.tabId,
+        url: tab.url ?? session.currentUrl,
+        title: tab.title ?? "",
+        active: tab.active,
+      },
+    ],
+  };
 }
 
-async function routeSwitchTab(commandId: string, tabId: number): Promise<Event> {
-  await browser.tabs.update(tabId, { active: true });
+async function routeSwitchTab(
+  commandId: string,
+  tabId: number,
+  session: CdpSession | null,
+): Promise<Event> {
+  if (session === null) return actionError(commandId, "no active CDP session");
+  if (tabId !== session.tabId) {
+    return actionError(commandId, `tab ${tabId} is not owned by this session`);
+  }
   return { type: "action_result", commandId, ok: true };
 }
 
 export async function routeCommand(cmd: Command, session: CdpSession | null): Promise<Event> {
+  const event = await routeCommandUnchecked(cmd, session);
+  const parsed = safeParseEvent(event);
+  if (
+    parsed.success &&
+    utf8ByteLength(JSON.stringify(parsed.data)) <= SESSION_RESULT_FRAME_MAX_BYTES
+  ) {
+    return parsed.data;
+  }
+  return actionError(cmd.commandId, "command result exceeded protocol limits");
+}
+
+async function routeCommandUnchecked(
+  cmd: Command,
+  session: CdpSession | null,
+): Promise<Event> {
   try {
     switch (cmd.type) {
       case "snapshot": {
@@ -89,9 +128,9 @@ export async function routeCommand(cmd: Command, session: CdpSession | null): Pr
         );
       }
       case "get_tabs":
-        return await routeGetTabs(cmd.commandId);
+        return await routeGetTabs(cmd.commandId, session);
       case "switch_tab":
-        return await routeSwitchTab(cmd.commandId, cmd.tabId);
+        return await routeSwitchTab(cmd.commandId, cmd.tabId, session);
       default: {
         const fallback = cmd as Command;
         return actionError(fallback.commandId, `unhandled command type: ${fallback.type}`);

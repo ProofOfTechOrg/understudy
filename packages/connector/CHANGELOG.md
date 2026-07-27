@@ -1,5 +1,19 @@
 # @understudy/connector
 
+## 0.5.0
+
+### Minor Changes
+
+- Send the command-contract-v2 header and classify `202` as a typed pending outcome.
+- Export typed not-started and unknown-outcome errors plus a durable command-status polling helper.
+- Hash business idempotency keys into bounded command IDs.
+- Require strict bounded connector inputs and consume `@understudy/protocol@0.7.0`.
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@understudy/protocol@0.7.0`
+
 ## 0.4.0
 
 ### Minor Changes

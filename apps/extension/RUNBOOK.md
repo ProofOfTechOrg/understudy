@@ -1,190 +1,199 @@
-# M2 verification runbook
+<!-- Content type: How-to -->
 
-The exact human-run steps that prove Milestone M2: the extension drives a real,
-logged-in Chromium tab over the **real WebSocket wire** and every Event it emits
-is schema-valid against `@understudy/protocol`.
+# Verify unattended sessions in a real Chromium profile
 
-The peer is a throwaway stub (`scripts/stub-server.mjs`, Node + `ws`) that runs
-`safeParseEvent` on every inbound message and lets you drive protocol Commands
-by typing JSON lines into its stdin. The real Hono backend is M3 — this stub is
-what M3 replaces (and a reference for M3's `onMessage`).
+This runbook verifies the production extension against one tenant-dedicated Chrome profile. Automated tests do not prove Chrome focus behavior, paused-popup containment, restart recovery, or a real authenticated website session.
 
-## Baseline / environment
+## Prepare the operator environment
 
-- Branch `master`, base commit `4a48b94` (`git rev-parse HEAD` to confirm).
-- **Node ≥ 22, pnpm 11.5.2** (repo `packageManager`). This machine: Node 24, pnpm 11.5.2.
-- **Real Chromium via `wxt build` + Load unpacked — NOT `wxt dev`.** `wxt dev`
-  starts a throwaway profile with no logins, which defeats the whole point
-  (puppeting a *logged-in* tab). Always load the built `.output/chrome-mv3/`.
-- Chromium **≥ 116** (WS traffic resets the MV3 service-worker idle timer; the
-  manifest declares `minimum_chrome_version: "116"`).
-- Run every `pnpm` command from the repo root.
+Before you start:
 
----
+- Use Chrome 125 or newer
+- Create or designate a profile used by one tenant only
+- Configure Chrome startup to **New Tab**, not **Continue where you left off**
+- Log into the required sites and complete Multi-Factor Authentication (MFA) or CAPTCHA
+- Keep the machine, Chrome, and network awake
+- Do not open DevTools on a controlled tab
+- Do not click the debugger banner’s detach control
 
-## 1. Build the protocol dist
+Two sessions in one profile share cookies, local storage, IndexedDB, and browser extensions. Use separate profiles when the sessions require different browser identities.
 
-The stub imports the **real** schemas from `@understudy/protocol`; that package's
-`exports` map points at `dist/`, so it must be built first.
+## Build and load the extension
+
+From the repository root:
 
 ```bash
 pnpm --filter @understudy/protocol build
-```
-
-Expect `packages/protocol/dist/index.js` + `index.d.ts` (exporting
-`safeParseEvent` / `safeParseCommand` and the `tabs_result` validators).
-
-## 2. Build the extension
-
-```bash
+pnpm --filter @understudy/extension typecheck
+pnpm --filter @understudy/extension test
 pnpm --filter @understudy/extension build
 ```
 
-Produces `apps/extension/.output/chrome-mv3/` with a `manifest.json` whose
-`minimum_chrome_version` is `"116"`, whose `permissions` are
-`debugger, tabs, activeTab, storage, alarms, sidePanel` (the 5 declared plus
-`sidePanel`, which WXT auto-adds; `<all_urls>` is under `host_permissions`), and
-which has both a `background` (service worker, `"type": "module"`) and a
-`side_panel` entry.
+Then:
 
-## 3. Load unpacked in real Chromium
+1. Open `chrome://extensions`
+2. Enable **Developer mode**
+3. Select **Load unpacked**
+4. Choose `apps/extension/.output/chrome-mv3/`
+5. Approve debugger, tabs, storage, alarms, and host permissions
 
-1. Open `chrome://extensions`.
-2. Toggle **Developer mode** (top-right) on.
-3. Click **Load unpacked** and select `apps/extension/.output/chrome-mv3/`.
-4. The extension appears; note its service-worker link (used in step 8).
+Use this production build. Do not use WXT development mode for acceptance.
 
-## 4. Start the stub WS server
+## Enroll one device
 
-From the repo root:
+Provision a device UUID and credential in the backend’s `DEVICE_TOKENS` secret. Store only the credential’s SHA-256 digest in that mapping.
+
+Open the extension side panel and enter:
+
+1. The backend HTTPS origin
+2. The device UUID
+3. The raw device credential
+4. One exact allowed origin per line
+5. **Enable unattended hosting**
+
+Select **Save enrollment**. The status must become `connected`.
+
+Confirm the device through the caller API:
 
 ```bash
-pnpm --filter @understudy/extension stub
+curl --fail-with-body \
+  -H 'Authorization: Bearer caller_token_here' \
+  https://understudy.example/v1/devices
 ```
 
-It prints:
+Done means the response reports the device online with capacity 2, usage 0, current browser and extension versions, and a recent `lastSeenAt`.
 
-```
-listening ws://localhost:8787
-```
+## Create two isolated runtimes
 
-Leave this terminal focused — you will type command lines into it in step 6.
+Use disjoint origin sets and different profile keys:
 
-## 5. Open the side panel and attach
-
-1. Click the extension's toolbar icon (or open the side panel for it) to open
-   the panel.
-2. Confirm the **wsUrl** field reads `ws://localhost:8787` (the default) and the
-   status pill turns **open**. The stub terminal prints `* extension connected`
-   and a `< hello …` line (browser, ext version, tab count).
-3. In a normal tab, navigate to a **real, logged-in** site (something where being
-   logged in is visible, e.g. an account/settings page).
-4. In the panel, click **Attach** (targets the active tab). Chromium shows the
-   yellow **"… is being debugged"** banner — **this is expected** (it is the
-   `chrome.debugger` attach; do NOT click "Cancel", which detaches).
-
-## 6. Drive commands (the core acceptance)
-
-Type each JSON line below into the **stub terminal** (the one running step 4) and
-press Enter. `commandId` is auto-filled — you do not type it. Blank lines and
-lines starting with `#` are ignored. After each send the stub echoes `> sent …`
-and then prints the extension's reply.
-
-> Tip: replace `<ref>` with the opaque ref copied verbatim from the most recent
-> `snapshot_result` output. Do not parse or construct refs: each is a capability
-> bound to the extension WebSocket session, CDP attachment, and snapshot
-> generation that produced it.
-
-```jsonc
-# read the page — first confirm tabId + exact URL, then copy a textbox/searchbox/button ref
-{"type":"snapshot","mode":"a11y"}
-
-# capture the same exact target as an image
-{"type":"snapshot","mode":"screenshot"}
-
-# type into a field you copied a ref for (submit:false = don't press Enter)
-{"type":"type","ref":"<ref>","text":"hello","submit":false}
-
-# click a button/link you copied a ref for
-{"type":"click","ref":"<ref>"}
-
-# navigate the tab (a page_event should also arrive)
-{"type":"navigate","url":"https://example.com/"}
-
-# reuse a ref copied BEFORE the navigate above — must be rejected as stale
-{"type":"click","ref":"<pre-navigation-ref>"}
-
-# list open tabs — copy a tabId for switch_tab
-{"type":"get_tabs"}
-
-# activate another tab by its tabId from get_tabs
-{"type":"switch_tab","tabId":<n>}
-
-# dom snapshot is intentionally unsupported in M2
-{"type":"snapshot","mode":"dom"}
-
-# fixed delay
-{"type":"wait","for":"ms","value":500}
+```bash
+curl --fail-with-body \
+  -X POST \
+  -H 'Authorization: Bearer caller_token_here' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 00000000-0000-4000-8000-000000000011' \
+  --data '{"mode":"unattended","allowedOrigins":["https://one.example"],"profileStateKey":"account_one"}' \
+  https://understudy.example/v1/sessions
 ```
 
-Expected replies (watch the stub terminal):
+Repeat with another UUID, `https://two.example`, and `account_two`.
 
-| Line | Expected stub output | Visible in Chromium |
-|---|---|---|
-| `snapshot` a11y | `snapshot_result` with the attached `tabId`, exact bracketed URL (including any fragment), node count, and first ~15 `{ref role "name"}` indented. Confirm the target matches the panel/current tab before using a ref. | — |
-| `snapshot` screenshot | `screenshot_result` with the same attached `tabId`, exact bracketed URL, MIME type, and payload length | — |
-| `type` | `action_result … ok=true` | the text appears in the field |
-| `click` | `action_result … ok=true` | the element is clicked |
-| `navigate` | `action_result … ok=true url=…` **and** a `page_event navigated …` | the tab navigates |
-| stale `click` | `action_result … ok=false error=…` (stale/unknown capability — no input dispatched) | nothing happens |
-| `get_tabs` | `tabs_result` listing the open tabs (tabId/title/url) | — |
-| `switch_tab` | `action_result … ok=true` | the other tab becomes active |
-| `snapshot` dom | `action_result … ok=false error="dom snapshot unsupported"` | — |
-| `wait` ms | `action_result … ok=true` | — |
+Done means:
 
-## 7. Idle-survival check
+- Each response reaches `connected`, either immediately or through status polling
+- Chrome contains two extension-owned tabs
+- Each session status reports one tab only
+- `GET /v1/devices` reports usage 2
 
-Stop typing and leave everything idle for **~30–40 s**. The stub terminal should
-print a `< pong · HH:MM:SS` roughly every **20–25 s** (the SW self-heartbeat,
-with a 30 s `chrome.alarms` backstop). Then send any command again, e.g.:
+Create a third session. It must fail with `429`.
 
-```jsonc
-{"type":"snapshot","mode":"a11y"}
+Try an overlapping origin and then a reused profile key. Each must fail with `409`.
+
+## Verify command routing
+
+Send concurrent reads to both session IDs. Confirm each result reports only its session-owned tab.
+
+Send input actions to both sessions. Confirm text and clicks never cross tabs. If inactive-tab `Input.*` fails or targets the wrong tab, stop rollout and add the planned profile-wide focus mutex for input operations.
+
+For one session:
+
+1. Navigate within its allowed origin and confirm success
+2. Trigger a redirect to another origin and confirm rejection
+3. Trigger JavaScript top-level navigation to another origin and confirm rejection
+4. Open a popup and confirm Chrome closes it before its first request
+5. Load a cross-origin image or frame and confirm it still works
+
+Paused-popup containment is a release gate. Do not weaken the exact-origin boundary if the production build cannot prove it.
+
+## Verify one-slot cleanup
+
+Delete one session:
+
+```bash
+curl --fail-with-body \
+  -X DELETE \
+  -H 'Authorization: Bearer caller_token_here' \
+  https://understudy.example/v1/sessions/session_id_here
 ```
 
-It must still succeed — proving the service worker stayed alive (or woke) and the
-CDP attachment is intact.
+Poll status if DELETE returns `202`.
 
-## 8. Eviction / reconcile check (DL-007)
+Done means Chrome closes exactly one leased tab, the other session remains functional, and device usage becomes 1.
 
-1. In `chrome://extensions`, force-stop the service worker: click the extension's
-   **service worker** link to open its DevTools and **Stop** it (or toggle the
-   extension off and on). This simulates MV3 eviction.
-2. Send a command (or reopen the panel):
+## Evict the service worker
 
-```jsonc
-{"type":"get_tabs"}
-```
+Open the extension’s service-worker inspection page from `chrome://extensions` and stop the worker. Do not inspect a controlled tab.
 
-Expected: the SW **wakes**, reconciles the existing attachment via
-`chrome.debugger.getTargets()` (re-enables domains + bumps generation rather than
-blindly re-attaching — so **no "Already attached" error**), emits a fresh
-`< hello …`, the panel's status pill returns to **open** without a manual reload,
-and the command returns its normal result.
+Wake the extension by reopening the side panel or sending a command.
 
----
+Done means:
 
-## Pass signal (the M2 acceptance)
+- The same browser epoch restores assignments from session storage
+- The extension does not create duplicate tabs
+- A completed unacknowledged result replays
+- Unrelated tabs remain untouched
 
-**Zero `EVENT SCHEMA VIOLATION` logs across the entire session.**
+## Restart Chrome
 
-Every event the extension emitted — `hello`, `snapshot_result`,
-`screenshot_result`, `action_result`, `page_event`, `dialog`, `tabs_result`,
-`pong` — passed `safeParseEvent` against the real protocol schemas on the real WS wire.
-Combined with explicit snapshot target confirmation, the visible page effects
-in step 6, the stale-ref rejection, `get_tabs`, idle survival (step 7), and
-eviction reconcile (step 8), that is M2 proven end-to-end.
+Close and reopen Chrome within 90s. This is a deliberate destructive acceptance step for active browser execution.
 
-If a violation *does* print, it is loud and boxed and includes the raw event plus
-`error.issues` — read the issues to see exactly which field of which event type
-failed, and fix the emitting executor.
+Done means:
+
+- Each still-live lease receives a fresh blank tab
+- Tab IDs, attachment generations, and accessibility refs change
+- No prior URL is restored
+- Restored ordinary tabs remain uncontrolled and open
+- Session status reports reconciliation
+- New writes remain blocked until DELETE and new session creation
+
+## Verify an ambiguous write
+
+Use a non-production test action with an observable idempotent marker. Stop Chrome after the write starts but before the result acknowledgement.
+
+Done means command polling returns `command_outcome_unknown`, `safeToRetry` is false, and the backend blocks further writes for that session. The extension must never execute that granted payload again.
+
+## Rotate the device credential
+
+Add the new credential digest with a higher `credentialVersion`, update the extension enrollment, then remove the old digest.
+
+Done means the old control socket closes, old tickets fail, the new credential reconnects, and no replayed ticket replaces the authoritative socket.
+
+## Run the 24-hour soak
+
+Create a read-only unattended session. Send a valid read less than every 2 hours to refresh idle expiry.
+
+During the soak:
+
+- Confirm the session expires at its exact 24-hour hard deadline despite activity
+- Confirm another idle session expires after 2 hours without a valid command
+- Compare Durable Object requests and duration before and after
+- Confirm billed duration scales with handler execution, not lease wall time
+- Confirm no unknown-write surprise, duplicate tab, or leaked capacity
+
+## Verify attended compatibility
+
+Use the side panel’s attended section:
+
+1. Enter the legacy session WebSocket URL
+2. Open the intended user-owned tab
+3. Select **Attach active tab**
+4. Run a snapshot and one approved test action
+5. Select **Detach tab**
+
+Done means the command path negotiates protocol 2 after attachment, reports only that tab, and detaching leaves the tab open.
+
+## Record the release decision
+
+Enable additional tenants only when all conditions hold:
+
+- Two controlled tabs route reads and inputs correctly
+- Capacity, origin, and profile collisions fail with the expected statuses
+- Redirect and popup containment hold
+- Service-worker and browser restart behavior matches this runbook
+- Credential rotation fences the predecessor
+- The 24-hour and 2-hour expiries hold
+- Durable Object duration does not scale with lease wall time
+- No granted write executes twice
+
+On failure, disable new leases, close or terminalize active leases and granted commands, and roll back application code. Keep migration `v2`.

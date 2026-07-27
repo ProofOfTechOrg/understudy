@@ -1,14 +1,21 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { Env } from "../src/types";
 import { base64urlEncode } from "../src/base64url";
 import {
   authenticate,
+  authenticatedRateAllowed,
+  authenticateDevice,
+  deviceCredentialExists,
   isValidTenantId,
   mintSessionId,
+  mintWsTicket,
   scopeSession,
   tenantOf,
   verifyExtensionToken,
+  verifyWsTicket,
   type Actor,
+  type DeviceIdentity,
+  type RateLimitIdentity,
 } from "../src/auth";
 
 const CALLER_TOKENS: Record<string, Actor> = {
@@ -24,13 +31,48 @@ const EXTENSION_TOKENS: Record<string, string> = {
 function makeEnv(overrides: Partial<Env> = {}): Env {
   return {
     SESSION: {} as unknown as Env["SESSION"],
+    DEVICE: {} as unknown as Env["DEVICE"],
+    TENANT_CONTROL: {} as unknown as Env["TENANT_CONTROL"],
     VAULT: {} as unknown as Env["VAULT"],
     AUTH_HMAC_SECRET: "test-hmac-secret-do-not-use-in-prod",
     CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),
     EXTENSION_TOKENS: JSON.stringify(EXTENSION_TOKENS),
+    DEVICE_TOKENS: "{}",
+    WS_TICKET_SECRET: "test-ticket-secret",
+    QUOTA_POLICY: "",
+    UNATTENDED_ENABLED_TENANTS: "[]",
+    SAFE_WRITE_REQUIRED_TENANTS: "[]",
     VAULT_MASTER_KEY: "unused-by-auth-tests",
     ...overrides,
   };
+}
+
+function rateLimitEnv(keys: string[]): Env {
+  return makeEnv({
+    RATE_LIMITER: {
+      limit: vi.fn(async ({ key }: { key: string }) => {
+        keys.push(key);
+        return { success: true };
+      }),
+    } as Env["RATE_LIMITER"],
+  });
+}
+
+async function deviceTokenEnv(
+  credential: string,
+  identity: Pick<DeviceIdentity, "tenantId" | "deviceId" | "credentialVersion">,
+  overrides: Partial<Env> = {},
+): Promise<Env> {
+  const digest = Array.from(
+    new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(credential)),
+    ),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return makeEnv({
+    DEVICE_TOKENS: JSON.stringify({ [digest]: identity }),
+    ...overrides,
+  });
 }
 
 function flipChar(value: string): string {
@@ -238,6 +280,84 @@ describe("authenticate", () => {
   );
 });
 
+describe("authenticatedRateAllowed", () => {
+  it("keys accepted caller and device bearer whitespace by authenticated identity", async () => {
+    const callerKeys: string[] = [];
+    const callerEnv = rateLimitEnv(callerKeys);
+    const callerRequests = ["Bearer tok-a", "Bearer     tok-a"].map(
+      (authorization) =>
+        new Request("https://understudy.example/v1/sessions", {
+          headers: { authorization },
+        }),
+    );
+    for (const request of callerRequests) {
+      const actor = await authenticate(request, callerEnv);
+      if (actor === null) throw new Error("expected caller identity");
+      await authenticatedRateAllowed({ kind: "caller", ...actor }, callerEnv);
+    }
+
+    const deviceKeys: string[] = [];
+    const deviceIdentity = {
+      tenantId: "tenantA",
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      credentialVersion: 1,
+    };
+    const deviceEnv = await deviceTokenEnv("device-secret", deviceIdentity, {
+      RATE_LIMITER: rateLimitEnv(deviceKeys).RATE_LIMITER,
+    });
+    const deviceRequests = ["Bearer device-secret", "Bearer     device-secret"].map(
+      (authorization) =>
+        new Request("https://understudy.example/v1/device/connect-ticket", {
+          headers: { authorization },
+        }),
+    );
+    for (const request of deviceRequests) {
+      const device = await authenticateDevice(request, deviceEnv);
+      if (device === null) throw new Error("expected device identity");
+      await authenticatedRateAllowed(
+        { kind: "device", tenantId: device.tenantId, deviceId: device.deviceId },
+        deviceEnv,
+      );
+    }
+
+    expect(callerKeys[0]).toBe(callerKeys[1]);
+    expect(deviceKeys[0]).toBe(deviceKeys[1]);
+  });
+
+  it("separates identities by actor, device, tenant, and namespace", async () => {
+    const keys: string[] = [];
+    const env = rateLimitEnv(keys);
+    const sharedId = "00000000-0000-4000-8000-000000000001";
+    const identities: RateLimitIdentity[] = [
+      { kind: "caller", tenantId: "tenantA", actor: "caller-a" },
+      { kind: "caller", tenantId: "tenantA", actor: "caller-b" },
+      { kind: "caller", tenantId: "tenantB", actor: "caller-a" },
+      { kind: "caller", tenantId: "tenantA", actor: sharedId },
+      { kind: "device", tenantId: "tenantA", deviceId: sharedId },
+      {
+        kind: "device",
+        tenantId: "tenantA",
+        deviceId: "00000000-0000-4000-8000-000000000002",
+      },
+    ];
+
+    for (const identity of identities) {
+      await authenticatedRateAllowed(identity, env);
+    }
+
+    expect(new Set(keys)).toHaveLength(identities.length);
+  });
+
+  it("allows authenticated requests when the limiter binding is absent", async () => {
+    await expect(
+      authenticatedRateAllowed(
+        { kind: "caller", tenantId: "tenantA", actor: "caller-a" },
+        makeEnv(),
+      ),
+    ).resolves.toBe(true);
+  });
+});
+
 describe("verifyExtensionToken", () => {
   it("returns the tenantId for a valid extension token", async () => {
     const env = makeEnv();
@@ -256,4 +376,166 @@ describe("verifyExtensionToken", () => {
       expect(await verifyExtensionToken(token, env)).toBeNull();
     },
   );
+});
+
+describe("device authentication and WebSocket tickets", () => {
+  it("maps only a configured SHA-256 device credential and detects revocation", async () => {
+    const credential = "device-secret";
+    const digest = Array.from(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(credential)),
+      ),
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("");
+    const env = makeEnv({
+      DEVICE_TOKENS: JSON.stringify({
+        [digest]: {
+          tenantId: "tenantA",
+          deviceId: "00000000-0000-4000-8000-000000000001",
+          credentialVersion: 2,
+        },
+      }),
+    });
+    const identity = await authenticateDevice(
+      new Request("https://understudy.example/v1/device/connect-ticket", {
+        headers: { authorization: `Bearer ${credential}` },
+      }),
+      env,
+    );
+    expect(identity).toMatchObject({
+      tenantId: "tenantA",
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      credentialVersion: 2,
+      credentialDigest: digest,
+    });
+    if (identity === null) throw new Error("expected device identity");
+    await expect(deviceCredentialExists(digest, identity, env)).resolves.toBe(true);
+    await expect(
+      deviceCredentialExists(digest, identity, makeEnv({ DEVICE_TOKENS: "{}" })),
+    ).resolves.toBe(false);
+  });
+
+  it("binds signed session tickets to audience, path agent, expiry, and lease claims", async () => {
+    const env = makeEnv();
+    const now = 1_000_000;
+    const ticket = await mintWsTicket(
+      {
+        aud: "session",
+        tenantId: "tenantA",
+        deviceId: "00000000-0000-4000-8000-000000000001",
+        sessionId: "session-1",
+        leaseId: "lease-1",
+        leaseEpoch: 1,
+        browserEpoch: "browser-1",
+        agentName: "session-1",
+      },
+      env,
+      now,
+    );
+
+    await expect(
+      verifyWsTicket(
+        ticket,
+        { aud: "session", agentName: "session-1" },
+        env,
+        now,
+      ),
+    ).resolves.toMatchObject({
+      aud: "session",
+      sessionId: "session-1",
+      leaseId: "lease-1",
+      leaseEpoch: 1,
+    });
+    await expect(
+      verifyWsTicket(
+        ticket,
+        { aud: "device-control", agentName: "session-1" },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      verifyWsTicket(
+        ticket,
+        { aud: "session", agentName: "another-session" },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      verifyWsTicket(
+        ticket,
+        { aud: "session", agentName: "session-1" },
+        env,
+        now + 61_000,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      verifyWsTicket(
+        `${ticket.slice(0, -1)}${ticket.endsWith("A") ? "B" : "A"}`,
+        { aud: "session", agentName: "session-1" },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("requires credential versions only on device-control tickets", async () => {
+    const env = makeEnv();
+    const now = 1_000_000;
+    const deviceClaims = {
+      aud: "device-control" as const,
+      tenantId: "tenantA",
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      leaseEpoch: 0,
+      browserEpoch: "browser-1",
+      agentName: "00000000-0000-4000-8000-000000000001",
+    };
+    const versioned = await mintWsTicket(
+      { ...deviceClaims, credentialVersion: 2 },
+      env,
+      now,
+    );
+    const unversioned = await mintWsTicket(deviceClaims, env, now);
+    const sessionWithVersion = await mintWsTicket(
+      {
+        aud: "session",
+        tenantId: "tenantA",
+        deviceId: deviceClaims.deviceId,
+        credentialVersion: 2,
+        sessionId: "session-1",
+        leaseId: "lease-1",
+        leaseEpoch: 1,
+        browserEpoch: "browser-1",
+        agentName: "session-1",
+      },
+      env,
+      now,
+    );
+
+    await expect(
+      verifyWsTicket(
+        versioned,
+        { aud: "device-control", agentName: deviceClaims.agentName },
+        env,
+        now,
+      ),
+    ).resolves.toMatchObject({ credentialVersion: 2 });
+    await expect(
+      verifyWsTicket(
+        unversioned,
+        { aud: "device-control", agentName: deviceClaims.agentName },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      verifyWsTicket(
+        sessionWithVersion,
+        { aud: "session", agentName: "session-1" },
+        env,
+        now,
+      ),
+    ).resolves.toBeNull();
+  });
 });

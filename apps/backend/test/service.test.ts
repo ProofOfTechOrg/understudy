@@ -1,8 +1,14 @@
 import { describe, it, expect, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { safeParseCommand, safeParseEvent } from "@understudy/protocol";
-import type { Command } from "@understudy/protocol";
+import {
+  PROTOCOL_CAPABILITIES,
+  PROTOCOL_VERSION,
+  safeParseCommand,
+  safeParseEvent,
+  safeParseSessionServerFrame,
+} from "@understudy/protocol";
+import type { Command, SessionServerFrame } from "@understudy/protocol";
 import type { SessionAgent } from "../src/session";
 import type { SessionStatus } from "../src/types";
 import { encryptSecret } from "../src/vault";
@@ -54,6 +60,24 @@ function postCommand(
   );
 }
 
+function postCommandV2(
+  sessionId: string,
+  token: string,
+  command: unknown,
+  dryRun = false,
+): Promise<Response> {
+  return exports.default.fetch(
+    authedRequest(`/v1/sessions/${sessionId}/commands`, token, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Understudy-Command-Contract": "2",
+      },
+      body: JSON.stringify({ command, dryRun }),
+    }),
+  );
+}
+
 async function openSession(callerToken: string): Promise<string> {
   const res = await exports.default.fetch(
     authedRequest("/v1/sessions", callerToken, { method: "POST" }),
@@ -72,6 +96,41 @@ async function openIdempotentSession(callerToken: string, idempotencyKey: string
   );
 }
 
+async function initializeUnattendedSession() {
+  const sessionId = await openSession(CALLER_TOKEN_A);
+  const deviceId = crypto.randomUUID();
+  const browserEpoch = `browser-${crypto.randomUUID()}`;
+  const allowedOrigin = `https://${deviceId}.example`;
+  const coordinator = env.TENANT_CONTROL.getByName("tenantA");
+  expect(
+    await coordinator.registerDevice({
+      deviceId,
+      browser: "Chrome/125",
+      extVersion: "0.1.0",
+      browserEpoch,
+      credentialDigest: "a".repeat(64),
+      credentialVersion: 1,
+      allowedOrigins: [allowedOrigin],
+      capabilities: ["safe-write-v2"],
+    }),
+  ).toMatchObject({ accepted: true });
+  const allocation = await coordinator.createLease({
+    idempotencyKey: crypto.randomUUID(),
+    fingerprint: crypto.randomUUID().replaceAll("-", "").repeat(2),
+    sessionId,
+    deviceId,
+    allowedOrigins: [allowedOrigin],
+    profileStateHash: crypto.randomUUID(),
+    actorPseudonym: "actor",
+  });
+  if (allocation.kind !== "created") {
+    throw new Error("expected created lease");
+  }
+  const session = await getSessionStub(sessionId);
+  await session.initializeUnattended("tenantA", allocation.lease);
+  return { coordinator, sessionId, deviceId, lease: allocation.lease };
+}
+
 /** Opens the fake-extension WS at the real onConnect-authed route (DL-006 critical fact). */
 async function connectFakeExtension(sessionId: string, token = EXTENSION_TOKEN_A): Promise<WebSocket> {
   const res = await exports.default.fetch(
@@ -82,6 +141,48 @@ async function connectFakeExtension(sessionId: string, token = EXTENSION_TOKEN_A
   const socket = getWebSocket(res);
   socket.accept();
   return socket;
+}
+
+async function connectSafeExtension(sessionId: string): Promise<WebSocket> {
+  const socket = await connectFakeExtension(sessionId);
+  socket.send(
+    JSON.stringify({
+      type: "hello",
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: [...PROTOCOL_CAPABILITIES],
+      browser: "Chrome/125",
+      extVersion: "0.1.0",
+      tabs: [
+        {
+          tabId: 7,
+          url: "https://example.com/",
+          title: "Example",
+          active: true,
+        },
+      ],
+    }),
+  );
+  const stub = await getSessionStub(sessionId);
+  expect(await stub.waitForProtocolV2Connection(2_000)).toBe(true);
+  return socket;
+}
+
+function waitForServerFrame<T extends SessionServerFrame["type"]>(
+  socket: WebSocket,
+  type: T,
+): Promise<Extract<SessionServerFrame, { type: T }>> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error(`timed out waiting for ${type}`)),
+      10_000,
+    );
+    socket.addEventListener("message", (event: MessageEvent) => {
+      const parsed = safeParseSessionServerFrame(JSON.parse(event.data as string));
+      if (!parsed.success || parsed.data.type !== type) return;
+      clearTimeout(timeout);
+      resolve(parsed.data as Extract<SessionServerFrame, { type: T }>);
+    });
+  });
 }
 
 /**
@@ -274,6 +375,63 @@ describe("GET /v1/sessions/:sessionId", () => {
     expect(res.status).not.toBe(403);
     expect(await res.json()).toEqual({ error: "not found" });
   });
+
+  it("keeps an unattended closing session pollable after DELETE", async () => {
+    const { sessionId } = await initializeUnattendedSession();
+
+    const deleted = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(deleted.status).toBe(202);
+    expect(deleted.headers.get("Location")).toBe(
+      new URL(`/v1/sessions/${encodeURIComponent(sessionId)}`, BASE).toString(),
+    );
+
+    const status = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A),
+    );
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({
+      mode: "unattended",
+      status: "closing",
+    });
+  });
+
+  it.each(["closed", "expired", "lost"] as const)(
+    "returns 410 for an unattended %s session",
+    async (terminalStatus) => {
+      const { coordinator, sessionId, deviceId, lease } =
+        await initializeUnattendedSession();
+      if (terminalStatus === "closed") {
+        expect(
+          await coordinator.confirmClosed({
+            sessionId,
+            leaseId: lease.leaseId,
+            deviceId,
+            leaseEpoch: lease.leaseEpoch,
+            browserEpoch: lease.browserEpoch,
+          }),
+        ).toEqual({ status: "closed", newlyClosed: true });
+      } else if (terminalStatus === "expired") {
+        expect(
+          await coordinator.getLease(sessionId, lease.idleExpiresAt),
+        ).toMatchObject({ status: "expired" });
+      } else {
+        expect(await coordinator.revokeDevice(deviceId)).toBe(true);
+      }
+
+      const status = await exports.default.fetch(
+        authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A),
+      );
+      expect(status.status).toBe(410);
+      expect(await status.json()).toMatchObject({
+        mode: "unattended",
+        status: terminalStatus,
+      });
+    },
+  );
 });
 
 describe("command parsing", () => {
@@ -292,6 +450,44 @@ describe("command parsing", () => {
       expect(await res.json()).toEqual({ error: "invalid command" });
 
       // #then nothing was ever dispatched to the extension
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(received).toEqual([]);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it.each([
+    {
+      label: "truthy-looking dryRun",
+      body: {
+        command: { type: "click", commandId: "strict-dry-run", ref: "r1" },
+        dryRun: "true",
+      },
+    },
+    {
+      label: "unknown request field",
+      body: {
+        command: { type: "get_tabs", commandId: "strict-extra" },
+        dryRun: false,
+        unexpected: true,
+      },
+    },
+  ])("rejects $label with zero WebSocket traffic", async ({ body }) => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const received = collectCommands(socket);
+    try {
+      const response = await exports.default.fetch(
+        authedRequest(`/v1/sessions/${sessionId}/commands`, CALLER_TOKEN_A, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "invalid command" });
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(received).toEqual([]);
     } finally {
@@ -346,6 +542,445 @@ describe("command round-trip via a live extension WebSocket", () => {
   });
 });
 
+describe("attended session retirement", () => {
+  it("retires authority on the first DELETE and rejects every later command or reconnect", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const closeFrame = waitForServerFrame(socket, "close_session");
+    const socketClosed = waitForSocketClose(socket);
+
+    const first = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(first.status).toBe(204);
+    expect(await closeFrame).toEqual({
+      type: "close_session",
+      closeTab: false,
+    });
+    expect(await socketClosed).toEqual({
+      code: 4003,
+      reason: "session deleted",
+    });
+
+    const terminalStatus = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A),
+    );
+    expect(terminalStatus.status).toBe(410);
+    expect(await terminalStatus.json()).toMatchObject({
+      status: "detached",
+    });
+
+    const repeated = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(repeated.status).toBe(204);
+
+    const legacy = await postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "get_tabs",
+      commandId: "after-delete-legacy",
+    });
+    expect(legacy.status).toBe(410);
+    expect(await legacy.json()).toEqual({ error: "session is terminal" });
+
+    const v2 = await postCommandV2(sessionId, CALLER_TOKEN_A, {
+      type: "get_tabs",
+      commandId: "after-delete-v2",
+    });
+    expect(v2.status).toBe(410);
+    expect(await v2.json()).toEqual({ error: "session is terminal" });
+
+    const vaultGetSpy = vi.spyOn(env.VAULT, "get");
+    const fill = await postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "fill_secret",
+      commandId: "after-delete-fill",
+      ref: "owned-ref",
+      secretRef: "vault://tenantA/terminal",
+    });
+    expect(fill.status).toBe(410);
+    expect(vaultGetSpy).not.toHaveBeenCalled();
+    vaultGetSpy.mockRestore();
+
+    const reconnectResponse = await exports.default.fetch(
+      new Request(
+        `${BASE}/agents/session/${sessionId}?token=${EXTENSION_TOKEN_A}`,
+        { headers: { Upgrade: "websocket" } },
+      ),
+    );
+    const reconnect = getWebSocket(reconnectResponse);
+    const reconnectClosed = waitForSocketClose(reconnect);
+    reconnect.accept();
+    expect(await reconnectClosed).toEqual({
+      code: 4003,
+      reason: "session deleted",
+    });
+  });
+
+  it("abandons an admitted legacy command as terminal when DELETE races its result", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+    const incoming = waitForCommand(socket);
+    const command = postCommand(sessionId, CALLER_TOKEN_A, {
+      type: "get_tabs",
+      commandId: "delete-race-legacy",
+    });
+    await incoming;
+
+    const deleted = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(deleted.status).toBe(204);
+    const response = await command;
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: "session is terminal" });
+  });
+
+  it("never grants a prepared v2 write after DELETE", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    const observed: SessionServerFrame[] = [];
+    socket.addEventListener("message", (event: MessageEvent) => {
+      const parsed = safeParseSessionServerFrame(JSON.parse(event.data as string));
+      if (parsed.success) observed.push(parsed.data);
+    });
+    const preparePromise = waitForServerFrame(socket, "write_prepare");
+    const command = postCommandV2(sessionId, CALLER_TOKEN_A, {
+      type: "click",
+      commandId: "delete-race-v2",
+      ref: "owned-ref",
+    });
+    const prepare = await preparePromise;
+
+    const deleted = await exports.default.fetch(
+      authedRequest(`/v1/sessions/${sessionId}`, CALLER_TOKEN_A, {
+        method: "DELETE",
+      }),
+    );
+    expect(deleted.status).toBe(204);
+    expect(prepare.commandId).toBe("delete-race-v2");
+    const response = await command;
+    expect(response.status).toBe(410);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(
+      observed.filter(
+        (frame) =>
+          frame.type === "write_grant" &&
+          frame.command.commandId === "delete-race-v2",
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("command contract v2", () => {
+  it("durably prepares and grants a write before accepting its result", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    try {
+      const preparePromise = waitForServerFrame(socket, "write_prepare");
+      const responsePromise = postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "v2-write",
+        ref: "owned-ref",
+      });
+      const prepare = await preparePromise;
+      const grantPromise = waitForServerFrame(socket, "write_grant");
+      socket.send(
+        JSON.stringify({
+          type: "write_ready",
+          attemptId: prepare.attemptId,
+          commandId: prepare.commandId,
+          deadlineAt: prepare.deadlineAt,
+          requestFingerprint: prepare.requestFingerprint,
+        }),
+      );
+      const grant = await grantPromise;
+      expect(grant.command).toEqual({
+        type: "click",
+        commandId: "v2-write",
+        ref: "owned-ref",
+      });
+      socket.send(
+        JSON.stringify({
+          type: "command_result",
+          attemptId: grant.attemptId,
+          commandId: "v2-write",
+          event: {
+            type: "action_result",
+            commandId: "v2-write",
+            ok: true,
+          },
+        }),
+      );
+
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        type: "action_result",
+        commandId: "v2-write",
+        ok: true,
+      });
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("conflicts a reused command ID with a changed request fingerprint", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    try {
+      const preparePromise = waitForServerFrame(socket, "write_prepare");
+      const firstResponse = postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "v2-conflict",
+        ref: "first-ref",
+      });
+      const prepare = await preparePromise;
+      const grantPromise = waitForServerFrame(socket, "write_grant");
+      socket.send(
+        JSON.stringify({
+          type: "write_ready",
+          attemptId: prepare.attemptId,
+          commandId: prepare.commandId,
+          deadlineAt: prepare.deadlineAt,
+          requestFingerprint: prepare.requestFingerprint,
+        }),
+      );
+      const grant = await grantPromise;
+      socket.send(
+        JSON.stringify({
+          type: "command_result",
+          attemptId: grant.attemptId,
+          commandId: "v2-conflict",
+          event: {
+            type: "action_result",
+            commandId: "v2-conflict",
+            ok: true,
+          },
+        }),
+      );
+      expect((await firstResponse).status).toBe(200);
+
+      const conflict = await postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "v2-conflict",
+        ref: "changed-ref",
+      });
+      expect(conflict.status).toBe(409);
+      expect(await conflict.json()).toEqual({
+        code: "command_id_conflict",
+        commandId: "v2-conflict",
+      });
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("returns session_busy for a distinct command while one attempt owns the slot", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    try {
+      const preparePromise = waitForServerFrame(socket, "write_prepare");
+      const firstResponse = postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "v2-busy-a",
+        ref: "first-ref",
+      });
+      const prepare = await preparePromise;
+
+      const busy = await postCommandV2(sessionId, CALLER_TOKEN_A, {
+        type: "key",
+        commandId: "v2-busy-b",
+        keys: "Escape",
+      });
+      expect(busy.status).toBe(429);
+      expect(await busy.json()).toEqual({
+        code: "session_busy",
+        commandId: "v2-busy-b",
+      });
+
+      const grantPromise = waitForServerFrame(socket, "write_grant");
+      socket.send(
+        JSON.stringify({
+          type: "write_ready",
+          attemptId: prepare.attemptId,
+          commandId: prepare.commandId,
+          deadlineAt: prepare.deadlineAt,
+          requestFingerprint: prepare.requestFingerprint,
+        }),
+      );
+      const grant = await grantPromise;
+      socket.send(
+        JSON.stringify({
+          type: "command_result",
+          attemptId: grant.attemptId,
+          commandId: "v2-busy-a",
+          event: {
+            type: "action_result",
+            commandId: "v2-busy-a",
+            ok: true,
+          },
+        }),
+      );
+      expect((await firstResponse).status).toBe(200);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("never returns 202 to a legacy connector after the extension selects protocol v2", async () => {
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectSafeExtension(sessionId);
+    try {
+      const preparePromise = waitForServerFrame(socket, "write_prepare");
+      const legacyResponse = postCommand(sessionId, CALLER_TOKEN_A, {
+        type: "click",
+        commandId: "legacy-on-v2",
+        ref: "owned-ref",
+      });
+      const prepare = await preparePromise;
+      const grantPromise = waitForServerFrame(socket, "write_grant");
+      socket.send(
+        JSON.stringify({
+          type: "write_ready",
+          attemptId: prepare.attemptId,
+          commandId: prepare.commandId,
+          deadlineAt: prepare.deadlineAt,
+          requestFingerprint: prepare.requestFingerprint,
+        }),
+      );
+      const grant = await grantPromise;
+      socket.send(
+        JSON.stringify({
+          type: "command_result",
+          attemptId: grant.attemptId,
+          commandId: "legacy-on-v2",
+          event: {
+            type: "action_result",
+            commandId: "legacy-on-v2",
+            ok: true,
+          },
+        }),
+      );
+      const response = await legacyResponse;
+      expect(response.status).toBe(200);
+      expect(response.status).not.toBe(202);
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it(
+    "atomically wins the prepare timeout and never grants a late-ready write",
+    async () => {
+      const sessionId = await openSession(CALLER_TOKEN_A);
+      const socket = await connectSafeExtension(sessionId);
+      const frames: SessionServerFrame[] = [];
+      socket.addEventListener("message", (event: MessageEvent) => {
+        const parsed = safeParseSessionServerFrame(JSON.parse(event.data as string));
+        if (parsed.success) frames.push(parsed.data);
+      });
+      try {
+        const preparePromise = waitForServerFrame(socket, "write_prepare");
+        const responsePromise = postCommandV2(sessionId, CALLER_TOKEN_A, {
+          type: "click",
+          commandId: "v2-safe-timeout",
+          ref: "owned-ref",
+        });
+        const prepare = await preparePromise;
+        const response = await responsePromise;
+        expect(response.status).toBe(504);
+        expect(await response.json()).toEqual({
+          code: "command_not_started",
+          commandId: "v2-safe-timeout",
+          safeToRetry: true,
+        });
+
+        socket.send(
+          JSON.stringify({
+            type: "write_ready",
+            attemptId: prepare.attemptId,
+            commandId: prepare.commandId,
+            deadlineAt: prepare.deadlineAt,
+            requestFingerprint: prepare.requestFingerprint,
+          }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(frames.some((frame) => frame.type === "write_grant")).toBe(false);
+      } finally {
+        socket.close(1000, "done");
+      }
+    },
+    10_000,
+  );
+
+  it(
+    "converges simultaneous safe retries of one logical command onto one new attempt",
+    async () => {
+      const sessionId = await openSession(CALLER_TOKEN_A);
+      const socket = await connectSafeExtension(sessionId);
+      try {
+        const firstPrepare = waitForServerFrame(socket, "write_prepare");
+        const firstResponse = postCommandV2(sessionId, CALLER_TOKEN_A, {
+          type: "click",
+          commandId: "v2-retry-race",
+          ref: "owned-ref",
+        });
+        await firstPrepare;
+        expect((await firstResponse).status).toBe(504);
+
+        const retryPrepare = waitForServerFrame(socket, "write_prepare");
+        const retries = [
+          postCommandV2(sessionId, CALLER_TOKEN_A, {
+            type: "click",
+            commandId: "v2-retry-race",
+            ref: "owned-ref",
+          }),
+          postCommandV2(sessionId, CALLER_TOKEN_A, {
+            type: "click",
+            commandId: "v2-retry-race",
+            ref: "owned-ref",
+          }),
+        ];
+        const prepare = await retryPrepare;
+        const grantPromise = waitForServerFrame(socket, "write_grant");
+        socket.send(
+          JSON.stringify({
+            type: "write_ready",
+            attemptId: prepare.attemptId,
+            commandId: prepare.commandId,
+            deadlineAt: prepare.deadlineAt,
+            requestFingerprint: prepare.requestFingerprint,
+          }),
+        );
+        const grant = await grantPromise;
+        socket.send(
+          JSON.stringify({
+            type: "command_result",
+            attemptId: grant.attemptId,
+            commandId: "v2-retry-race",
+            event: {
+              type: "action_result",
+              commandId: "v2-retry-race",
+              ok: true,
+            },
+          }),
+        );
+
+        const responses = await Promise.all(retries);
+        expect(responses.map((response) => response.status).sort()).toEqual([200, 202]);
+      } finally {
+        socket.close(1000, "done");
+      }
+    },
+    15_000,
+  );
+});
+
 describe("fill_secret", () => {
   it("resolves the vault secret and types it via the extension without leaking the plaintext", async () => {
     // #given a seeded vault secret and a connected fake extension
@@ -355,7 +990,7 @@ describe("fill_secret", () => {
 
     // Captures every raw WS frame (Command AND Agents-SDK framework
     // messages alike) so the no-leak check below can assert the plaintext
-    // appears on the wire exactly once - the one hop where it must travel.
+    // appears on the single wire hop where it must travel.
     const rawFrames: string[] = [];
     socket.addEventListener("message", (event: MessageEvent) => {
       rawFrames.push(event.data as string);
@@ -1008,12 +1643,12 @@ describe("error taxonomy (route mapping)", () => {
         expect(res.status).toBe(504);
         expect(await res.json()).toEqual({ error: "command timed out" });
 
-        // #then the awaiting marker was cleared by the REAL DO-level timeout
-        // (the fake-timer coordinator test covers this deterministically;
-        // this re-asserts it through the integrated path, post-settlement)
+        // #then the durable marker still fences the session. Dropping it
+        // here would admit another command while this command remains queued
+        // in the extension and could execute later.
         const stub = await getSessionStub(sessionId);
         await runInDurableObject(stub, (instance: SessionAgent) => {
-          expect(instance.state.awaitingCommandIds).toEqual([]);
+          expect(instance.state.awaitingCommandIds).toEqual(["c-silent"]);
         });
       } finally {
         socket.close(1000, "done");
@@ -1123,7 +1758,7 @@ describe("idempotent write replay (stable commandId contract)", () => {
       });
 
       // #then the recorded Event is replayed byte-for-byte and the extension
-      // never saw a second click - the write executed exactly once
+      // never saw a second click: the write executed at most once
       expect(retryRes.status).toBe(200);
       expect(await retryRes.json()).toEqual(first);
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -1271,8 +1906,8 @@ describe("idempotent write replay (stable commandId contract)", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       // #then a retry of the same commandId still replays the recorded Event
-      // unchanged - completedWrites is untouched by the resync, and replay is
-      // keyed by commandId alone (no generation dependence)
+      // unchanged: completedWrites survives resync, and the exact command type
+      // and request fingerprint still match.
       const retryRes = await postCommand(sessionId, CALLER_TOKEN_A, {
         type: "click",
         commandId: "ik_resync:click",
@@ -1296,7 +1931,7 @@ describe("idempotent write replay (stable commandId contract)", () => {
 
       // #when the same read commandId is posted again
       // #then it round-trips to the extension again - reads are free to
-      // re-execute; only writes carry the exactly-once contract
+      // re-execute; only writes carry the at-most-once contract
       expect((await roundTripGetTabs(socket, sessionId, "read-1")).status).toBe(200);
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(received.filter((cmd) => cmd.type === "get_tabs")).toHaveLength(2);
@@ -1446,7 +2081,7 @@ describe("two-tenant vault isolation (cross-tenant secretRef scoping, server-sid
     }
   });
 
-  it("refuses a cross-tenant secretRef before replay - a reused commandId cannot serve a cached own-tenant result", async () => {
+  it("rejects a changed cross-tenant fill under a completed commandId", async () => {
     // #given tenantB completed a legitimate OWN-tenant fill under a commandId
     // (caching an ok:true write result), and tenantA's secret is also seeded
     await seedVault("vault://tenantB/own-pw", "tenantB-own");
@@ -1480,14 +2115,10 @@ describe("two-tenant vault isolation (cross-tenant secretRef scoping, server-sid
           secretRef: "vault://tenantA/okta-pw",
         });
 
-        // #then the guard (which runs BEFORE replay) refuses it: the cached
-        // ok:true is NOT served, and tenantA's vault is never read
-        expect(await res.json()).toEqual({
-          type: "action_result",
-          commandId: "ik_shared:fill",
-          ok: false,
-          error: "fill_secret: secret could not be resolved",
-        });
+        // #then exact replay binding rejects the changed request without
+        // serving the cached result or reading tenantA's vault.
+        expect(res.status).toBe(409);
+        expect(await res.json()).toEqual({ code: "command_id_conflict" });
         expect(vaultGetSpy).not.toHaveBeenCalled();
       } finally {
         vaultGetSpy.mockRestore();
@@ -1625,6 +2256,8 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
       socket.send(
         JSON.stringify({
           type: "dialog",
+          dialogId: "dialog-confirm-1",
+          occurredAt: "2026-07-26T00:00:00.000Z",
           tabId: 3,
           dialogType: "confirm",
           message: "Delete this item?",
@@ -1641,6 +2274,8 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
       const status = (await res.json()) as { dialogs: unknown[] };
       expect(status.dialogs).toEqual([
         {
+          dialogId: "dialog-confirm-1",
+          occurredAt: "2026-07-26T00:00:00.000Z",
           tabId: 3,
           dialogType: "confirm",
           message: "Delete this item?",
@@ -1663,6 +2298,8 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
       socket.send(
         JSON.stringify({
           type: "dialog",
+          dialogId: "dialog-alert-1",
+          occurredAt: "2026-07-26T00:00:00.000Z",
           tabId: 1,
           dialogType: "alert",
           message: "Saved",
@@ -1673,6 +2310,8 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
       socket.send(
         JSON.stringify({
           type: "dialog",
+          dialogId: "dialog-prompt-1",
+          occurredAt: "2026-07-26T00:00:01.000Z",
           tabId: 1,
           dialogType: "prompt",
           message: "Name?",

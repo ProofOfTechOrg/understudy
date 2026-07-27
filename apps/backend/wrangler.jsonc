@@ -12,12 +12,18 @@
       // SessionAgent itself lands in src/session.ts at M-004 (wired into the
       // Worker entry, src/index.ts, at M-005); the binding is declared now
       // so wrangler.jsonc doesn't churn again for that milestone.
-      { "name": "SESSION", "class_name": "SessionAgent" }
+      { "name": "SESSION", "class_name": "SessionAgent" },
+      { "name": "DEVICE", "class_name": "DeviceAgent" },
+      { "name": "TENANT_CONTROL", "class_name": "TenantDeviceCoordinator" }
     ]
   },
   "migrations": [
     // Agents SDK Durable Objects are SQLite-backed.
-    { "tag": "v1", "new_sqlite_classes": ["SessionAgent"] }
+    { "tag": "v1", "new_sqlite_classes": ["SessionAgent"] },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["DeviceAgent", "TenantDeviceCoordinator"]
+    }
   ],
   "kv_namespaces": [
     {
@@ -48,8 +54,33 @@
     // excludes the rest (no "optional" tier exists), which silently breaks
     // dev auth. They are operationally required anyway - without them the
     // service 401s every caller and rejects the extension WS.
-    "required": ["AUTH_HMAC_SECRET", "CALLER_TOKENS", "EXTENSION_TOKENS", "VAULT_MASTER_KEY"]
+    "required": [
+      "AUTH_HMAC_SECRET",
+      "CALLER_TOKENS",
+      "EXTENSION_TOKENS",
+      "DEVICE_TOKENS",
+      "WS_TICKET_SECRET",
+      "VAULT_MASTER_KEY"
+    ]
   },
+  "vars": {
+    "QUOTA_POLICY": "{\"sessionCreatesPerActorMinute\":10,\"commandsPerSessionMinute\":120,\"commandsPerTenantMinute\":600,\"credentialFillsPerActorMinute\":30,\"deviceTicketsPerDeviceMinute\":30,\"sessionCommandCap\":10000}",
+    "UNATTENDED_ENABLED_TENANTS": "[]",
+    "SAFE_WRITE_REQUIRED_TENANTS": "[]"
+  },
+  "analytics_engine_datasets": [
+    {
+      "binding": "ANALYTICS",
+      "dataset": "understudy_telemetry"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 300, "period": 60 }
+    }
+  ],
   "observability": {
     "enabled": true
   }

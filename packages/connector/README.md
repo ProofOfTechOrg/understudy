@@ -1,229 +1,187 @@
-# @understudy/connector
+<!-- Content type: Reference -->
 
-Reference [`@proofoftech/breakwater`](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/breakwater)
-connectors for the [understudy](https://github.com/ProofOfTechOrg/understudy)
-browser-execution service.
+# Govern browser commands with the Understudy connector
 
-understudy is a **model-free substrate** (Topology 1): it holds live,
-logged-in browser sessions behind `POST /v1/sessions/:sessionId/commands` and
-runs no LLM and no governance of its own. The Mastra agent, the approval flow,
-RBAC, and the audit trail live in the **consumer** app — and this package is
-the bridge: it wraps understudy's browser commands as breakwater connectors so
-every browser write flows through the *same* governance path as any API
-connector (approval grants, egress pinning, idempotent replay, dry-run, rate
-limits, audit).
+`@understudy/connector` wraps the Understudy command API as three breakwater connectors. Consumer applications retain their Mastra agent, flowsafe approval workflow, role-based access control, policy, and durable audit. Version 0.5.0 adds protocol-2 pending, not-started, and unknown outcomes.
 
-## The three connectors
+## Install the connector
 
-| connector | id | class | protocol commands |
-|---|---|---|---|
-| `observe` | `browser.observe` | read — no approval | `snapshot` (a11y/dom/screenshot), `get_tabs`, `get_dialogs`, `wait` |
-| `act` | `browser.act` | write — approval-gated | `click`, `type`, `navigate`, `key`, `scroll`, `switch_tab` |
-| `fillCredential` | `browser.fill_credential` | vaulted write — approval-gated | `fill_secret` |
-
-`scroll` and `switch_tab` route through the gated `act` connector because both
-change what the user's real browser shows. The protocol classifies them as
-writes for exactly this reason (`isWriteCommand` returns `true`), so `act`
-gates precisely the protocol's write class minus `fill_secret` — no divergence
-to keep in sync.
-
-The protocol's `resolve_ref` command is deliberately unreachable from here —
-it is an internal service↔extension probe. Dry-run intent is expressed via the
-service API's `dryRun` flag, which the `dryRunExecute` paths set.
-
-Snapshot reads return `target: { tabId, url }` beside the tree or screenshot.
-That target is captured from the exact attached CDP session with the artifact;
-consumers should validate it instead of inferring session identity from the
-global `get_tabs` list, where each browser window can have an active tab.
-When the driver cannot produce a trustworthy snapshot, including an expected
-tab mismatch or a page change during capture, `observe` returns structured
-`{ ok: false, error }` output with the driver's reason.
-
-Accessibility refs are opaque and bound to the extension session, CDP
-attachment, and snapshot generation that minted them. Do not parse their
-encoding or reuse a ref after another attachment replaces the target.
-
-## Install
-
-```sh
-pnpm add @understudy/connector @understudy/protocol @proofoftech/breakwater @mastra/core zod
+```bash
+pnpm add @understudy/connector @understudy/protocol \
+  @proofoftech/breakwater @mastra/core zod
 ```
 
-`@proofoftech/breakwater` and `@mastra/core` are peer dependencies — the
-connectors must share the consumer's Mastra runtime. The package declares
-`engines.node >= 22`, mirroring its breakwater peer (unlike
-`@understudy/protocol`, which is runtime-agnostic and deliberately declares
-no engines constraint).
+The package requires Node 22 or newer. `@proofoftech/breakwater` and `@mastra/core` are peer dependencies.
 
-## Quick start
+## Choose a connector
 
-```ts
+| Export | Connector ID | Class | Commands |
+|---|---|---|---|
+| `observe` | `browser.observe` | Read | `snapshot`, `get_tabs`, `get_dialogs`, `wait` |
+| `act` | `browser.act` | Approval-gated write | `click`, `type`, `navigate`, `key`, `scroll`, `switch_tab` |
+| `fillCredential` | `browser.fill_credential` | Approval-gated vaulted write | `fill_secret` |
+
+The connector derives this split from the protocol write classification. `resolve_ref` remains an internal service command.
+
+## Create connector instances
+
+Use durable stores on Cloudflare. In-memory idempotency and rate-limit stores do not survive isolate replacement.
+
+```typescript
 import {
-  BROWSER_WRITE_CONNECTOR_IDS,
-  callBrowserDryRun,
-  callBrowserWrite,
-  callConnector,
   createBrowserConnectors,
   durableStores,
-  type ObserveInput,
-  type ObserveOutput,
 } from "@understudy/connector";
 
-// D1-backed stores are load-bearing on Cloudflare: breakwater's in-memory
-// defaults are per-isolate, which under flowsafe's DO-per-run routing means
-// per-RUN — a Worker restart mid-step would double-submit a form.
 const stores = durableStores(env.DB);
-const { observe, act, fillCredential } = createBrowserConnectors(
-  { UNDERSTUDY_URL: env.UNDERSTUDY_URL, UNDERSTUDY_TOKEN: env.UNDERSTUDY_TOKEN },
+const connectors = createBrowserConnectors(
+  {
+    UNDERSTUDY_URL: env.UNDERSTUDY_URL,
+    UNDERSTUDY_TOKEN: env.UNDERSTUDY_TOKEN,
+  },
   stores,
 );
 ```
 
-Register the three connectors as tools on your Mastra agent (they *are*
-Mastra tools — `createConnector()` wraps `createTool()`), or call them from
-workflow steps via the helpers:
+`UNDERSTUDY_URL` defines the hostname allowed by breakwater’s per-hop egress guard. Store `UNDERSTUDY_TOKEN` as a secret.
 
-```ts
-// 1. Verify that the snapshot came from the intended browser target.
-const snapshot = await callConnector<ObserveInput, ObserveOutput>(
-  observe,
+## Execute a governed write
+
+Simulate the action before requesting approval. Use a business-stable idempotency key for the real write.
+
+```typescript
+import {
+  BROWSER_WRITE_CONNECTOR_IDS,
+  callBrowserDryRun,
+  callBrowserWrite,
+} from "@understudy/connector";
+
+await callBrowserDryRun(connectors.act, {
+  sessionId,
+  action: { type: "click", ref },
+});
+
+await suspend({
+  reason: "Submit the approved browser action",
+  connectors: [...BROWSER_WRITE_CONNECTOR_IDS],
+});
+
+await callBrowserWrite(
+  connectors.act,
+  { sessionId, action: { type: "click", ref } },
+  requestContext,
+  `${caseId}:${step}:click`,
+);
+```
+
+The connector hashes the business key into a bounded `ik_<sha256>` command ID. It never emits the raw key on the command wire.
+
+An absent or forged flowsafe grant fails with `ConnectorPolicyError` before network traffic.
+
+## Handle protocol-2 outcomes
+
+The connector sends `Understudy-Command-Contract: 2`. A `202` response is not an event and raises `UnderstudyCommandPendingError`.
+
+```typescript
+import {
+  callBrowserWrite,
+  pollUnderstudyCommand,
+  UnderstudyCommandNotStartedError,
+  UnderstudyCommandOutcomeUnknownError,
+  UnderstudyCommandPendingError,
+  UnderstudyCommandTimedOutError,
+} from "@understudy/connector";
+
+try {
+  return await callBrowserWrite(
+    connectors.act,
+    input,
+    requestContext,
+    businessKey,
+  );
+} catch (error) {
+  if (error instanceof UnderstudyCommandPendingError) {
+    return pollUnderstudyCommand(
+      runtime,
+      env,
+      input.sessionId,
+      error.pending.commandId,
+    );
+  }
+  if (error instanceof UnderstudyCommandNotStartedError) {
+    throw error;
+  }
+  if (error instanceof UnderstudyCommandTimedOutError) {
+    throw error;
+  }
+  if (error instanceof UnderstudyCommandOutcomeUnknownError) {
+    throw error;
+  }
+  throw error;
+}
+```
+
+Apply these retry rules:
+
+- **Pending**: poll the same command ID
+- **Not started**: retrying the same logical command is safe and creates a new attempt
+- **Timed out**: retry a read or dry run because it cannot create an external side effect
+- **Unknown outcome**: do not retry; a side effect may have occurred
+
+Understudy guarantees at-most-once write execution with explicit pending and unknown outcomes. It cannot guarantee exactly-once external outcomes if Chromium dies after a side effect.
+
+## Validate snapshot targets
+
+Snapshots return the exact tab ID and URL captured with the artifact. Validate both before using a ref.
+
+```typescript
+const result = await callConnector(
+  connectors.observe,
   {
     sessionId,
     read: { type: "snapshot", mode: "a11y", tabId: expectedTabId },
   },
   requestContext,
 );
-const target = snapshot.target;
+
 if (
-  snapshot.ok === false ||
-  target === undefined ||
-  target.tabId !== expectedTabId ||
-  target.url !== expectedUrl
+  result.ok === false ||
+  result.target?.tabId !== expectedTabId ||
+  result.target.url !== expectedUrl
 ) {
-  throw new Error(snapshot.error ?? "browser snapshot target mismatch");
+  throw new Error(result.error ?? "browser snapshot target mismatch");
 }
 ```
 
-After target validation, use the normal simulation and approval flow:
+Refs bind to the extension session, CDP attachment, and snapshot generation. Re-snapshot after navigation or attachment replacement.
 
-```ts
-// 1. Simulate before asking for approval — no side effect, no grant needed.
-const preview = await callBrowserDryRun(act, {
-  sessionId,
-  action: { type: "click", ref },
-});
+## Fill a credential
 
-// 2. Suspend at a flowsafe approval gate, minting grants for the STATIC ids
-//    (never ids derived from model output — the grant is a capability token):
-await suspend({ reason: "...", connectors: [...BROWSER_WRITE_CONNECTOR_IDS] });
+`fillCredential` accepts an opaque `secretRef`, such as `vault://tenant_a/portal/password`. The Understudy service resolves plaintext after write readiness and sends it only in the in-memory grant frame.
 
-// 3. On resume, flowsafe's approvalGrantProvider re-derives
-//    requestContext['breakwater.approvedConnectors'] from the APPROVED record;
-//    the write executes at-most-once under a business-meaningful key.
-await callBrowserWrite(act, { sessionId, action: { type: "click", ref } },
-  requestContext, `${caseId}:${step}:click`);
-```
+Never route a credential through `act` and `type.text`. Plaintext must not enter model context, connector input, flowsafe snapshots, audit details, storage, or logs.
 
-An unapproved (or forged-resume) call fails **closed** with
-`ConnectorPolicyError` before any bytes leave the Worker.
+## Configure consumer governance
 
-## Environment
+`createBrowserConnectors` accepts organization policies:
 
-| var | meaning |
-|---|---|
-| `UNDERSTUDY_URL` | Base URL of the understudy service. Its host becomes the connector egress declaration — `runtime.fetch` is pinned to it, redirect hops included. |
-| `UNDERSTUDY_TOKEN` | Caller bearer token for the service's `/v1` API. The service maps it to a tenant and refuses cross-tenant `sessionId`s with 404. |
-
-Both are secrets-adjacent config: provision them via Wrangler secrets, not
-plain vars, in production.
-
-## Governance the consumer gets
-
-- **Approval (fail closed).** `act` and `fillCredential` declare
-  `requiresApproval`; breakwater denies the call unless the request context
-  carries a flowsafe-minted grant for the connector's static id. One approval
-  queue, one audit trail — understudy runs no second HITL stack.
-- **Egress pinning.** Every `execute()` reaches understudy only through
-  breakwater's egress-guarded `runtime.fetch`; a redirect off the understudy
-  hostname is denied per hop (and recorded, once an audit logger is wired —
-  see below). Pinning is hostname-scoped, breakwater's egress model — not
-  origin-scoped, so it does not distinguish ports.
-- **Idempotency.** Writes require a caller-supplied key
-  (`callBrowserWrite`'s last argument). Replays return the stored result
-  without re-executing, so DO hibernation/retry cannot double-submit after a
-  *known* outcome. The once-inherent gap — write performed but the response
-  lost/unparseable, so the key stays retryable and the retry re-executes —
-  is closed end to end: the connector derives the wire `commandId` from the
-  idempotency key (`ik_<key>`), the understudy service replays a recorded
-  write Event for a repeated commandId instead of re-dispatching (and refuses
-  a still-in-flight duplicate outright), and the extension both replays its
-  own recorded result if the service timed out *after* it responded and drops
-  a duplicate that arrives while it is *still* executing — so the write runs
-  exactly once even under a timeout race. Remaining boundary: the replay
-  records are bounded (100 writes each, service- and extension-side) and
-  scoped to the session — a retry beyond that bound degrades to the old
-  conservative re-execution.
-- **Dry-run.** `callBrowserDryRun` runs the connector's simulation:
-  understudy checks the `ref` still resolves (a pure ref-map lookup — it never
-  re-mints refs, so outstanding refs survive the simulation) and returns a
-  simulated `action_result`. A simulated `ok` guarantees *resolvability*, not
-  executability; for ref-less actions (`navigate`, `switch_tab`) the service
-  answers `ok: true` without dispatching anything to the browser, so a
-  simulated `ok` is not a liveness signal.
-- **Rate limits.** `act` 60/min, `fillCredential` 30/min, enforced against the
-  durable store.
-
-### Audit and org policies
-
-`createBrowserConnectors` takes an optional third argument passing org-level
-breakwater policies through to all three connectors:
-
-```ts
+```typescript
 import { AuditLogger } from "@proofoftech/breakwater/audit";
 import { tenantIsolation } from "@proofoftech/breakwater/policy-engine";
 
 createBrowserConnectors(env, stores, {
-  audit: new AuditLogger({ sink: myAuditSink }), // every decision recorded
-  evaluators: [tenantIsolation()],               // multi-tenant hosts
+  audit: new AuditLogger({ sink: auditSink }),
+  evaluators: [tenantIsolation()],
 });
 ```
 
-Without an `audit` logger, breakwater-layer decisions are enforced but not
-recorded — the durable case-level trail is the consumer's flowsafe layer
-either way.
+Without an audit logger, breakwater still enforces decisions. The consumer’s flowsafe layer remains the durable case-level audit owner.
 
-## The credential invariant
+Page accessibility and Document Object Model content is untrusted model input. Enforce prompt-injection controls and business origin policy in the consumer.
 
-The model **never sees a secret**. `fillCredential` takes an opaque
-`secretRef` (e.g. `vault://acme/portal-x/password`); the understudy *service*
-resolves it and types the plaintext into the field over the trusted
-service↔extension hop. The plaintext never enters the connector input, the
-model context, the audit `detail`, or the flowsafe snapshot — and its dry-run
-never touches the vault. Never route credentials through `act`'s `type.text`;
-a breakwater `piiSecrets` policy at the agent boundary can additionally reject
-high-entropy strings that leak into it.
+## Version history
 
-## Prompt-injection note
-
-Page content returned by `observe` (a11y text, DOM) is **untrusted input to
-your LLM**. understudy reports it faithfully; the injection boundary — "page
-text is data, not instructions", origin allowlists, breakwater policy — is
-yours to enforce at the agent.
-
-## What this package is not
-
-- It does not run an agent, choose a model, or talk to an LLM.
-- It does not implement approvals — it *demands* them (flowsafe mints the
-  grants).
-- It does not mint sessions. Create one with
-  `POST {UNDERSTUDY_URL}/v1/sessions` (bearer `UNDERSTUDY_TOKEN`) during case
-  setup and pass the returned `sessionId` into every connector input.
-
-## Versioning
-
-- **0.4.0** — returns the exact snapshot target through `observe`, preserves
-  snapshot driver failures as structured output, and requires
-  `@understudy/protocol@^0.6.0`. Upgrade the service and extension in the same
-  rollout because protocol 0.6 makes snapshot target fields mandatory.
-- **0.3.0** — adds `observe`'s `get_dialogs` read for recent dialogs handled by
-  the extension and requires `@understudy/protocol@^0.5.0`.
+- **0.5.0**: command contract 2, typed pending and terminal safety outcomes, status polling, bounded command IDs, and protocol 0.7
+- **0.4.0**: target-bound snapshot outputs and protocol 0.6
+- **0.3.0**: handled-dialog reads and protocol 0.5
+- **0.2.0**: durable idempotency keys and shared write classification

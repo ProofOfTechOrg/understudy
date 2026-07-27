@@ -10,7 +10,7 @@
  */
 
 import type { Command, Event } from "@understudy/protocol";
-import type { SessionStatus } from "./types";
+import type { LegacyCommandTombstone, SessionStatus } from "./types";
 
 /**
  * send()'s delivery-failure vocabulary. These prefixes never cross the RPC
@@ -26,12 +26,16 @@ export const SESSION_NOT_CONNECTED = "session not connected";
 export const COMMAND_TIMED_OUT = "command timed out";
 export const SESSION_RESYNCED = "session resynced";
 export const DUPLICATE_COMMAND = "duplicate command in flight";
+export const SESSION_BUSY = "session busy";
+export const SESSION_TERMINAL = "session terminal";
 
 /** One outstanding `send(cmd)` call, awaiting its correlated Event. */
 export interface PendingCommand {
   resolve: (ev: Event) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  timedOut: boolean;
+  tombstone: LegacyCommandTombstone;
 }
 
 /** Outstanding commands awaiting their correlated Event, keyed by commandId. */
@@ -44,6 +48,6 @@ export type PendingMap = Map<string, PendingCommand>;
  * per-command timeout.
  */
 export interface SessionCoordinator {
-  send(cmd: Command): Promise<Event>;
+  send(cmd: Command, tombstone: LegacyCommandTombstone): Promise<Event>;
   setStatus(s: SessionStatus): void;
 }

@@ -1,14 +1,27 @@
-import { safeParseCommand } from "@understudy/protocol";
+import {
+  PROTOCOL_CAPABILITIES,
+  PROTOCOL_VERSION,
+  WS_CLOSE_SESSION_TERMINAL,
+  isWriteCommand,
+  safeParseCommand,
+  safeParseSessionServerFrame,
+} from "@understudy/protocol";
+import type { Command, Event, SessionServerFrame } from "@understudy/protocol";
 import type { Browser } from "wxt/browser";
 import { CommandIngress, type StartedCommand } from "../core/command-ingress";
 import { WriteDedupe } from "../core/dedupe";
+import {
+  DialogOutbox,
+  handleDialogWithOutbox,
+} from "../core/dialog-outbox";
 import { sendIfPeerCurrent } from "../core/peer-binding";
 import { routeCommand } from "../core/router";
 import { ReconnectingWs } from "../core/ws-client";
+import { ProfileClient } from "../core/profile-client";
+import { WriteJournal } from "../core/write-journal";
 import { CdpSession } from "../driver/cdp";
-import { applyDialogDecision, classifyCdpEvent } from "../driver/cdp-events";
+import { classifyCdpEvent } from "../driver/cdp-events";
 import { errorMessage } from "../events";
-import { queryTabInfos } from "../tabs";
 import type {
   AttachedTab,
   LogEntry,
@@ -20,7 +33,8 @@ import type {
 } from "../messaging";
 
 const DEFAULT_WS_URL = "ws://localhost:8787";
-// WXT storage item id 'local:wsUrl' maps to browser.storage.local key 'wsUrl'.
+// Attended URLs can contain a legacy extension token. Keep them in
+// storage.session so they survive SW eviction but clear on browser restart.
 const WS_URL_KEY = "wsUrl";
 // Persisted across SW eviction so a wake can re-discover the driven tab.
 const ATTACHED_TAB_KEY = "understudy:attachedTabId";
@@ -56,7 +70,18 @@ let attachedTitle: string | undefined;
 // Write-replay record (idempotent-retry contract); hydrates lazily from
 // storage.session, so rebuilding it each wake loses nothing.
 const dedupe = new WriteDedupe(browser.storage.session);
+const attendedJournal = new WriteJournal(
+  browser.storage.session,
+  "understudy:attendedJournal",
+);
+const attendedDialogs = new DialogOutbox(
+  browser.storage.session,
+  "understudy:attendedDialogs",
+);
+let attendedWritesBlocked = false;
+let attendedTerminal = false;
 const commandIngress = new CommandIngress();
+const profileClient = new ProfileClient(() => broadcastState());
 
 const logBuffer: LogEntry[] = [];
 const ports = new Set<Browser.runtime.Port>();
@@ -69,6 +94,7 @@ export default defineBackground({
     browser.alarms.onAlarm.addListener(onAlarm);
     browser.debugger.onEvent.addListener(onCdpEvent);
     browser.debugger.onDetach.addListener(onDetach);
+    browser.tabs.onCreated.addListener(onTabCreated);
     browser.runtime.onConnect.addListener(onConnect);
     browser.alarms.create(BACKSTOP_ALARM, { periodInMinutes: 0.5 }).catch((cause: unknown) => {
       log(`alarm create failed: ${errorMessage(cause)}`, "warn");
@@ -77,6 +103,7 @@ export default defineBackground({
     // Kick off the async wake tasks without awaiting (main() must stay non-async).
     fireAndForget("ensureConnection", ensureConnection);
     fireAndForget("reconcileAttachment", reconcileAttachment);
+    fireAndForget("profileClient", () => profileClient.start());
   },
 });
 
@@ -90,9 +117,17 @@ function getUrl(): string {
 
 async function readWsUrl(): Promise<string> {
   try {
-    const stored = await browser.storage.local.get(WS_URL_KEY);
+    const stored = await browser.storage.session.get(WS_URL_KEY);
     const value = stored[WS_URL_KEY];
-    return typeof value === "string" && value.length > 0 ? value : DEFAULT_WS_URL;
+    if (typeof value === "string" && value.length > 0) return value;
+    const legacy = await browser.storage.local.get(WS_URL_KEY);
+    const legacyValue = legacy[WS_URL_KEY];
+    await browser.storage.local.remove(WS_URL_KEY);
+    if (typeof legacyValue === "string" && legacyValue.length > 0) {
+      await browser.storage.session.set({ [WS_URL_KEY]: legacyValue });
+      return legacyValue;
+    }
+    return DEFAULT_WS_URL;
   } catch (cause) {
     log(`read wsUrl failed, using default: ${errorMessage(cause)}`, "warn");
     return DEFAULT_WS_URL;
@@ -126,7 +161,7 @@ function connectWs(): void {
   peer = new ReconnectingWs(getUrl, {
     onCommand: (raw) => onCommand(raw, peer),
     onOpen: () => onOpen(peer),
-    onClose: () => onClose(peer),
+    onClose: (event) => onClose(peer, event),
     onConnecting,
   });
   ws = peer;
@@ -135,7 +170,10 @@ function connectWs(): void {
 
 // ReconnectingWs starts its own pong heartbeat on open, so we only (re)send hello.
 function onOpen(peer: ReconnectingWs): void {
-  if (peer !== ws || wsSwitching) return;
+  if (peer !== ws || wsSwitching || attendedTerminal) {
+    peer.stop();
+    return;
+  }
   wsStatus = "open";
   log("ws connected");
   fireAndForget("hello", () => sendHello(peer));
@@ -147,37 +185,271 @@ function onConnecting(): void {
   broadcastState();
 }
 
-function onClose(peer: ReconnectingWs): void {
+function onClose(peer: ReconnectingWs, event: CloseEvent): void {
   if (peer !== ws) return;
   wsStatus = "closed";
+  if (event.code === WS_CLOSE_SESSION_TERMINAL) {
+    attendedTerminal = true;
+    if (acceptingPeer === peer) acceptingPeer = null;
+    fireAndForget("terminal session detach", detach);
+  }
   broadcastState();
 }
 
 // A fresh hello on every (re)connect is the resync signal: any commands in flight
 // when the SW was evicted are abandoned, and the peer tolerates repeated hellos.
 async function sendHello(peer: ReconnectingWs): Promise<void> {
-  const tabs = await queryTabInfos();
+  const active = session;
+  if (active === null) {
+    sendIfPeerCurrent(peer, acceptingPeer, (current) => {
+      current.send({
+        type: "hello",
+        browser: navigator.userAgent,
+        extVersion: browser.runtime.getManifest().version,
+        tabs: [],
+      });
+    });
+    return;
+  }
+  const tab = await browser.tabs.get(active.tabId);
   sendIfPeerCurrent(peer, acceptingPeer, (current) => {
     current.send({
       type: "hello",
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: [...PROTOCOL_CAPABILITIES],
       browser: navigator.userAgent,
       extVersion: browser.runtime.getManifest().version,
-      tabs,
+      tabs: [
+        {
+          tabId: active.tabId,
+          url: tab.url ?? active.currentUrl,
+          title: tab.title ?? "",
+          active: tab.active,
+        },
+      ],
+    });
+  });
+  await replayAttendedState(peer);
+}
+
+function onCommand(raw: unknown, peer: ReconnectingWs): void {
+  if (attendedTerminal || peer !== acceptingPeer) return;
+  const v2 = safeParseSessionServerFrame(raw);
+  if (v2.success) {
+    fireAndForget("v2 command ingress", () =>
+      commandIngress.enqueue(() => startV2Frame(v2.data, peer)),
+    );
+    return;
+  }
+  fireAndForget("command ingress", () =>
+    commandIngress.enqueue(() => startCommand(raw, peer)),
+  );
+}
+
+async function startV2Frame(
+  frame: SessionServerFrame,
+  peer: ReconnectingWs,
+): Promise<StartedCommand | undefined> {
+  if (attendedTerminal || peer !== acceptingPeer) return undefined;
+  switch (frame.type) {
+    case "command": {
+      if (deadline(frame.deadlineAt) <= Date.now()) return undefined;
+      const active = session;
+      const completion = executeAttendedCommand(
+        frame.command,
+        frame.attemptId,
+        frame.deadlineAt,
+        active,
+        peer,
+      );
+      fireAndForget("v2 read execution", async () => completion);
+      return { completion };
+    }
+    case "write_prepare":
+      if (
+        attendedWritesBlocked ||
+        deadline(frame.deadlineAt) <= Date.now() ||
+        frame.leaseId !== undefined ||
+        frame.leaseEpoch !== undefined ||
+        frame.browserEpoch !== undefined
+      ) {
+        return undefined;
+      }
+      await attendedJournal.prepare({
+        attemptId: frame.attemptId,
+        commandId: frame.commandId,
+        requestFingerprint: frame.requestFingerprint,
+      });
+      sendIfPeerCurrent(peer, acceptingPeer, (current) => {
+        current.send({
+          type: "write_ready",
+          attemptId: frame.attemptId,
+          commandId: frame.commandId,
+          deadlineAt: frame.deadlineAt,
+          requestFingerprint: frame.requestFingerprint,
+        });
+      });
+      return undefined;
+    case "write_grant": {
+      if (
+        attendedWritesBlocked ||
+        !isWriteCommand(frame.command) ||
+        deadline(frame.deadlineAt) <= Date.now() ||
+        frame.leaseId !== undefined ||
+        frame.leaseEpoch !== undefined ||
+        frame.browserEpoch !== undefined
+      ) {
+        return undefined;
+      }
+      const record = await attendedJournal.get(frame.attemptId);
+      if (
+        record?.state !== "prepared" ||
+        record.commandId !== frame.command.commandId
+      ) {
+        return undefined;
+      }
+      await attendedJournal.markStarted(frame.attemptId);
+      const active = session;
+      const completion = executeAttendedWrite(
+        frame.command,
+        frame.attemptId,
+        frame.deadlineAt,
+        active,
+        peer,
+      );
+      fireAndForget("v2 write execution", async () => completion);
+      return { completion };
+    }
+    case "attempt_cancel":
+      await attendedJournal.cancelPrepared(frame.attemptId);
+      return undefined;
+    case "result_ack":
+      await attendedJournal.acknowledge(frame.attemptId);
+      return undefined;
+    case "dialog_ack":
+      await attendedDialogs.acknowledge(frame.dialogId);
+      return undefined;
+    case "writes_blocked":
+      attendedWritesBlocked = true;
+      return undefined;
+    case "close_session":
+      attendedTerminal = true;
+      if (acceptingPeer === peer) acceptingPeer = null;
+      peer.stop();
+      await detach();
+      return undefined;
+  }
+}
+
+async function executeAttendedCommand(
+  command: Command,
+  attemptId: string,
+  deadlineAt: string,
+  active: CdpSession | null,
+  peer: ReconnectingWs,
+): Promise<void> {
+  const event = await executeAttendedWithDeadline(command, deadlineAt, active);
+  if (event === null || session !== active) return;
+  sendAttendedResult(peer, attemptId, command.commandId, event);
+}
+
+async function executeAttendedWrite(
+  command: Command,
+  attemptId: string,
+  deadlineAt: string,
+  active: CdpSession | null,
+  peer: ReconnectingWs,
+): Promise<void> {
+  const event = await executeAttendedWithDeadline(command, deadlineAt, active);
+  if (event === null || session !== active) {
+    await attendedJournal.markUnknown(attemptId);
+    attendedWritesBlocked = true;
+    return;
+  }
+  await attendedJournal.markCompleted(attemptId, event);
+  sendAttendedResult(peer, attemptId, command.commandId, event);
+}
+
+async function executeAttendedWithDeadline(
+  command: Command,
+  deadlineAt: string,
+  active: CdpSession | null,
+): Promise<Event | null> {
+  const remaining = deadline(deadlineAt) - Date.now();
+  if (remaining <= 0) return null;
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), remaining);
+  });
+  const event = await Promise.race([routeCommand(command, active), timeout]);
+  clearTimeout(timer!);
+  if (event !== null) return event;
+  if (session === active && active !== null) {
+    await active.detach().catch(() => {});
+    await clearAttachment();
+  }
+  return null;
+}
+
+function sendAttendedResult(
+  peer: ReconnectingWs,
+  attemptId: string,
+  commandId: string,
+  event: Event,
+): void {
+  sendIfPeerCurrent(peer, acceptingPeer, (current) => {
+    current.send({
+      type: "command_result",
+      attemptId,
+      commandId,
+      event,
     });
   });
 }
 
-function onCommand(raw: unknown, peer: ReconnectingWs): void {
-  if (peer !== acceptingPeer) return;
-  fireAndForget("command ingress", () =>
-    commandIngress.enqueue(() => startCommand(raw, peer)),
-  );
+async function replayAttendedState(peer: ReconnectingWs): Promise<void> {
+  for (const record of await attendedJournal.recover()) {
+    if (record.state === "prepared") {
+      sendIfPeerCurrent(peer, acceptingPeer, (current) => {
+        current.send({
+          type: "write_ready",
+          attemptId: record.attemptId,
+          commandId: record.commandId,
+          deadlineAt: new Date(Date.now() + 1_000).toISOString(),
+          requestFingerprint: record.requestFingerprint,
+        });
+      });
+    } else if (record.state === "started") {
+      await attendedJournal.markUnknown(record.attemptId);
+      attendedWritesBlocked = true;
+    } else if (
+      record.state === "completed_unacked" &&
+      record.event !== undefined
+    ) {
+      sendAttendedResult(
+        peer,
+        record.attemptId,
+        record.commandId,
+        record.event,
+      );
+    }
+  }
+  for (const record of await attendedDialogs.pending()) {
+    sendIfPeerCurrent(peer, acceptingPeer, (current) => {
+      current.send({ type: "dialog", ...record });
+    });
+  }
+}
+
+function deadline(value: string): number {
+  return Date.parse(value);
 }
 
 async function startCommand(
   raw: unknown,
   peer: ReconnectingWs,
 ): Promise<StartedCommand | undefined> {
+  if (attendedTerminal || peer !== acceptingPeer) return undefined;
   const parsed = safeParseCommand(raw);
   if (!parsed.success) {
     log(`invalid command dropped: ${parsed.error.message}`, "warn");
@@ -191,7 +463,7 @@ async function startCommand(
   // Idempotent-retry gate for WRITE commands (reads always execute). A retry
   // under the same commandId either replays a recorded result, or - if the
   // original is still executing (the service timed out and the consumer
-  // retried) - is dropped so the write runs exactly once; the running
+  // retried) - is dropped so the write runs at most once; the running
   // execution's response resolves the service's parked promise.
   const decision = await dedupe.claim(parsed.data);
   if (decision.kind === "replay") {
@@ -240,6 +512,7 @@ async function onCdpEvent(
   method: string,
   params: unknown,
 ): Promise<void> {
+  await profileClient.sessions.onCdpEvent(source, method, params);
   const active = session;
   if (active === null || source.tabId !== active.tabId) return;
   const eventPeer = acceptingPeer;
@@ -276,23 +549,41 @@ async function onCdpEvent(
       });
     }
     if (decision.dialog !== undefined) {
-      // Answer synchronously so a page dialog cannot wedge the single CDP
-      // channel, then report it to the consumer fire-and-forget (like
-      // page_event) - the consumer is never in the response path. The
-      // answer-before-report ordering lives in applyDialogDecision (tested).
-      await applyDialogDecision(
-        decision.dialog,
-        (accept) => active.send("Page.handleJavaScriptDialog", { accept }),
-        (event) => {
-          if (session !== active) return;
-          sendIfPeerCurrent(eventPeer, acceptingPeer, (current) => {
-            current.send({ type: "dialog", tabId: active.tabId, ...event });
-          });
+      const accept = decision.dialog.accept;
+      const payload = decision.dialog.event;
+      const record = {
+        dialogId: crypto.randomUUID(),
+        occurredAt: new Date().toISOString(),
+        tabId: active.tabId,
+        dialogType: payload?.dialogType ?? "alert",
+        message: payload?.message ?? "",
+        url: payload?.url ?? active.currentUrl,
+        ...(payload?.defaultPrompt === undefined
+          ? {}
+          : { defaultPrompt: payload.defaultPrompt }),
+        disposition:
+          payload?.disposition ??
+          (accept ? "accept" : "dismiss"),
+      } as const;
+      await handleDialogWithOutbox(
+        attendedDialogs,
+        record,
+        () => active.send("Page.handleJavaScriptDialog", { accept }),
+        (delivery) => {
+          if (session === active) {
+            sendIfPeerCurrent(eventPeer, acceptingPeer, (current) => {
+              current.send(
+                delivery === "ok"
+                  ? { type: "dialog", ...record }
+                  : { type: "health", dialogDelivery: "overflow" },
+              );
+            });
+          }
         },
       );
       log(
         `handled ${decision.dialog.event?.dialogType ?? "unknown"} dialog: ${
-          decision.dialog.accept ? "accept" : "dismiss"
+          accept ? "accept" : "dismiss"
         }`,
       );
     }
@@ -302,8 +593,10 @@ async function onCdpEvent(
 }
 
 async function onDetach(source: { tabId?: number }, reason: string): Promise<void> {
+  await profileClient.sessions.onDebuggerDetach(source);
   const active = session;
   if (active === null || source.tabId !== active.tabId) return;
+  await fenceStartedAttendedWrites();
   await clearAttachment();
   log(`debugger detached from tab ${active.tabId} (${reason})`);
   broadcastState();
@@ -344,6 +637,7 @@ async function attach(): Promise<void> {
     attachedTitle = tab.title;
     await persistAttachedTabId(tabId);
     log(`attached to tab ${tabId}`);
+    if (acceptingPeer !== null) await sendHello(acceptingPeer);
     broadcastState();
   } catch (cause) {
     log(`attach failed: ${errorMessage(cause)}`, "error");
@@ -377,6 +671,14 @@ async function clearAttachment(): Promise<void> {
   }
 }
 
+async function fenceStartedAttendedWrites(): Promise<void> {
+  for (const record of await attendedJournal.recover()) {
+    if (record.state !== "started") continue;
+    await attendedJournal.markUnknown(record.attemptId);
+    attendedWritesBlocked = true;
+  }
+}
+
 // Runs on every wake. Reads the persisted driven-tab id; if the browser is still
 // attached to it, rebuilds the session and reconciles WITHOUT re-attaching (which
 // would throw 'Already attached'); otherwise clears the stale persisted state.
@@ -402,6 +704,7 @@ async function reconcileAttachment(): Promise<void> {
       session = next;
       attachedTitle = target.title;
       log(`reconciled attachment to tab ${tabId}`);
+      if (acceptingPeer !== null) await sendHello(acceptingPeer);
     } else {
       await clearAttachment();
       log(`attachment to tab ${tabId} no longer present; cleared`);
@@ -442,6 +745,10 @@ async function setWsUrl(url: string): Promise<void> {
       // the old peer before clearing replay state and rotating the ref scope;
       // this prevents an old snapshot from repopulating refs after invalidation.
       await dedupe.clear();
+      await attendedJournal.clear();
+      await attendedDialogs.clear();
+      attendedWritesBlocked = false;
+      attendedTerminal = false;
       const active = session;
       if (active !== null) {
         try {
@@ -453,11 +760,11 @@ async function setWsUrl(url: string): Promise<void> {
     });
     currentWsUrl = url;
     try {
-      await browser.storage.local.set({ [WS_URL_KEY]: url });
+      await browser.storage.session.set({ [WS_URL_KEY]: url });
     } catch (cause) {
       log(`persist wsUrl failed: ${errorMessage(cause)}`, "warn");
     }
-    log(`ws url set to ${url}; reconnecting`);
+    log("attended session endpoint updated; reconnecting");
   });
   wsSwitchTail = change.then(
     () => undefined,
@@ -496,10 +803,24 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
       fireAndForget("attach", attach);
       break;
     case "detach":
-      fireAndForget("detach", detach);
+      fireAndForget("detach", () => commandIngress.barrier(detach));
       break;
     case "setWsUrl":
       fireAndForget("setWsUrl", () => setWsUrl(msg.url));
+      break;
+    case "configureProfile":
+      fireAndForget("configureProfile", () =>
+        profileClient.configure({
+          serviceOrigin: msg.serviceOrigin,
+          unattendedEnabled: msg.enabled,
+          deviceId: msg.deviceId,
+          deviceCredential: msg.deviceCredential,
+          originPolicy: msg.originPolicy,
+        }),
+      );
+      break;
+    case "stopAll":
+      fireAndForget("stopAll", () => profileClient.stopAll());
       break;
   }
 }
@@ -518,6 +839,9 @@ function buildState(): StateMsg {
     wsStatus,
     wsUrl: currentWsUrl,
     attached: buildAttached(),
+    profileStatus: profileClient.currentStatus(),
+    controlledTabs: profileClient.sessions.assignments().length,
+    profileConfig: profileClient.publicConfig(),
     logs: [...logBuffer],
   };
 }
@@ -555,7 +879,14 @@ function onAlarm(alarm: { name: string }): void {
   if (alarm.name === BACKSTOP_ALARM) {
     // Wake-driven reconnect backstop across SW eviction.
     fireAndForget("ensureConnection", ensureConnection);
+    fireAndForget("ensureProfileConnection", () =>
+      profileClient.ensureConnection(),
+    );
   }
+}
+
+function onTabCreated(tab: Browser.tabs.Tab): void {
+  fireAndForget("popup containment", () => profileClient.sessions.closeRelatedPopup(tab));
 }
 
 // Run an async task detached from the caller, funnelling any rejection to the log

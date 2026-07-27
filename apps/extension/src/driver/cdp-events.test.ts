@@ -1,6 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { applyDialogDecision, classifyCdpEvent, dialogDisposition } from "./cdp-events";
-import type { DialogEventFields } from "./cdp-events";
+import { describe, it, expect } from "vitest";
+import { classifyCdpEvent, dialogDisposition } from "./cdp-events";
 
 const ctx = { currentUrl: "https://example.com/current", mainFrameId: "F1" };
 
@@ -174,38 +173,5 @@ describe("dialogDisposition", () => {
     expect(dialogDisposition("beforeunload")).toBe("accept");
     expect(dialogDisposition("confirm")).toBe("dismiss");
     expect(dialogDisposition("prompt")).toBe("dismiss");
-  });
-});
-
-describe("applyDialogDecision", () => {
-  it("answers the dialog BEFORE reporting it (the channel is freed first)", async () => {
-    const calls: string[] = [];
-    const answer = vi.fn(async (accept: boolean) => {
-      calls.push(`answer:${accept}`);
-    });
-    const report = vi.fn((event: DialogEventFields) => {
-      calls.push(`report:${event.dialogType}`);
-    });
-
-    await applyDialogDecision(
-      {
-        accept: false,
-        event: { dialogType: "confirm", message: "?", url: "https://x/", disposition: "dismiss" },
-      },
-      answer,
-      report,
-    );
-
-    expect(calls).toEqual(["answer:false", "report:confirm"]);
-  });
-
-  it("answers an unclassifiable dialog (no event) and reports nothing - channel still freed", async () => {
-    const answer = vi.fn(async () => {});
-    const report = vi.fn();
-
-    await applyDialogDecision({ accept: false }, answer, report);
-
-    expect(answer).toHaveBeenCalledWith(false);
-    expect(report).not.toHaveBeenCalled();
   });
 });

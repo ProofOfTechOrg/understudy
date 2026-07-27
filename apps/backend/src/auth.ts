@@ -19,6 +19,27 @@ export interface Actor {
   tenantId: string;
 }
 
+export interface DeviceIdentity {
+  tenantId: string;
+  deviceId: string;
+  credentialVersion: number;
+  credentialDigest: string;
+}
+
+export interface WsTicketClaims {
+  jti: string;
+  aud: "device-control" | "session";
+  tenantId: string;
+  deviceId: string;
+  credentialVersion?: number;
+  sessionId?: string;
+  leaseId?: string;
+  leaseEpoch: number;
+  browserEpoch: string;
+  agentName: string;
+  exp: number;
+}
+
 export interface TokenVerifier {
   verify(token: string): Promise<Actor | null>;
 }
@@ -182,6 +203,244 @@ export async function verifyExtensionToken(
   return tenantId ? { tenantId } : null;
 }
 
+export async function authenticateDevice(
+  req: Request,
+  env: Env,
+): Promise<DeviceIdentity | null> {
+  const header = req.headers.get("Authorization");
+  if (!header?.startsWith(BEARER_PREFIX)) return null;
+  const credential = header.slice(BEARER_PREFIX.length).trim();
+  if (!credential || !env.DEVICE_TOKENS) return null;
+  const credentialDigest = await sha256Hex(credential);
+
+  let entries: Record<
+    string,
+    { tenantId?: unknown; deviceId?: unknown; credentialVersion?: unknown }
+  >;
+  try {
+    entries = JSON.parse(env.DEVICE_TOKENS) as typeof entries;
+  } catch {
+    return null;
+  }
+  const entry = entries[credentialDigest];
+  if (
+    entry === undefined ||
+    typeof entry.tenantId !== "string" ||
+    !isValidTenantId(entry.tenantId) ||
+    typeof entry.deviceId !== "string" ||
+    !isUuid(entry.deviceId) ||
+    typeof entry.credentialVersion !== "number" ||
+    !Number.isInteger(entry.credentialVersion) ||
+    entry.credentialVersion < 1
+  ) {
+    return null;
+  }
+  return {
+    tenantId: entry.tenantId,
+    deviceId: entry.deviceId.toLowerCase(),
+    credentialVersion: entry.credentialVersion,
+    credentialDigest,
+  };
+}
+
+export async function deviceCredentialExists(
+  digest: string,
+  identity: Pick<DeviceIdentity, "tenantId" | "deviceId" | "credentialVersion">,
+  env: Env,
+): Promise<boolean> {
+  if (!env.DEVICE_TOKENS) return false;
+  try {
+    const entries = JSON.parse(env.DEVICE_TOKENS) as Record<
+      string,
+      { tenantId?: unknown; deviceId?: unknown; credentialVersion?: unknown }
+    >;
+    const entry = entries[digest];
+    return (
+      entry?.tenantId === identity.tenantId &&
+      typeof entry.deviceId === "string" &&
+      entry.deviceId.toLowerCase() === identity.deviceId.toLowerCase() &&
+      entry.credentialVersion === identity.credentialVersion
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function mintWsTicket(
+  claims: Omit<WsTicketClaims, "jti" | "exp">,
+  env: Env,
+  now = Date.now(),
+): Promise<string> {
+  const complete: WsTicketClaims = {
+    ...claims,
+    jti: crypto.randomUUID(),
+    exp: Math.floor(now / 1000) + 60,
+  };
+  const payload = new TextEncoder().encode(JSON.stringify(complete));
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    await importNamedHmacKey(env.WS_TICKET_SECRET),
+    payload,
+  );
+  return `${base64urlEncode(payload)}.${base64urlEncode(new Uint8Array(signature))}`;
+}
+
+export async function verifyWsTicket(
+  ticket: string,
+  expected: { aud: WsTicketClaims["aud"]; agentName: string },
+  env: Env,
+  now = Date.now(),
+): Promise<WsTicketClaims | null> {
+  try {
+    if (!ticket || ticket.length > 4 * 1024) return null;
+    const parts = ticket.split(".");
+    if (parts.length !== 2) return null;
+    const [payloadPart, signaturePart] = parts;
+    if (!payloadPart || !signaturePart) return null;
+    const payload = base64urlDecode(payloadPart);
+    const signature = base64urlDecode(signaturePart);
+    if (
+      base64urlEncode(payload) !== payloadPart ||
+      base64urlEncode(signature) !== signaturePart
+    ) {
+      return null;
+    }
+    const valid = await crypto.subtle.verify(
+      "HMAC",
+      await importNamedHmacKey(env.WS_TICKET_SECRET),
+      signature,
+      payload,
+    );
+    if (!valid) return null;
+    const rawClaims = JSON.parse(new TextDecoder().decode(payload)) as unknown;
+    if (
+      typeof rawClaims !== "object" ||
+      rawClaims === null ||
+      Array.isArray(rawClaims)
+    ) {
+      return null;
+    }
+    const claims = rawClaims as Partial<WsTicketClaims>;
+    const allowedClaims = new Set([
+      "jti",
+      "aud",
+      "tenantId",
+      "deviceId",
+      "credentialVersion",
+      "sessionId",
+      "leaseId",
+      "leaseEpoch",
+      "browserEpoch",
+      "agentName",
+      "exp",
+    ]);
+    if (
+      Object.keys(claims).some((key) => !allowedClaims.has(key)) ||
+      typeof claims.jti !== "string" ||
+      !isUuid(claims.jti) ||
+      claims.aud !== expected.aud ||
+      typeof claims.tenantId !== "string" ||
+      !isValidTenantId(claims.tenantId) ||
+      typeof claims.deviceId !== "string" ||
+      !isUuid(claims.deviceId) ||
+      typeof claims.leaseEpoch !== "number" ||
+      !Number.isInteger(claims.leaseEpoch) ||
+      claims.leaseEpoch < 0 ||
+      typeof claims.browserEpoch !== "string" ||
+      claims.browserEpoch.length < 1 ||
+      claims.browserEpoch.length > 128 ||
+      claims.agentName !== expected.agentName ||
+      typeof claims.exp !== "number" ||
+      !Number.isInteger(claims.exp) ||
+      claims.exp <= Math.floor(now / 1000) ||
+      claims.exp > Math.floor(now / 1000) + 60
+    ) {
+      return null;
+    }
+    if (
+      (claims.sessionId !== undefined &&
+        (typeof claims.sessionId !== "string" || claims.sessionId.length > 128)) ||
+      (claims.leaseId !== undefined &&
+        (typeof claims.leaseId !== "string" || claims.leaseId.length > 128))
+    ) {
+      return null;
+    }
+    if (
+      claims.credentialVersion !== undefined &&
+      (typeof claims.credentialVersion !== "number" ||
+        !Number.isInteger(claims.credentialVersion) ||
+        claims.credentialVersion < 1)
+    ) {
+      return null;
+    }
+    if (
+      (claims.aud === "device-control" &&
+        (claims.credentialVersion === undefined ||
+          claims.sessionId !== undefined ||
+          claims.leaseId !== undefined ||
+          claims.leaseEpoch !== 0)) ||
+      (claims.aud === "session" &&
+        (claims.credentialVersion !== undefined ||
+          typeof claims.sessionId !== "string" ||
+          claims.sessionId.length < 1 ||
+          typeof claims.leaseId !== "string" ||
+          claims.leaseId.length < 1 ||
+          claims.leaseEpoch < 1))
+    ) {
+      return null;
+    }
+    return claims as WsTicketClaims;
+  } catch {
+    return null;
+  }
+}
+
+export async function hashProfileStateKey(
+  tenantId: string,
+  profileStateKey: string,
+  env: Env,
+): Promise<string> {
+  const bytes = new TextEncoder().encode(`profile-state\0${tenantId}\0${profileStateKey}`);
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    await importHmacKey(env.AUTH_HMAC_SECRET),
+    bytes,
+  );
+  return toHex(new Uint8Array(signature));
+}
+
+export async function telemetryPseudonym(
+  domain: string,
+  value: string,
+  env: Env,
+): Promise<string> {
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    await importHmacKey(env.AUTH_HMAC_SECRET),
+    new TextEncoder().encode(`telemetry\0${domain}\0${value}`),
+  );
+  return toHex(new Uint8Array(signature)).slice(0, 32);
+}
+
+export type RateLimitIdentity =
+  | { kind: "caller"; tenantId: string; actor: string }
+  | { kind: "device"; tenantId: string; deviceId: string };
+
+export async function authenticatedRateAllowed(
+  identity: RateLimitIdentity,
+  env: Env,
+): Promise<boolean> {
+  if (env.RATE_LIMITER === undefined) return true;
+  const domain =
+    identity.kind === "caller" ? "rate-limit-caller" : "rate-limit-device";
+  const value =
+    identity.kind === "caller"
+      ? JSON.stringify([identity.tenantId, identity.actor])
+      : JSON.stringify([identity.tenantId, identity.deviceId]);
+  const key = await telemetryPseudonym(domain, value, env);
+  return (await env.RATE_LIMITER.limit({ key })).success;
+}
+
 async function importHmacKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",
@@ -190,6 +449,20 @@ async function importHmacKey(secret: string): Promise<CryptoKey> {
     false,
     ["sign", "verify"],
   );
+}
+
+async function importNamedHmacKey(secret: string): Promise<CryptoKey> {
+  if (!secret) throw new Error("missing WebSocket ticket secret");
+  return importHmacKey(secret);
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return toHex(new Uint8Array(digest));
+}
+
+function isUuid(value: string): boolean {
+  return SESSION_IDEMPOTENCY_KEY_PATTERN.test(value);
 }
 
 function toHex(bytes: Uint8Array): string {
