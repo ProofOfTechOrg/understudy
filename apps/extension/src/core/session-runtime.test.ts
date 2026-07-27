@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SessionStorageArea } from "./dedupe";
 import { SessionRuntime, type RuntimeAssignment, type RuntimeHost } from "./session-runtime";
 
 const ASSIGNMENT: RuntimeAssignment = {
@@ -21,9 +22,17 @@ function host(): RuntimeHost & { onFenced: ReturnType<typeof vi.fn> } {
   };
 }
 
-function stubBrowser(remove: () => Promise<void>, get = vi.fn()): void {
+function stubBrowser(
+  remove: () => Promise<void>,
+  get = vi.fn(),
+  storage: SessionStorageArea = {
+    get: vi.fn(async () => ({})),
+    set: vi.fn(async () => {}),
+    remove: vi.fn(async () => {}),
+  },
+): void {
   vi.stubGlobal("browser", {
-    storage: { session: {} },
+    storage: { session: storage },
     tabs: { remove: vi.fn(remove), get },
   });
 }
@@ -78,5 +87,64 @@ describe("SessionRuntime close fencing", () => {
     const runtime = new SessionRuntime(ASSIGNMENT, host());
 
     await expect(runtime.close(true)).resolves.toBe(false);
+  });
+});
+
+describe("SessionRuntime dialog handling", () => {
+  it("answers Page.handleJavaScriptDialog without waiting for a stalled outbox write", async () => {
+    let markSetStarted!: () => void;
+    const setStarted = new Promise<void>((resolve) => {
+      markSetStarted = resolve;
+    });
+    let releaseSet!: () => void;
+    const setBlocked = new Promise<void>((resolve) => {
+      releaseSet = resolve;
+    });
+    const values: Record<string, unknown> = {};
+    const storage: SessionStorageArea = {
+      get: vi.fn(async (key: string) => ({ [key]: values[key] })),
+      set: vi.fn(async (items: Record<string, unknown>) => {
+        markSetStarted();
+        await setBlocked;
+        Object.assign(values, items);
+      }),
+      remove: vi.fn(async (key: string) => {
+        delete values[key];
+      }),
+    };
+    stubBrowser(async () => {}, vi.fn(), storage);
+    const runtime = new SessionRuntime(ASSIGNMENT, host());
+    const cdpSend = vi.fn(async () => {});
+    const send = vi.fn();
+    Object.assign(runtime, {
+      cdp: {
+        currentUrl: "https://example.com/",
+        mainFrameId: "main",
+        send: cdpSend,
+      },
+      send,
+    });
+
+    const handling = runtime.onCdpEvent("Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "Continue?",
+      url: "https://example.com/",
+    });
+    await setStarted;
+
+    expect(cdpSend).toHaveBeenCalledWith("Page.handleJavaScriptDialog", {
+      accept: false,
+    });
+    expect(send).not.toHaveBeenCalled();
+
+    releaseSet();
+    await handling;
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "dialog",
+        dialogType: "confirm",
+        disposition: "dismiss",
+      }),
+    );
   });
 });

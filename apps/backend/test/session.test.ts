@@ -2,9 +2,14 @@ import { describe, it, expect, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { runInDurableObject, evictDurableObject } from "cloudflare:test";
 import type { Connection, ConnectionContext } from "agents";
-import type { Command } from "@understudy/protocol";
+import type {
+  Command,
+  CommandState,
+  UnattendedSessionLifecycle,
+} from "@understudy/protocol";
 import { mintSessionId } from "../src/auth";
 import type { SessionAgent } from "../src/session";
+import type { LeaseResource } from "../src/tenant-coordinator";
 import type { SessionState } from "../src/types";
 import { requestFingerprint } from "../src/validation";
 import { EXTENSION_TOKEN_A, EXTENSION_TOKEN_B } from "./tokens";
@@ -66,6 +71,108 @@ function withoutActiveConnectionId(state: SessionState): SessionState {
   const legacy = { ...state } as Partial<SessionState>;
   delete legacy.activeConnectionId;
   return legacy as SessionState;
+}
+
+function unattendedLease(sessionId: string): LeaseResource {
+  const now = Date.now();
+  return {
+    sessionId,
+    leaseId: crypto.randomUUID(),
+    deviceId: crypto.randomUUID(),
+    status: "connected",
+    allowedOrigins: ["https://example.com"],
+    leaseEpoch: 1,
+    browserEpoch: crypto.randomUUID(),
+    createdAt: now,
+    lastActivityAt: now,
+    idleExpiresAt: now + 60_000,
+    hardExpiresAt: now + 120_000,
+    needsReconciliation: false,
+    dialogDelivery: "ok",
+  };
+}
+
+interface SeededAttempt {
+  commandId: string;
+  attemptId: string;
+  state: "preparing" | "ready" | "granted";
+}
+
+function seedAttempt(
+  instance: SessionAgent,
+  input: {
+    state: SeededAttempt["state"];
+    commandType: Command["type"];
+    dryRun: boolean;
+    isWrite: boolean;
+  },
+): SeededAttempt {
+  const commandId = crypto.randomUUID();
+  const attemptId = crypto.randomUUID();
+  const now = Date.now();
+  instance.sql`
+    INSERT INTO command_journal (
+      command_id, fingerprint, command_type, dry_run, state, attempt_id,
+      ready_deadline_at, execution_deadline_at, result_json, created_at,
+      updated_at, is_write
+    ) VALUES (
+      ${commandId}, ${crypto.randomUUID()}, ${input.commandType},
+      ${input.dryRun ? 1 : 0}, ${input.state}, ${attemptId},
+      ${now + 60_000}, ${input.state === "granted" ? now + 60_000 : null},
+      NULL, ${now}, ${now}, ${input.isWrite ? 1 : 0}
+    )
+  `;
+  return { commandId, attemptId, state: input.state };
+}
+
+function seedActiveAttempts(instance: SessionAgent): {
+  preparing: SeededAttempt;
+  ready: SeededAttempt;
+  grantedRead: SeededAttempt;
+  grantedDryRun: SeededAttempt;
+  grantedWrite: SeededAttempt;
+} {
+  return {
+    preparing: seedAttempt(instance, {
+      state: "preparing",
+      commandType: "get_tabs",
+      dryRun: false,
+      isWrite: false,
+    }),
+    ready: seedAttempt(instance, {
+      state: "ready",
+      commandType: "click",
+      dryRun: false,
+      isWrite: true,
+    }),
+    grantedRead: seedAttempt(instance, {
+      state: "granted",
+      commandType: "get_tabs",
+      dryRun: false,
+      isWrite: false,
+    }),
+    grantedDryRun: seedAttempt(instance, {
+      state: "granted",
+      commandType: "click",
+      dryRun: true,
+      isWrite: true,
+    }),
+    grantedWrite: seedAttempt(instance, {
+      state: "granted",
+      commandType: "click",
+      dryRun: false,
+      isWrite: true,
+    }),
+  };
+}
+
+async function commandState(
+  instance: SessionAgent,
+  attempt: SeededAttempt,
+): Promise<CommandState> {
+  const status = await instance.getCommandStatus(attempt.commandId);
+  if (status === null) throw new Error("seeded command disappeared");
+  return status.status;
 }
 
 /**
@@ -815,6 +922,143 @@ describe("hello resync", () => {
       expect(instance.state.awaitingCommandIds).toEqual([]);
     });
   });
+});
+
+describe("unattended terminal lifecycle settlement", () => {
+  it.each(["closing", "closed", "expired", "lost"] as const)(
+    "settles every active attempt and notifies a waiter when lifecycle becomes %s",
+    async (lifecycle) => {
+      const sessionId = crypto.randomUUID();
+      const stub = await getSessionStub(sessionId);
+
+      await runInDurableObject(stub, async (instance: SessionAgent) => {
+        await instance.initializeUnattended("tenantA", unattendedLease(sessionId));
+        instance.setState({
+          ...instance.state,
+          activeConnectionId: "active-connection",
+          status: "connected",
+        });
+        const attempts = seedActiveAttempts(instance);
+        const internals = instance as unknown as {
+          waitForAttempt(
+            attemptId: string,
+            predicate: (row: { state: CommandState }) => boolean,
+            timeoutMs: number,
+          ): Promise<{ state: CommandState }>;
+          writesBlocked(): boolean;
+        };
+        const waiter = internals.waitForAttempt(
+          attempts.preparing.attemptId,
+          (row) => row.state !== "preparing",
+          250,
+        );
+
+        await instance.markLifecycle(lifecycle, true);
+
+        await expect(waiter).resolves.toMatchObject({ state: "not_started" });
+        await expect(commandState(instance, attempts.preparing)).resolves.toBe(
+          "not_started",
+        );
+        await expect(commandState(instance, attempts.ready)).resolves.toBe(
+          "not_started",
+        );
+        await expect(commandState(instance, attempts.grantedRead)).resolves.toBe(
+          "timed_out",
+        );
+        await expect(commandState(instance, attempts.grantedDryRun)).resolves.toBe(
+          "timed_out",
+        );
+        await expect(commandState(instance, attempts.grantedWrite)).resolves.toBe(
+          "unknown",
+        );
+        expect(internals.writesBlocked()).toBe(true);
+        expect(instance.state.unattended?.status).toBe(lifecycle);
+        expect(instance.state.activeConnectionId).toBe(
+          lifecycle === "closing" ? "active-connection" : null,
+        );
+        expect(instance.state.status).toBe(
+          lifecycle === "closing" ? "connected" : "detached",
+        );
+      });
+    },
+  );
+
+  it("revokeDevice settles preparing, ready, and granted attempts", async () => {
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      await instance.initializeUnattended("tenantA", unattendedLease(sessionId));
+      const attempts = seedActiveAttempts(instance);
+
+      await instance.revokeDevice();
+
+      await expect(commandState(instance, attempts.preparing)).resolves.toBe(
+        "not_started",
+      );
+      await expect(commandState(instance, attempts.ready)).resolves.toBe(
+        "not_started",
+      );
+      await expect(commandState(instance, attempts.grantedRead)).resolves.toBe(
+        "timed_out",
+      );
+      await expect(commandState(instance, attempts.grantedDryRun)).resolves.toBe(
+        "timed_out",
+      );
+      await expect(commandState(instance, attempts.grantedWrite)).resolves.toBe(
+        "unknown",
+      );
+      expect(
+        (
+          instance as unknown as {
+            writesBlocked(): boolean;
+          }
+        ).writesBlocked(),
+      ).toBe(true);
+      expect(instance.state.unattended?.status).toBe("lost");
+    });
+  });
+
+  it.each([
+    "allocating",
+    "provisioning",
+    "connected",
+    "recovering",
+  ] as const)(
+    "does not settle active attempts for non-terminal lifecycle %s",
+    async (lifecycle: UnattendedSessionLifecycle) => {
+      const sessionId = crypto.randomUUID();
+      const stub = await getSessionStub(sessionId);
+
+      await runInDurableObject(stub, async (instance: SessionAgent) => {
+        await instance.initializeUnattended("tenantA", unattendedLease(sessionId));
+        const attempts = seedActiveAttempts(instance);
+
+        await instance.markLifecycle(lifecycle, false);
+
+        await expect(commandState(instance, attempts.preparing)).resolves.toBe(
+          "preparing",
+        );
+        await expect(commandState(instance, attempts.ready)).resolves.toBe("ready");
+        await expect(commandState(instance, attempts.grantedRead)).resolves.toBe(
+          "granted",
+        );
+        await expect(commandState(instance, attempts.grantedDryRun)).resolves.toBe(
+          "granted",
+        );
+        await expect(commandState(instance, attempts.grantedWrite)).resolves.toBe(
+          "granted",
+        );
+        expect(
+          (
+            instance as unknown as {
+              writesBlocked(): boolean;
+            }
+          ).writesBlocked(),
+        ).toBe(false);
+      });
+    },
+  );
 });
 
 describe("dialog recording (onMessage → SessionState.dialogs)", () => {

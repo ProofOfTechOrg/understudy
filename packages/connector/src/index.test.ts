@@ -26,6 +26,7 @@ import {
   UnderstudyCommandNotStartedError,
   UnderstudyCommandOutcomeUnknownError,
   UnderstudyCommandPendingError,
+  UnderstudyCommandTimedOutError,
 } from "./index";
 
 const ENV = {
@@ -365,6 +366,31 @@ describe("service bridge hardening", () => {
         retryPolicy: "poll_same_command",
       },
     });
+  });
+
+  it("surfaces a timed-out read as a retryable typed failure with its command ID", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(
+        eventResponse(
+          { code: "command_timed_out", commandId: "response-id", safeToRetry: true },
+          504,
+        ),
+      );
+    vi.stubGlobal("fetch", fetchSpy);
+    const { observe } = createBrowserConnectors(ENV, stores());
+
+    const failure = await callConnector(
+      observe,
+      { sessionId: "s-1", read: { type: "get_tabs" } },
+      undefined,
+    ).catch((error: unknown) => error);
+    const { body } = sentRequest(fetchSpy);
+    const commandId = (body as { command: { commandId: string } }).command.commandId;
+
+    expect(failure).toBeInstanceOf(UnderstudyCommandTimedOutError);
+    expect(failure).toMatchObject({ commandId, safeToRetry: true });
+    expect((failure as UnderstudyCommandTimedOutError).safeToRetry).toBe(true);
   });
 
   it("exports distinct typed safe-timeout and unknown-outcome failures", async () => {

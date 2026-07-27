@@ -89,6 +89,7 @@ import {
   UnderstudyCommandNotStartedError,
   UnderstudyCommandOutcomeUnknownError,
   UnderstudyCommandPendingError,
+  UnderstudyCommandTimedOutError,
 } from "@understudy/connector";
 
 try {
@@ -110,6 +111,9 @@ try {
   if (error instanceof UnderstudyCommandNotStartedError) {
     throw error;
   }
+  if (error instanceof UnderstudyCommandTimedOutError) {
+    throw error;
+  }
   if (error instanceof UnderstudyCommandOutcomeUnknownError) {
     throw error;
   }
@@ -121,6 +125,7 @@ Apply these retry rules:
 
 - **Pending**: poll the same command ID
 - **Not started**: retrying the same logical command is safe and creates a new attempt
+- **Timed out**: retry a read or dry run because it cannot create an external side effect
 - **Unknown outcome**: do not retry; a side effect may have occurred
 
 Understudy guarantees at-most-once write execution with explicit pending and unknown outcomes. It cannot guarantee exactly-once external outcomes if Chromium dies after a side effect.

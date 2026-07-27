@@ -10,7 +10,10 @@ import type { Command, Event, SessionServerFrame } from "@understudy/protocol";
 import type { Browser } from "wxt/browser";
 import { CommandIngress, type StartedCommand } from "../core/command-ingress";
 import { WriteDedupe } from "../core/dedupe";
-import { DialogOutbox } from "../core/dialog-outbox";
+import {
+  DialogOutbox,
+  handleDialogWithOutbox,
+} from "../core/dialog-outbox";
 import { sendIfPeerCurrent } from "../core/peer-binding";
 import { routeCommand } from "../core/router";
 import { ReconnectingWs } from "../core/ws-client";
@@ -546,6 +549,7 @@ async function onCdpEvent(
       });
     }
     if (decision.dialog !== undefined) {
+      const accept = decision.dialog.accept;
       const payload = decision.dialog.event;
       const record = {
         dialogId: crypto.randomUUID(),
@@ -559,27 +563,27 @@ async function onCdpEvent(
           : { defaultPrompt: payload.defaultPrompt }),
         disposition:
           payload?.disposition ??
-          (decision.dialog.accept ? "accept" : "dismiss"),
+          (accept ? "accept" : "dismiss"),
       } as const;
-      const delivery = await attendedDialogs.add(record);
-      try {
-        await active.send("Page.handleJavaScriptDialog", {
-          accept: decision.dialog.accept,
-        });
-      } finally {
-        if (session === active) {
-          sendIfPeerCurrent(eventPeer, acceptingPeer, (current) => {
-            current.send(
-              delivery === "ok"
-                ? { type: "dialog", ...record }
-                : { type: "health", dialogDelivery: "overflow" },
-            );
-          });
-        }
-      }
+      await handleDialogWithOutbox(
+        attendedDialogs,
+        record,
+        () => active.send("Page.handleJavaScriptDialog", { accept }),
+        (delivery) => {
+          if (session === active) {
+            sendIfPeerCurrent(eventPeer, acceptingPeer, (current) => {
+              current.send(
+                delivery === "ok"
+                  ? { type: "dialog", ...record }
+                  : { type: "health", dialogDelivery: "overflow" },
+              );
+            });
+          }
+        },
+      );
       log(
         `handled ${decision.dialog.event?.dialogType ?? "unknown"} dialog: ${
-          decision.dialog.accept ? "accept" : "dismiss"
+          accept ? "accept" : "dismiss"
         }`,
       );
     }

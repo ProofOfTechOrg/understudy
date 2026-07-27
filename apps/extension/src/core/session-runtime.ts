@@ -11,7 +11,7 @@ import {
 import { routeCommand } from "./router";
 import { ReconnectingWs } from "./ws-client";
 import { WriteJournal } from "./write-journal";
-import { DialogOutbox } from "./dialog-outbox";
+import { DialogOutbox, handleDialogWithOutbox } from "./dialog-outbox";
 import { CdpSession } from "../driver/cdp";
 import { classifyCdpEvent } from "../driver/cdp-events";
 
@@ -212,6 +212,7 @@ export class SessionRuntime {
       await this.host.onTabChanged(this);
     }
     if (decision.dialog !== undefined) {
+      const accept = decision.dialog.accept;
       const payload = decision.dialog.event;
       const record = {
         dialogId: crypto.randomUUID(),
@@ -223,15 +224,17 @@ export class SessionRuntime {
         ...(payload?.defaultPrompt === undefined
           ? {}
           : { defaultPrompt: payload.defaultPrompt }),
-        disposition: payload?.disposition ?? (decision.dialog.accept ? "accept" : "dismiss"),
+        disposition: payload?.disposition ?? (accept ? "accept" : "dismiss"),
       } as const;
-      const delivery = await this.dialogs.add(record);
-      try {
-        await cdp.send("Page.handleJavaScriptDialog", { accept: decision.dialog.accept });
-      } finally {
-        if (delivery === "ok") this.send({ type: "dialog", ...record });
-        else this.send({ type: "health", dialogDelivery: "overflow" });
-      }
+      await handleDialogWithOutbox(
+        this.dialogs,
+        record,
+        () => cdp.send("Page.handleJavaScriptDialog", { accept }),
+        (delivery) => {
+          if (delivery === "ok") this.send({ type: "dialog", ...record });
+          else this.send({ type: "health", dialogDelivery: "overflow" });
+        },
+      );
     }
   }
 

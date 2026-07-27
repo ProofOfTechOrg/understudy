@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DialogRecord } from "@understudy/protocol";
 import type { SessionStorageArea } from "./dedupe";
-import { DialogOutbox } from "./dialog-outbox";
+import { DialogOutbox, handleDialogWithOutbox } from "./dialog-outbox";
 
 class MemoryStorage implements SessionStorageArea {
   readonly values: Record<string, unknown> = {};
@@ -75,5 +75,121 @@ describe("DialogOutbox", () => {
     );
     expect(storage.set).not.toHaveBeenCalled();
     expect(await outbox.pending()).toEqual([]);
+  });
+
+  it("retains two concurrently added records in arrival order", async () => {
+    const storage = new MemoryStorage();
+    const outbox = new DialogOutbox(storage, "dialogs");
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    storage.set.mockImplementationOnce(async (items) => {
+      markStarted();
+      await blocked;
+      Object.assign(storage.values, items);
+    });
+
+    const first = outbox.add(dialog(1));
+    await started;
+    const second = outbox.add(dialog(2));
+    release();
+
+    await expect(Promise.all([first, second])).resolves.toEqual(["ok", "ok"]);
+    expect(await outbox.pending()).toEqual([dialog(1), dialog(2)]);
+  });
+
+  it("serializes concurrent add, ACK, clear, and later add operations", async () => {
+    const storage = new MemoryStorage();
+    const outbox = new DialogOutbox(storage, "dialogs");
+    await outbox.add(dialog(0));
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    storage.set.mockImplementationOnce(async (items) => {
+      markStarted();
+      await blocked;
+      Object.assign(storage.values, items);
+    });
+
+    const firstAdd = outbox.add(dialog(1));
+    await started;
+    const acknowledge = outbox.acknowledge("dialog-0");
+    const clear = outbox.clear();
+    const finalAdd = outbox.add(dialog(2));
+    release();
+
+    await Promise.all([firstAdd, acknowledge, clear, finalAdd]);
+    expect(await outbox.pending()).toEqual([dialog(2)]);
+  });
+
+  it("continues queued operations after one rejects", async () => {
+    const storage = new MemoryStorage();
+    const outbox = new DialogOutbox(storage, "dialogs");
+    await outbox.add(dialog(1));
+    storage.set.mockRejectedValueOnce(new Error("storage unavailable"));
+
+    const acknowledge = outbox.acknowledge("dialog-1");
+    const add = outbox.add(dialog(2));
+
+    await expect(acknowledge).rejects.toThrow("storage unavailable");
+    await expect(add).resolves.toBe("ok");
+    expect(await outbox.pending()).toEqual([dialog(1), dialog(2)]);
+  });
+});
+
+describe("handleDialogWithOutbox", () => {
+  it("delivers overflow only after the browser answer settles", async () => {
+    const storage = new MemoryStorage();
+    storage.set.mockRejectedValueOnce(new Error("storage unavailable"));
+    const outbox = new DialogOutbox(storage, "dialogs");
+    let finishAnswer!: () => void;
+    const answer = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishAnswer = resolve;
+        }),
+    );
+    const deliver = vi.fn();
+
+    const handled = handleDialogWithOutbox(
+      outbox,
+      dialog(1),
+      answer,
+      deliver,
+    );
+    await vi.waitFor(() => expect(storage.set).toHaveBeenCalled());
+    expect(answer).toHaveBeenCalledOnce();
+    expect(deliver).not.toHaveBeenCalled();
+
+    finishAnswer();
+    await handled;
+    expect(deliver).toHaveBeenCalledWith("overflow");
+  });
+
+  it("delivers the persisted record even when the browser answer fails", async () => {
+    const storage = new MemoryStorage();
+    const deliver = vi.fn();
+
+    await expect(
+      handleDialogWithOutbox(
+        new DialogOutbox(storage, "dialogs"),
+        dialog(1),
+        async () => {
+          throw new Error("CDP failed");
+        },
+        deliver,
+      ),
+    ).rejects.toThrow("CDP failed");
+    expect(deliver).toHaveBeenCalledWith("ok");
   });
 });

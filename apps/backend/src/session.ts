@@ -1156,7 +1156,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
   async revokeDevice(): Promise<void> {
     if (this.state.unattended === undefined) return;
-    this.terminalizeGrantedAttempts();
+    this.terminalizeActiveAttempts();
     this.fenceConnections("device credential revoked");
     this.setState({
       ...this.state,
@@ -1189,6 +1189,9 @@ export class SessionAgent extends Agent<Env, SessionState> {
     needsReconciliation: boolean,
   ): Promise<void> {
     if (this.state.unattended === undefined) return;
+    if (status === "closing" || isTerminalLifecycle(status)) {
+      this.terminalizeActiveAttempts();
+    }
     this.setState({
       ...this.state,
       activeConnectionId: isTerminalLifecycle(status) ? null : this.state.activeConnectionId,

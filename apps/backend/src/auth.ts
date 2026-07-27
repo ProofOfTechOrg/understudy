@@ -422,6 +422,25 @@ export async function telemetryPseudonym(
   return toHex(new Uint8Array(signature)).slice(0, 32);
 }
 
+export type RateLimitIdentity =
+  | { kind: "caller"; tenantId: string; actor: string }
+  | { kind: "device"; tenantId: string; deviceId: string };
+
+export async function authenticatedRateAllowed(
+  identity: RateLimitIdentity,
+  env: Env,
+): Promise<boolean> {
+  if (env.RATE_LIMITER === undefined) return true;
+  const domain =
+    identity.kind === "caller" ? "rate-limit-caller" : "rate-limit-device";
+  const value =
+    identity.kind === "caller"
+      ? JSON.stringify([identity.tenantId, identity.actor])
+      : JSON.stringify([identity.tenantId, identity.deviceId]);
+  const key = await telemetryPseudonym(domain, value, env);
+  return (await env.RATE_LIMITER.limit({ key })).success;
+}
+
 async function importHmacKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",

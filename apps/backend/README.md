@@ -114,7 +114,7 @@ The default exact quotas are:
 - 30 device tickets/min per device
 - 10,000 admitted commands per session
 
-The `RATE_LIMITER` binding allows 300 requests/min per credential pseudonym. It is an abuse backstop, not the authoritative quota mechanism.
+The `RATE_LIMITER` binding allows 300 requests/min per authenticated caller or device identity pseudonym. It is an abuse backstop, not the authoritative quota mechanism.
 
 ## Protect WebSocket authority
 

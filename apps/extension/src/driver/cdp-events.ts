@@ -133,18 +133,3 @@ export function classifyCdpEvent(
       return {};
   }
 }
-
-// Answer a dialog, then report it. Extracted from the background worker's
-// onCdpEvent so the ordering guarantee is directly testable: `answer` is awaited
-// FIRST and unconditionally, so an open dialog can never wedge the single CDP
-// channel even when the report path is a no-op (WS down) or there is no event to
-// emit (an unclassifiable dialog type). `report` runs only for a classifiable
-// dialog and never blocks the answer.
-export async function applyDialogDecision(
-  dialog: NonNullable<CdpDecision["dialog"]>,
-  answer: (accept: boolean) => Promise<unknown>,
-  report: (event: DialogEventFields) => void,
-): Promise<void> {
-  await answer(dialog.accept);
-  if (dialog.event !== undefined) report(dialog.event);
-}

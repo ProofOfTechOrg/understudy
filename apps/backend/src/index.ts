@@ -9,6 +9,7 @@ import {
 } from "@understudy/protocol";
 import {
   authenticate,
+  authenticatedRateAllowed,
   authenticateDevice,
   mintSessionId,
   mintWsTicket,
@@ -428,7 +429,12 @@ async function authenticateCaller(
     await emitTelemetry(env, { event: "authentication", outcome: "unauthorized" });
     return { kind: "unauthorized" };
   }
-  if (!(await approximateRateAllowed(request, env))) {
+  if (
+    !(await authenticatedRateAllowed(
+      { kind: "caller", tenantId: actor.tenantId, actor: actor.actor },
+      env,
+    ))
+  ) {
     await emitTelemetry(env, {
       event: "authentication",
       outcome: "rate_limited",
@@ -460,7 +466,12 @@ async function authenticateDeviceCaller(
     await emitTelemetry(env, { event: "authentication", outcome: "device_unauthorized" });
     return { kind: "unauthorized" };
   }
-  if (!(await approximateRateAllowed(request, env))) {
+  if (
+    !(await authenticatedRateAllowed(
+      { kind: "device", tenantId: device.tenantId, deviceId: device.deviceId },
+      env,
+    ))
+  ) {
     await emitTelemetry(env, {
       event: "authentication",
       outcome: "device_rate_limited",
@@ -476,13 +487,6 @@ async function authenticateDeviceCaller(
     deviceId: device.deviceId,
   });
   return { kind: "ok", device };
-}
-
-async function approximateRateAllowed(request: Request, env: Env): Promise<boolean> {
-  if (env.RATE_LIMITER === undefined) return true;
-  const credential = request.headers.get("authorization") ?? "";
-  const key = await telemetryPseudonym("rate-limit-credential", credential, env);
-  return (await env.RATE_LIMITER.limit({ key })).success;
 }
 
 function v2Outcome(

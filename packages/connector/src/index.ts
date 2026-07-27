@@ -271,6 +271,9 @@ async function callUnderstudy(
     if (res.status === 504 && failure.code === "command_not_started") {
       throw new UnderstudyCommandNotStartedError(command.commandId);
     }
+    if (res.status === 504 && failure.code === "command_timed_out") {
+      throw new UnderstudyCommandTimedOutError(command.commandId);
+    }
     if (res.status === 409 && failure.code === "command_outcome_unknown") {
       throw new UnderstudyCommandOutcomeUnknownError(command.commandId);
     }
@@ -317,6 +320,17 @@ export class UnderstudyCommandNotStartedError extends Error {
   constructor(commandId: string) {
     super(`understudy command ${commandId} was not started`);
     this.name = "UnderstudyCommandNotStartedError";
+    this.commandId = commandId;
+  }
+}
+
+export class UnderstudyCommandTimedOutError extends Error {
+  readonly commandId: string;
+  readonly safeToRetry = true as const;
+
+  constructor(commandId: string) {
+    super(`understudy command ${commandId} timed out`);
+    this.name = "UnderstudyCommandTimedOutError";
     this.commandId = commandId;
   }
 }
