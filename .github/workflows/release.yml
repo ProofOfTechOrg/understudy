@@ -1,14 +1,15 @@
 name: Release
 
-# Single-branch changesets flow (adapted from anchorage's two-branch
-# version.yml + release.yml — understudy has no dev/main split, so one
-# workflow does both halves). On every push to master the changesets action
-# either:
-#   (a) opens/updates the standing "Version Packages" PR when changesets are
-#       pending (version bumps + CHANGELOG entries + changeset deletion), or
-#   (b) publishes any public package whose package.json version is not yet on
-#       npm, creates git tags, and creates GitHub releases.
-# A push with nothing pending and nothing unpublished is a clean no-op.
+# Publish the versions promoted from dev by a dev-to-master release PR.
+# version.yml owns version bumps and changelogs on dev, so this workflow never
+# opens pull requests or commits to master. It publishes public package
+# versions that are not yet on npm, creates git tags, and creates GitHub
+# releases. A push with nothing unpublished is a clean no-op.
+#
+# A pending changeset on master means dev changed after its Version Packages
+# PR merged but before promotion. Publishing that tree would attach the new
+# change to a version and changelog that did not include it, so fail before
+# installing or publishing anything.
 #
 # Requires the NPM_TOKEN repo secret: an npm automation token with publish
 # rights on the @understudy scope (the org must exist on npm first). Without
@@ -24,7 +25,6 @@ concurrency: release-${{ github.ref }}
 
 permissions:
   contents: write
-  pull-requests: write
   id-token: write
 
 jobs:
@@ -49,6 +49,15 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
 
+      - name: Refuse pending changesets (freeze-window tripwire)
+        run: |
+          PENDING=$(find .changeset -maxdepth 1 -name '*.md' ! -name 'README.md')
+          if [ -n "$PENDING" ]; then
+            echo "::error::Unversioned changesets reached master. Merge the regenerated 'Version Packages' PR into dev, then re-cut the release PR (dev -> master)."
+            echo "$PENDING"
+            exit 1
+          fi
+
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
@@ -57,12 +66,10 @@ jobs:
       - name: Build publishable packages
         run: pnpm --filter "./packages/*" build
 
-      - name: Version PR or publish
+      - name: Publish unpublished versions to npm
         uses: changesets/action@v1
         with:
           publish: pnpm changeset publish
-          title: 'release: version packages'
-          commit: 'release: version packages'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
