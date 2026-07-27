@@ -1,5 +1,11 @@
 # @understudy/protocol
 
+## 0.8.0
+
+### Minor Changes
+
+- b3212ed: Add strict device-control closure acknowledgements for durable, replayable session retirement.
+
 ## 0.7.0
 
 ### Minor Changes
