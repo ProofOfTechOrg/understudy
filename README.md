@@ -78,7 +78,7 @@ The Release workflow publishes the promoted versions with npm provenance. It rej
 
 Do not merge `master` back into `dev`. `NPM_TOKEN` needs publish access to the `@understudy` scope.
 
-Backend deployment remains a separate Wrangler operation. Keep `UNATTENDED_ENABLED_TENANTS=[]` until the canary extension passes the production acceptance suite.
+Backend deployment remains a separate Wrangler operation. Keep `UNATTENDED_ENABLED_TENANTS=[]` until the canary extension passes the production acceptance suite. Follow the [unattended production rollout runbook](docs/unattended-production-rollout.md) for deployment order, evidence gates, and rollback.
 
 ## Preserve attended proof history
 

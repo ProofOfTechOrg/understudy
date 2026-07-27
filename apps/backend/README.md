@@ -162,19 +162,22 @@ The Miniflare test suite needs permission to bind a loopback port.
 
 ## Deploy safely
 
-Deploy the dual-protocol backend with unattended creation disabled:
+Use the [unattended production rollout runbook](../../docs/unattended-production-rollout.md) as the canonical deployment, evidence, and rollback procedure. Deploy the dual-protocol backend with unattended creation disabled:
 
 ```bash
 pnpm --filter @understudy/backend exec wrangler deploy
 ```
 
-After one canary extension reports protocol 2, enable only its tenant. Complete the production Chromium acceptance suite and 24-hour soak before broad enablement.
+After deployment, record the exact migration-`v2`, flags-off version as the rollback baseline. After one canary extension reports protocol 2, enable only its tenant. Complete the production Chromium acceptance suite and 24-hour soak before broad enablement.
 
 A rollback must:
 
-1. Disable new unattended leases
-2. Drain or terminalize active leases and granted commands
-3. Roll back application code
-4. Retain the additive Durable Object migrations
+1. Return the consumer to attended mode
+2. Roll back to the recorded migration-`v2`, flags-off version
+3. Confirm new unattended leases are disabled
+4. Delete and poll active leases while the durable sweeper retains unresolved cleanup
+5. Retain the additive Durable Object migrations and coordinator data
 
-Do not deploy protocol-1-only code while protocol-2 leases exist.
+Migration `v2` is additive and irreversible. Cloudflare blocks rollback across incompatible Durable Object class lifecycle changes, so the active migration-`v1` version cannot be assumed to remain a valid rollback target after `v2`. See [Cloudflare Worker rollback constraints](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
+
+Do not remove migration `v2` or deploy protocol-1-only code while protocol-2 leases exist.
