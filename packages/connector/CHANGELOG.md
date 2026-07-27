@@ -1,5 +1,13 @@
 # @understudy/connector
 
+## 0.5.1
+
+### Patch Changes
+
+- a1b7120: Expose retryable command timeouts as a typed connector error.
+- Updated dependencies [b3212ed]
+  - @understudy/protocol@0.8.0
+
 ## 0.5.0
 
 ### Minor Changes
