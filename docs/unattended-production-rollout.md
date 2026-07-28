@@ -41,7 +41,7 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Phase 0b: rollout runbook merged | Passed | `464763bd6c39b86f6154fcb7c95ed3edfe75ef4e` | Not applicable: documentation gate | [PR #22](https://github.com/ProofOfTechOrg/understudy/pull/22) merged; [CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913062) and [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913036) passing. Release workflow is a no-op: no pending changesets, no published-package code changed | `2026-07-28T02:51:30Z` | Engineering |
 | Phase 1a: Metamind implementation | Passed | Metamind `fb6a7b706106306d95861ebe4a7abf0f5c65c6b8` (merged to `dev`) | Not applicable: implementation gate; production still on the baseline | [PR #17](https://github.com/ProofOfTechOrg/metamind/pull/17) merged, [CI passing](https://github.com/ProofOfTechOrg/metamind/actions/runs/30325493776) (app, worker, preflight). Worker lane covers typecheck, 716 tests, Biome, proof-runner self-test in both modes, `pnpm build` + `validate-build.sh`. Both migration copies apply to SQLite with identical schemas; the additive file is idempotent | `2026-07-28T03:21:33Z` | Engineering |
 | Phase 1b: Metamind attended deployment and proof | In progress | Metamind `5fb1e118487377132e6d5b571607b13fcb669f4d` (merged to `master`) | Deployment `906afcb2-aca0-4f51-b985-2b1f9b411b00`, version `2143000b-0171-49c9-991d-dc05af8c894b` at `2026-07-28T03:47:58Z`. Deployment message `release 5fb1e118487377132e6d5b571607b13fcb669f4d` | D1 lease migration applied BEFORE the promotion: `changes: 1, changed_db: true, num_tables: 34`; verification returns `browser_session_leases` with both indexes and is queryable post-deploy (`COUNT(*) = 0`). `/health.commit` = `5fb1e118487377132e6d5b571607b13fcb669f4d`, confirmed by five consecutive matching reads. [PR #18](https://github.com/ProofOfTechOrg/metamind/pull/18), [CI](https://github.com/ProofOfTechOrg/metamind/actions/runs/30326639077). Smoke: `/` 302 to `/app/`, `/app/` 200, `/v1` 401 unauthenticated. Deployed with `UNDERSTUDY_SESSION_MODE=attended`. **Remaining: the attended production proof**, which needs an operator at a Chromium browser | Pending | Release operator |
-| Phase 2: Understudy `v2`, flags-off rollback baseline | In progress | `dd7c100343cfc15e02802d93831600e0535670ed` | Deployment `1c32a8e9-bf87-49eb-89a5-253ea4e47d1a`, version **`7eff2d11-2ba5-420b-b1f2-113faf0d6f73`** at `2026-07-28T04:29:57Z`, message `release dd7c100343cfc15e02802d93831600e0535670ed`. Previous baseline was version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Verified at the approved SHA on a detached checkout: `pnpm install --frozen-lockfile`, `build`, `typecheck`, `test` (408 tests: 194 backend, 139 extension, 43 protocol, 32 connector), `wrangler deploy --dry-run`. All six secret names confirmed present — `DEVICE_TOKENS` and `WS_TICKET_SECRET` were MISSING and were provisioned first (see below). Active version exports `SessionAgent`, `DeviceAgent`, `TenantDeviceCoordinator`; binds `SESSION`, `DEVICE`, `TENANT_CONTROL`, `ANALYTICS`, `RATE_LIMITER`, `VAULT`, all six secrets, `QUOTA_POLICY`, and both rollout variables at `"[]"`. `/health` returns `{"ok":true}`. **Remaining: the attended session smoke request and the Metamind attended proof** | Pending | Release operator |
+| Phase 2: Understudy `v2`, flags-off rollback baseline | In progress | `dd7c100343cfc15e02802d93831600e0535670ed` | Deployment `1c32a8e9-bf87-49eb-89a5-253ea4e47d1a`, version **`7eff2d11-2ba5-420b-b1f2-113faf0d6f73`** at `2026-07-28T04:29:57Z`, message `release dd7c100343cfc15e02802d93831600e0535670ed`. Previous baseline was version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Verified at the approved SHA on a detached checkout: `pnpm install --frozen-lockfile`, `build`, `typecheck`, `test` (408 tests: 194 backend, 139 extension, 43 protocol, 32 connector), `wrangler deploy --dry-run`. All six secret names confirmed present — `DEVICE_TOKENS` and `WS_TICKET_SECRET` were MISSING and were provisioned first (see below). Active version exports `SessionAgent`, `DeviceAgent`, `TenantDeviceCoordinator`; binds `SESSION`, `DEVICE`, `TENANT_CONTROL`, `ANALYTICS`, `RATE_LIMITER`, `VAULT`, all six secrets, `QUOTA_POLICY`, and both rollout variables at `"[]"`. `/health` returns `{"ok":true}`; an unmapped token gets `401`; a well-formed unattended request gets `503 unattended sessions are disabled`, proving the flags-off baseline. Caller token rotated on both sides (Metamind confirmed as the only caller). The runbook's attended `curl` smoke test is NOT executable — see "Send one attended session request" — so attended coverage comes from the Metamind proof. **Remaining: the Metamind attended proof** | Pending | Release operator |
 | Phase 3a: canary device acceptance | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 3b: 24-hour read-only soak | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 4: governed Metamind unattended proof | Not started | Pending | Pending | Pending | Pending | Canary operator |
@@ -488,9 +488,45 @@ curl --fail-with-body \
 
 Confirm it succeeds, then rerun the Metamind attended proof.
 
-**Outstanding.** This request currently returns `401 unauthorized`. The caller token in Metamind's local `packages/worker/.dev.vars` is the `dev-tenant` token, not the production one, and production `CALLER_TOKENS` is a Cloudflare secret that cannot be read back. Closing this step needs either the production caller token, or a rotation of `CALLER_TOKENS` — which cannot be done blind, because the current value may map several tokens to tenants and overwriting it would silently drop the ones not carried forward.
+**This command cannot pass, and should be replaced.** Attended mode is discriminated on `c.req.raw.body === null` (`apps/backend/src/index.ts`), and no external HTTP client can produce a request workerd surfaces that way — every client sends `Content-Length: 0` for a bodiless POST, which arrives as an empty but non-null body and falls through to the unattended branch. Verified on the deployed `v2` with a valid caller token: plain `curl -X POST`, `curl` with `Content-Length` stripped, `--http1.1`, `--http2`, and Node's `fetch` with no `body` property all return `400 invalid body`.
 
-Note the 401 is itself a partial signal: the deployed `v2` is authenticating callers and rejecting an unmapped token, rather than failing open.
+The attended branch is reachable only from a Worker subrequest (Metamind's `createAttendedSession` builds `{ method: "POST", headers }` with no `body` property) or in-process, which is how `apps/backend/test/service.test.ts` exercises it via `authedRequest("/v1/sessions", token, { method: "POST" })`. Production is therefore fine — the consumer is a Worker. Only this documented smoke test is unexecutable.
+
+Note the design consequence, out of scope to change here but worth recording: any future NON-Worker consumer — a CLI, a shell script, a curl-based health probe — cannot create an attended session at all.
+
+**Substitute smoke test.** Use the checks that are executable over HTTP and that actually verify what Phase 2 is about, namely a working `v2` with the unattended flags off:
+
+```bash
+# 1. Service is up
+curl --fail-with-body https://understudy-backend.gcharang.workers.dev/health
+
+# 2. An unmapped token is rejected — auth is not failing open
+curl --silent -o /dev/null -w '%{http_code}\n' --request POST \
+  --header "Authorization: Bearer not-a-real-token" \
+  --header "Idempotency-Key: 00000000-0000-4000-8000-000000000061" \
+  https://understudy-backend.gcharang.workers.dev/v1/sessions          # expect 401
+
+# 3. A well-formed unattended request is refused BY THE FLAG, not by validation
+curl --silent --request POST \
+  --header "Authorization: Bearer caller_token_here" \
+  --header "Idempotency-Key: 00000000-0000-4000-8000-000000000051" \
+  --header "content-type: application/json" \
+  --data '{"mode":"unattended","deviceId":"<enrolled-uuid>","allowedOrigins":["https://example.com"],"profileStateKey":"metamind-practice-account"}' \
+  https://understudy-backend.gcharang.workers.dev/v1/sessions          # expect 503
+```
+
+Result on `2026-07-28`: `{"ok":true}`, `401`, and `503 {"error":"unattended sessions are disabled"}` respectively. The third is the important one — reaching the flag check proves the request authenticated, parsed against `UnattendedSessionRequestSchema`, and was stopped by `UNATTENDED_ENABLED_TENANTS` being `"[]"`, which is exactly the flags-off baseline this phase establishes.
+
+Attended coverage comes from the Metamind attended proof, which exercises the real Worker-to-Worker path.
+
+### Caller token rotated
+
+Production `CALLER_TOKENS` could not be read back and the local `packages/worker/.dev.vars` value is the `dev-tenant` token, so the credential was rotated on both sides after confirming Metamind is the only production caller:
+
+- Understudy `CALLER_TOKENS` = `{"<token>": {"actor": "metamind", "tenantId": "metamind"}}`
+- Metamind `UNDERSTUDY_TOKEN` = the same value
+
+The token is at `~/.understudy-canary/caller-token.json`, mode `0600`. Metamind's `/health.commit` still reports `5fb1e118…` afterwards, confirming a secret update does not disturb the build-time provenance stamp.
 
 Record the exact active version ID as `UNDERSTUDY_V2_FLAGS_OFF_VERSION` in the Phase 2 ledger row and operator record. Also record the deployment ID, approved SHA, status JSON, health result, and attended proof.
 
