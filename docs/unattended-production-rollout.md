@@ -140,6 +140,37 @@ The SWEEP_CRON recovery pass — the durable backstop for browser-session cleanu
  "error":"Error: understudy session mint failed (404)"}
 ```
 
+## The attended production proof PASSED (2026-07-28)
+
+Run `metamind_efefdb2e-2aed-441a-af6b-527e640c816f`, record `rec_nDHTDg3Z9UbzyyG7`, against Metamind `434c1a7f` and Understudy `5cc96902`.
+
+| Gate | Evidence |
+|---|---|
+| Extension connected, tab attached | Chrome 150, extension `0.1.1`, `https://example.com/` |
+| Approval by a present human | `decidedByPresent: true`, `decision: approve` |
+| Workflow run | `status: "success"` |
+| Public page datum | matched `Example Domain` |
+| **Authenticated datum** | matched `Secure Area` — behind the portal login, filled from the vault |
+| Context line | non-empty, 77 characters |
+| Audit trail | 13 `connector.execute` entries correlated on `targetId == runId` |
+| Lease cleanup | `released` — a CONFIRMED 204, `last_error` null |
+
+Real Chromium, real CDP, human-in-the-loop approval, a vaulted credential, and a datum read from behind a login — with the audit trail and the durable lease both closing correctly. **Phases 1b and 2 are closed.**
+
+The run needed three attempts, and the first two failed on defects in this repo's consumer rather than on anything the operator did.
+
+### The sweep tore down a session mid-attach
+
+Provisioning and starting are two calls with a human between them, so between them the lease has NO run. `recoverActiveLease` read a missing run as a finished one and queued cleanup five minutes after provisioning — while the operator was still loading an extension. The attach took twenty minutes; the enrichment then failed with `lease_conflict`.
+
+**Only the cron routing fault prevented data loss.** The sweep's DELETE hit the same unreachable-host 404 as everything else, so Understudy never received it and the session survived. Fixing the routing without fixing this would have destroyed live sessions.
+
+Fixed in Metamind: a missing run counts as finished only past a 30-minute attach window. The test that asserted the old behaviour had encoded the bug, which is why it looked deliberate.
+
+### The step-up expired mid-proof
+
+The admin step-up lives fifteen minutes and the attended flow spends most of that waiting for a human, so the credential was dead by the audit read — discarding a proof whose browser writes had all succeeded. The audit read now re-reads the file and asks the operator to re-stage. The trailing audit for the passing run was completed by hand.
+
 ### Correction: the first evidence chain rested on a dead instrument
 
 An earlier revision of this section concluded the same thing from a `wrangler tail` that had **silently failed to start**. Run from `apps/backend` without an account, it exits immediately with:
