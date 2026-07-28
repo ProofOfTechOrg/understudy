@@ -706,6 +706,19 @@ Both were provisioned before the deploy. `wrangler secret put` refuses while an 
 
 Device UUID `aaf119f2-a85f-46b4-8b53-8e92196d6275`. Only the credential's SHA-256 digest is stored in Cloudflare; the raw credential is at `~/.understudy-canary/device-credential.json`, mode `0600`, for the operator to enter during extension enrollment. Rotating it means generating a new credential, bumping `credentialVersion`, and re-putting the secret.
 
+#### …and then were never written down (2026-07-28)
+
+Provisioning them fixed the worker but not the record. `apps/backend/.secrets.production.env` — the operator-local backup, and the ONLY readable copy, since Cloudflare never shows a secret again after it is set — still listed four of six. Both new secrets existed live and nowhere else.
+
+That is worse than it sounds for `DEVICE_TOKENS`: overwriting it revokes every enrolled device, and the mapping could not have been reconstructed from anything except the operator's own credential file. Closed as follows, with the live worker and the backup now byte-identical for all six:
+
+| Secret | Action | Why that action |
+|---|---|---|
+| `DEVICE_TOKENS` | Reconstructed from `~/.understudy-canary/device-credential.json`, recorded, then re-put | Reconstructable because the raw credential was retained. Verified BEFORE re-putting: `POST /v1/device/connect-ticket` with that credential and an empty body answered `400`, not `401` — auth runs before body parsing, so a `400` proves the digest is enrolled without minting a ticket or spending quota |
+| `WS_TICKET_SECRET` | Rotated to a fresh value, recorded | Unrecoverable by anyone, so rotating is the only way to ever hold a backup. It signs 60-second single-use tickets and an established socket is authenticated at connect, so rotation fences nothing already connected — the cost is zero while no device is online, and it is not zero later |
+
+**Provision and record in one step.** A secret that exists only on the worker is a single point of unrecoverable loss, and the gap is invisible to `wrangler secret list`, which shows names and never values — the same instrument that caught the first gap cannot catch this one.
+
 The initial `v1 → v2` migration is a stop-and-forward-fix boundary. Do not attempt to remove `v2` or roll back to the current `v1` version.
 
 ## Phase 3: Provision and accept the canary device
