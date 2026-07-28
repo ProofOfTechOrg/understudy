@@ -38,9 +38,9 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Gate | State | Approved SHA | Deployment | Evidence | Completed | Owner |
 |---|---|---|---|---|---|---|
 | Phase 0a: release-flow baseline | Passed | `4843b6bccd8e1028c8fb6dba7812d643a4106778` | Not applicable: package and branch-flow gate | [PR #20](https://github.com/ProofOfTechOrg/understudy/pull/20), [PR #21](https://github.com/ProofOfTechOrg/understudy/pull/21), [master CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565127), [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255262164), [Release](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565196) | `2026-07-27T09:51:30Z` | Release operator |
-| Phase 0b: rollout runbook merged | In progress | Pending | Not applicable: documentation gate | This file, committed to `dev@ee105ac7de0b0a8022e815f601fc991a0c8144d7`; `dev → master` promotion pull request pending | Pending | Engineering |
-| Phase 1a: Metamind implementation | In progress | Metamind `e602b3b32426e35490d8f1df6bdc3f7ebebbd9de` (branch `feat/unattended-phase-1`, not yet merged) | Not applicable: implementation gate | Local lane green: typecheck, 716 tests, Biome (0 errors), proof-runner self-test both modes, `pnpm build` + `validate-build.sh`, `git diff --check`. Both migration copies apply to SQLite with identical schemas and the additive file is idempotent. Not merged, not deployed, no CI run yet | Pending | Engineering |
-| Phase 1b: Metamind attended deployment and proof | Not started | Pending | Current baseline: deployment `f85a53c6-7b90-4b6f-a427-2e8cef7df637`, version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a` | Pending: needs the D1 lease migration, a stamped deploy with `UNDERSTUDY_SESSION_MODE=attended`, `/health.commit` verification, and the attended production proof | Pending | Release operator |
+| Phase 0b: rollout runbook merged | Passed | `464763bd6c39b86f6154fcb7c95ed3edfe75ef4e` | Not applicable: documentation gate | [PR #22](https://github.com/ProofOfTechOrg/understudy/pull/22) merged; [CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913062) and [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913036) passing. Release workflow is a no-op: no pending changesets, no published-package code changed | `2026-07-28T02:51:30Z` | Engineering |
+| Phase 1a: Metamind implementation | Passed | Metamind `fb6a7b706106306d95861ebe4a7abf0f5c65c6b8` (merged to `dev`) | Not applicable: implementation gate; production still on the baseline | [PR #17](https://github.com/ProofOfTechOrg/metamind/pull/17) merged, [CI passing](https://github.com/ProofOfTechOrg/metamind/actions/runs/30325493776) (app, worker, preflight). Worker lane covers typecheck, 716 tests, Biome, proof-runner self-test in both modes, `pnpm build` + `validate-build.sh`. Both migration copies apply to SQLite with identical schemas; the additive file is idempotent | `2026-07-28T03:21:33Z` | Engineering |
+| Phase 1b: Metamind attended deployment and proof | In progress | Metamind `5fb1e118487377132e6d5b571607b13fcb669f4d` (merged to `master`) | Deployment `906afcb2-aca0-4f51-b985-2b1f9b411b00`, version `2143000b-0171-49c9-991d-dc05af8c894b` at `2026-07-28T03:47:58Z`. Deployment message `release 5fb1e118487377132e6d5b571607b13fcb669f4d` | D1 lease migration applied BEFORE the promotion: `changes: 1, changed_db: true, num_tables: 34`; verification returns `browser_session_leases` with both indexes and is queryable post-deploy (`COUNT(*) = 0`). `/health.commit` = `5fb1e118487377132e6d5b571607b13fcb669f4d`, confirmed by five consecutive matching reads. [PR #18](https://github.com/ProofOfTechOrg/metamind/pull/18), [CI](https://github.com/ProofOfTechOrg/metamind/actions/runs/30326639077). Smoke: `/` 302 to `/app/`, `/app/` 200, `/v1` 401 unauthenticated. Deployed with `UNDERSTUDY_SESSION_MODE=attended`. **Remaining: the attended production proof**, which needs an operator at a Chromium browser | Pending | Release operator |
 | Phase 2: Understudy `v2`, flags-off rollback baseline | Not started | Pending | Current baseline: deployment `b73220f0-8035-40d2-9987-243770d96306`, version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Source preconditions verified on `dev@ee105ac7de0b0a8022e815f601fc991a0c8144d7` (no deployment): `pnpm install --frozen-lockfile`, `build`, `typecheck`, `test` (194 backend) all pass, and `wrangler deploy --dry-run` confirms migration `v2`, the `SESSION`/`DEVICE`/`TENANT_CONTROL` bindings, `ANALYTICS`, `RATE_LIMITER`, `VAULT`, quota policy, and both rollout variables at `"[]"`. Still pending: `wrangler secret list`, the deploy itself, and the active-version inspection | Pending | Release operator |
 | Phase 3a: canary device acceptance | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 3b: 24-hour read-only soak | Not started | Pending | Pending | Pending | Pending | Canary operator |
@@ -49,6 +49,63 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Phase 5b: five-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 5c: all-allowlisted 24-hour gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 6: rollout closeout | Not started | Pending | Pending | Pending | Pending | Release operator |
+
+## Unplanned Phase 1b deployment (2026-07-28)
+
+Pushing the Metamind Phase 1a branch `feat/unattended-phase-1` deployed it to **production**. Nothing was merged; the push alone was sufficient.
+
+A built branch does not preview here, it deploys. Non-production branch builds normally produce a preview version because Cloudflare runs `wrangler versions upload` for them — the preview behavior comes from the COMMAND, not the branch. Metamind's configured deploy command is `npx wrangler deploy`, which creates a deployment at 100% traffic on whatever branch it runs. Deployment `0b7c23c4-8c32-41ac-ac68-92cca84d255c` records exactly that: version `998ca9c2` at 100%, not a version upload.
+
+| Fact | Value |
+|---|---|
+| Deployed version | `998ca9c2-95cb-4731-a2a0-29bf94163acd` at `2026-07-28T02:46:04Z` |
+| Displaced baseline | version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a` |
+| `/health.commit` | `e602b3b32426e35490d8f1df6bdc3f7ebebbd9de` — an unmerged pull-request branch |
+| D1 state | `browser_session_leases` absent; the deployed code queries it |
+
+Impact is confined to browser enrichment: `POST /v1/intake/records/:id/enrich-website` fails because the lease table is missing, and the 15-minute sweep logs `browser-lease-sweep-error` each tick. The primary lead-intake workflow, authentication, CRM commit, and Gmail draft paths are untouched, and the approval-resume lease release is internally contained, so approval decisions still land.
+
+This inverts the ordering Phase 1b requires — the additive D1 migration must be applied **before** deploying code that queries the table — and the deployment carries no `/health` verification and no attended proof, so it is not a passed gate.
+
+### Resolution
+
+Rolled back at `2026-07-28T02:54:56Z`. Deployment `09d99cf6-6ef7-404b-81dd-99d36319ac77` restored version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a`, and `/health.commit` reads `local` again — the documented baseline. Production D1 was never modified, which is the correct state for the restored code. Rolling back rather than applying the migration was chosen because the displaced version had no `/health` verification and no attended proof behind it, so it was an unrecorded state rather than a passed gate; returning to a known baseline lets Phase 1b run in the order this runbook specifies.
+
+Metamind pull request #17 (Phase 1a) is held open and green, unmerged, because merging it would trigger another branch build and redeploy production.
+
+Before any further Metamind deployment:
+
+1. **Done `2026-07-28T03:1xZ`.** Non-production branch builds are Disabled in the Metamind Workers Builds configuration (production branch `master`). Verified by pushing to the branch afterwards: no new deployment record, `/health.commit` unchanged at `local`, and the `Workers Builds: metamind` check no longer appears on the pull request — it was present on the push that caused this incident. If branch builds are ever wanted back, their deploy command must be `wrangler versions upload`; and even a correct preview binds production D1, KV, and Durable Objects here, because there is one wrangler environment with top-level bindings.
+2. **Done.** Metamind's `docs/deploy.md` corrected in `8173ddd`, merged with [PR #17](https://github.com/ProofOfTechOrg/metamind/pull/17).
+
+Phase 1a is merged. Phase 1b remains, and its ordering is below.
+
+### Phase 1b ordering, with the auto-deploy in the picture
+
+The promotion to Metamind's default branch **is** the production deploy. `pnpm deploy:prod` is not what ships production in the normal flow — the merge is. That removes the window this runbook's Phase 1 sequence assumes between deploying code and applying its schema, so:
+
+Apply `packages/worker/sql/add-browser-session-leases.sql` to production D1 **before** promoting to `master`, not after. The deployed code queries that table on the enrichment path; promoting first repeats the failure this section records.
+
+**Chosen and in force:** the default-branch auto-deploy stays enabled, and its Workers Builds commands were changed so that it runs the source-controlled deploy script rather than a bare `wrangler deploy`:
+
+| Setting | Value |
+|---|---|
+| Production branch | `master` |
+| Build command | `pnpm build` |
+| Deploy command | `bash scripts/deploy.sh --skip-build` |
+| Non-production branch builds | Disabled |
+
+Every production deploy therefore carries a SHA-stamped `--var COMMIT` and deployment message plus a `/health.commit` verification, with the logic reviewable in the repository and only a one-line reference in the dashboard. Confirmed working on the Phase 1b deployment: deployment `906afcb2` records the message `release 5fb1e118…`, which only `scripts/deploy.sh` produces.
+
+State what this does and does not gate. The clean-tree checks are genuine pre-deploy gates but apply only to local `pnpm deploy:prod` runs, since a CI checkout is clean by construction. The `/health.commit` check runs AFTER `wrangler deploy` has landed, so it detects a mismatch and fails the run loudly — it cannot reject a deployment that already happened. Treat a red verification as "roll back", not "nothing shipped".
+
+### Verifying `/health.commit` after a deployment
+
+A deployment propagates across the edge over seconds to minutes, and during that window `/health` legitimately answers with EITHER version depending on which isolate serves the request — observed mixed for roughly two minutes after the rollback below. A single `curl` is therefore not a verification: it can read an un-propagated isolate and reject a good deployment, and one matching read only proves one isolate updated while traffic may still run the old code.
+
+Poll for at least three minutes and require several CONSECUTIVE matching reads before accepting the gate. Metamind's `scripts/deploy.sh` does this (`8173ddd`); a hand-run check must do the same.
+
+The deployment was only detectable because Phase 1's build-time provenance stamp was already in place. Under the previous `COMMIT=local` placeholder, `/health` would have reported `local` both before and after, and this would have been invisible.
 
 ## Start from the verified baseline
 
