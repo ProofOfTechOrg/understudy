@@ -140,27 +140,65 @@ The SWEEP_CRON recovery pass — the durable backstop for browser-session cleanu
  "error":"Error: understudy session mint failed (404)"}
 ```
 
-Evidence, in the order it rules things out:
+### Correction: the first evidence chain rested on a dead instrument
+
+An earlier revision of this section concluded the same thing from a `wrangler tail` that had **silently failed to start**. Run from `apps/backend` without an account, it exits immediately with:
+
+```
+✘ [ERROR] More than one account available but unable to select one in non-interactive mode.
+```
+
+It writes nothing to stdout, so "zero requests during the tick" was indistinguishable from "the tail never ran". Understudy's Worker lives on account `056cbaa6f5c3d8ff5584f1aa84bbe050`, so the tail must be started as:
+
+```bash
+CLOUDFLARE_ACCOUNT_ID=056cbaa6f5c3d8ff5584f1aa84bbe050 npx wrangler tail --format json
+```
+
+**Always validate a tail before drawing a negative conclusion from it** — issue a known request (`curl .../health`) and confirm it appears. Every observation below was taken on a tail validated that way.
+
+### Evidence, in the order it rules things out
 
 | Observation | Rules out |
 |---|---|
-| The same `POST /v1/sessions` with the same idempotency keys returns `200` from curl | The keys, the route, the payload |
-| Understudy's `.workers.dev` host serves `/health` `200`; an unknown path returns `404` (Hono `notFound`) | The hostname being unrouted |
-| The Metamind fetch-context mint at `05:46Z` succeeded and minted a real session | Metamind's caller token and `UNDERSTUDY_URL` |
-| Tailing Understudy across a full cron tick shows **zero** requests from the sweep, while Metamind logs the 404 for that same tick | Understudy rejecting it — the request never arrives |
+| `POST /v1/sessions` replaying the leases' **original** idempotency keys returns `200` from curl | The keys, the route, the payload, idempotent-replay state |
+| Missing or garbage bearer tokens return `401`, never `404`; a valid token returns `200` with or without an idempotency key | The caller token — no auth failure can present as `404` |
+| The deployed bindings of Metamind version `3f1ba280` carry `UNDERSTUDY_URL=https://understudy-backend.gcharang.workers.dev` and `UNDERSTUDY_TENANT_ID=metamind` | Configuration drift (see the two-config trap below) |
+| Breakwater's `egressFetch` **throws** `EgressDeniedError` on denial and never synthesizes a `Response` | The egress guard manufacturing the `404` |
+| The Metamind fetch-context mint at `05:46:42Z` succeeded and minted a real session | Metamind's caller token and `UNDERSTUDY_URL` at runtime |
+| Across the `07:45:31Z` tick Metamind logged 3 × `404` while Understudy received **zero** sweep requests — the only requests in that window were my own probes, identifiable by `user-agent: curl/8.5.0` and `cf-connecting-ip` | Understudy rejecting it — the request never arrives |
 
-So the 404 is produced before the request reaches the Worker, and only from the scheduled-handler context. Fetch-context subrequests to the same URL work.
+Because `createAttendedSession` fails on `!response.ok`, the fetch **resolved with a real 404 Response**; it did not throw. Something between Metamind's scheduled handler and Understudy answers it.
 
-Confidence: **high** that cron-context subrequests to the `*.workers.dev` hostname do not arrive; **unknown** as to Cloudflare's precise reason.
+Confidence: **high** that the sweep's subrequest does not reach Understudy; **unknown** as to Cloudflare's precise reason — do not guess it into the record.
 
-Impact: Phase 1's durable cleanup guarantee is not met in production. The synchronous release on the resume path still works — that is what released the one successful run's lease — but the crash backstop does not, so a lease orphaned by a crash stays orphaned and its device slot is held until Understudy's own idle expiry. The Phase 5 ramp gate "no stale `minting`, `active`, or `cleanup_pending` lease after a terminal workflow" cannot pass while this holds.
+### The two-config trap
 
-Two candidate fixes, neither applied:
+Metamind has **two** Wrangler configs, and reading the wrong one sends you chasing a phantom:
 
-1. **Service binding.** The correct Worker-to-Worker mechanism for two Workers on one account: no DNS, no public hop, no egress. It changes the connector's egress model, which pins to a hostname, so it is the larger change.
-2. **Custom domain for Understudy.** Point `UNDERSTUDY_URL` at a routed domain instead of `*.workers.dev`. Smaller, and testable immediately, but unverified — it assumes the workers.dev hostname is the cause rather than the scheduled context.
+| File | Purpose | `UNDERSTUDY_URL` |
+|---|---|---|
+| `wrangler.jsonc` (repo root) | **Production.** `scripts/deploy.sh` runs from the root, so this is what deploys | `https://understudy-backend.gcharang.workers.dev` |
+| `packages/worker/wrangler.jsonc` | Local dev | `http://localhost:8790` |
 
-Prefer (1) on architecture and (2) to unblock quickly. Verify either by tailing Understudy across a cron tick and confirming the sweep's request arrives.
+`wrangler deploy --dry-run` run from `packages/worker` prints the **dev** bindings and looks alarming. Verify what is actually live with `wrangler versions view <id>` instead.
+
+### Impact
+
+Phase 1's durable cleanup guarantee is not met in production. The synchronous release on the resume path still works — that is what released the one successful run's lease — but the crash backstop does not, so a lease orphaned by a crash stays orphaned and its device slot is held until Understudy's own idle expiry. The Phase 5 ramp gate "no stale `minting`, `active`, or `cleanup_pending` lease after a terminal workflow" cannot pass while this holds.
+
+### Next step: read the 404's body
+
+The bare status is why this cost hours. Metamind now reports the response's content type and a bounded body snippet on a failed mint (`describeFailure` in `packages/worker/src/intake/browser-session.ts`), which separates the two possibilities without further guesswork:
+
+- a JSON body (`{"error":…}`) means **Understudy answered** — fix the call;
+- an HTML body means **the edge synthesized it** — fix the routing.
+
+### Two candidate fixes, neither applied
+
+1. **Service binding.** The correct Worker-to-Worker mechanism for two Workers on one account: no DNS, no public hop, no egress. But session management deliberately routes through breakwater's egress pin — `browser-session.ts` states it "must not be the one hole in the egress pin" — and a service binding bypasses that guard entirely. It is therefore not a drop-in: it needs `egressFetch` to gain a service-binding transport, or it weakens a deliberate security boundary.
+2. **Custom domain for Understudy.** Point `UNDERSTUDY_URL` at a routed domain instead of `*.workers.dev`. This keeps the egress guard intact and only changes a hostname, and it retires a personal `gcharang.workers.dev` subdomain as the production address of a service other repos consume. It needs a hostname decision from the owner.
+
+Given the egress-pin constraint, (2) is now preferred on architecture as well as speed — the reverse of this document's earlier recommendation. Either way, verify by tailing Understudy — **validated** as above — across a cron tick and confirming the sweep's request arrives.
 
 ## Start from the verified baseline
 
