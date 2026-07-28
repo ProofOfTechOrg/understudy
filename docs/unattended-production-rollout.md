@@ -200,6 +200,23 @@ The bare status is why this cost hours. Metamind now reports the response's cont
 
 Given the egress-pin constraint, (2) is now preferred on architecture as well as speed — the reverse of this document's earlier recommendation. Either way, verify by tailing Understudy — **validated** as above — across a cron tick and confirming the sweep's request arrives.
 
+**(2) is blocked on one decision only: the hostname.** `understudy.proofof.tech` is the obvious default. Adding it is a DNS change on a domain the owner controls, so it is not taken unilaterally.
+
+### What the diagnostic cost, and what it found on the way
+
+The observability change is Metamind PR #20, not yet merged or deployed. It grew well past a logging fix, because the "who answered?" question turns out to gate an irreversible action: `mintLeasedSession` abandons a durable lease on a refusal, on the premise that a refusal proves nothing was created. Four review rounds each found that premise applied wrongly, and the last two found defects that predate this investigation:
+
+| Defect | Why it mattered |
+|---|---|
+| Any non-2xx raised the refusal type in unattended mode | An edge-synthesized 404 retired a lease whose session may exist |
+| Ambiguity resolved toward "Understudy answered" | Any JSON-speaking proxy in front of Understudy could strand a session |
+| Understudy's own `{"error":"internal error"}` at **500** passed the envelope check | That 500 is raised while waiting for the extension — *after* the session exists |
+| The sweep replayed permanently-failing mints forever | A rotated token or disabled tenant crowds out recoverable leases, since the sweep pages oldest-attempt-first |
+
+Only the statuses Understudy declines with — 409, 429, 503 — are now read as refusals, and a lease that never learned a session id is retired after 24 hours under its own `browser-lease-quarantined` log type.
+
+Relevant to the ramp gates: the Phase 5 gate forbidding stale leases assumed the sweep could clear them. It cannot reach Understudy at all (above), and until it can, the gate measures the routing fault rather than the lease machinery.
+
 ## Start from the verified baseline
 
 The following state was verified on 2026-07-27. Recheck it before operational work because deployments and remote refs can change.
