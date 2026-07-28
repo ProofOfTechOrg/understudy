@@ -38,9 +38,9 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Gate | State | Approved SHA | Deployment | Evidence | Completed | Owner |
 |---|---|---|---|---|---|---|
 | Phase 0a: release-flow baseline | Passed | `4843b6bccd8e1028c8fb6dba7812d643a4106778` | Not applicable: package and branch-flow gate | [PR #20](https://github.com/ProofOfTechOrg/understudy/pull/20), [PR #21](https://github.com/ProofOfTechOrg/understudy/pull/21), [master CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565127), [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255262164), [Release](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565196) | `2026-07-27T09:51:30Z` | Release operator |
-| Phase 0b: rollout runbook merged | In progress | Pending | Not applicable: documentation gate | This file, committed to `dev@ee105ac7de0b0a8022e815f601fc991a0c8144d7`; `dev → master` promotion pull request pending | Pending | Engineering |
+| Phase 0b: rollout runbook merged | Passed | `464763bd6c39b86f6154fcb7c95ed3edfe75ef4e` | Not applicable: documentation gate | [PR #22](https://github.com/ProofOfTechOrg/understudy/pull/22) merged; [CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913062) and [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913036) passing. Release workflow is a no-op: no pending changesets, no published-package code changed | `2026-07-28T02:51:30Z` | Engineering |
 | Phase 1a: Metamind implementation | In progress | Metamind `e602b3b32426e35490d8f1df6bdc3f7ebebbd9de` (branch `feat/unattended-phase-1`, not yet merged) | Not applicable: implementation gate | Local lane green: typecheck, 716 tests, Biome (0 errors), proof-runner self-test both modes, `pnpm build` + `validate-build.sh`, `git diff --check`. Both migration copies apply to SQLite with identical schemas and the additive file is idempotent. Not merged, not deployed, no CI run yet | Pending | Engineering |
-| Phase 1b: Metamind attended deployment and proof | Not started | Pending | Current baseline: deployment `f85a53c6-7b90-4b6f-a427-2e8cef7df637`, version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a` | Pending: needs the D1 lease migration, a stamped deploy with `UNDERSTUDY_SESSION_MODE=attended`, `/health.commit` verification, and the attended production proof | Pending | Release operator |
+| Phase 1b: Metamind attended deployment and proof | Blocked | Pending | **Unplanned**: version `998ca9c2-95cb-4731-a2a0-29bf94163acd` deployed `2026-07-28T02:46:04Z`, displacing baseline version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a`. See "Unplanned Phase 1b deployment" below | `/health.commit` = `e602b3b32426e35490d8f1df6bdc3f7ebebbd9de` (the unmerged PR branch); production D1 has NO `browser_session_leases` table, so browser enrichment is broken until the migration is applied. No attended proof was run | Pending | Release operator |
 | Phase 2: Understudy `v2`, flags-off rollback baseline | Not started | Pending | Current baseline: deployment `b73220f0-8035-40d2-9987-243770d96306`, version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Source preconditions verified on `dev@ee105ac7de0b0a8022e815f601fc991a0c8144d7` (no deployment): `pnpm install --frozen-lockfile`, `build`, `typecheck`, `test` (194 backend) all pass, and `wrangler deploy --dry-run` confirms migration `v2`, the `SESSION`/`DEVICE`/`TENANT_CONTROL` bindings, `ANALYTICS`, `RATE_LIMITER`, `VAULT`, quota policy, and both rollout variables at `"[]"`. Still pending: `wrangler secret list`, the deploy itself, and the active-version inspection | Pending | Release operator |
 | Phase 3a: canary device acceptance | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 3b: 24-hour read-only soak | Not started | Pending | Pending | Pending | Pending | Canary operator |
@@ -49,6 +49,29 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Phase 5b: five-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 5c: all-allowlisted 24-hour gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 6: rollout closeout | Not started | Pending | Pending | Pending | Pending | Release operator |
+
+## Unplanned Phase 1b deployment (2026-07-28)
+
+Pushing the Metamind Phase 1a branch `feat/unattended-phase-1` deployed it to **production**. Cloudflare Workers Builds is building and deploying non-production branches, which `docs/deploy.md` in the Metamind repository states is off. Nothing was merged; the push alone was sufficient.
+
+| Fact | Value |
+|---|---|
+| Deployed version | `998ca9c2-95cb-4731-a2a0-29bf94163acd` at `2026-07-28T02:46:04Z` |
+| Displaced baseline | version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a` |
+| `/health.commit` | `e602b3b32426e35490d8f1df6bdc3f7ebebbd9de` — an unmerged pull-request branch |
+| D1 state | `browser_session_leases` absent; the deployed code queries it |
+
+Impact is confined to browser enrichment: `POST /v1/intake/records/:id/enrich-website` fails because the lease table is missing, and the 15-minute sweep logs `browser-lease-sweep-error` each tick. The primary lead-intake workflow, authentication, CRM commit, and Gmail draft paths are untouched, and the approval-resume lease release is internally contained, so approval decisions still land.
+
+This inverts the ordering Phase 1b requires — the additive D1 migration must be applied **before** deploying code that queries the table — and the deployment carries no `/health` verification and no attended proof, so it is not a passed gate.
+
+Do not treat the deployed version as Phase 1b evidence. Before any further Metamind deployment:
+
+1. Turn off non-production branch builds in the Metamind Workers Builds configuration, or disable the auto-deploy for the rollout. Until then, any push to any branch redeploys production.
+2. Correct the Workers Builds table in Metamind's `docs/deploy.md`, which currently documents the opposite.
+3. Choose a recovery path and record it here: roll back to `b7890ecc-b4c4-489f-a67f-3cafbca67b6a`, or apply the additive lease migration and complete Phase 1b's remaining evidence.
+
+The deployment was only detectable because Phase 1's build-time provenance stamp was already in place. Under the previous `COMMIT=local` placeholder, `/health` would have reported `local` both before and after, and this would have been invisible.
 
 ## Start from the verified baseline
 
