@@ -337,6 +337,88 @@ describe("POST /v1/sessions attended over the wire", () => {
   });
 });
 
+describe("UNATTENDED_ENABLED_TENANTS gate", () => {
+  // This allowlist is the blast-radius control for unattended traffic, and it
+  // had NO coverage: nothing asserted that a listed tenant is admitted, that an
+  // unlisted one is refused, or that matching is exact. A silent regression to
+  // prefix or case-insensitive matching would admit a tenant nobody enabled.
+  //
+  // The gate is asserted through its MESSAGE, not its status. Refusal by the
+  // gate and refusal for having no device are BOTH 503 — they differ only in the
+  // body, so a status-only assertion would pass even with the gate deleted.
+  const unattendedBody = JSON.stringify({
+    mode: "unattended",
+    allowedOrigins: ["https://example.com"],
+    profileStateKey: "gate-test",
+  });
+
+  async function createUnattended(token: string, key: string): Promise<Response> {
+    return exports.default.fetch(
+      new Request(`${BASE}/v1/sessions`, {
+        method: "POST",
+        headers: new Headers({
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Idempotency-Key": key,
+        }),
+        body: unattendedBody,
+      }),
+    );
+  }
+
+  async function withAllowlist(value: string, run: () => Promise<void>): Promise<void> {
+    const previous = env.UNATTENDED_ENABLED_TENANTS;
+    env.UNATTENDED_ENABLED_TENANTS = value;
+    try {
+      await run();
+    } finally {
+      env.UNATTENDED_ENABLED_TENANTS = previous;
+    }
+  }
+
+  it("refuses a tenant that is not on the allowlist", async () => {
+    // #given the allowlist names only tenantA
+    await withAllowlist('["tenantA"]', async () => {
+      // #when tenantB asks for an unattended session
+      const res = await createUnattended(CALLER_TOKEN_B, "aaaaaaaa-0000-4000-8000-000000000001");
+
+      // #then it is refused BY THE GATE, before any device is considered
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "unattended sessions are disabled" });
+    });
+  });
+
+  it("admits a tenant that is on the allowlist", async () => {
+    // #given the allowlist names tenantA
+    await withAllowlist('["tenantA"]', async () => {
+      // #when tenantA asks for an unattended session
+      const res = await createUnattended(CALLER_TOKEN_A, "aaaaaaaa-0000-4000-8000-000000000002");
+
+      // #then it passes the gate and fails later, on there being no device.
+      // Same 503, different reason — which is exactly why the message matters.
+      expect(await res.json()).toEqual({ error: "no online compatible device" });
+    });
+  });
+
+  it.each([
+    ["a longer tenant id that starts with the listed one", '["tenant"]'],
+    ["a tenant id that differs only in case", '["TENANTA"]'],
+    ["an empty allowlist", "[]"],
+    ["malformed JSON", "not json"],
+    ["an empty value", ""],
+  ])("refuses tenantA given %s", async (_label, allowlist) => {
+    // #given an allowlist that must NOT match tenantA
+    await withAllowlist(allowlist, async () => {
+      // #when tenantA asks for an unattended session
+      const res = await createUnattended(CALLER_TOKEN_A, crypto.randomUUID());
+
+      // #then matching is exact and parsing failures close the gate, never open it
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "unattended sessions are disabled" });
+    });
+  });
+});
+
 describe("POST /v1/sessions idempotency", () => {
   it("replays the same tenant-scoped session for the same key", async () => {
     const key = "d9428888-122b-4c26-a044-7096d6e845c5";
