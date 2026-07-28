@@ -1,5 +1,11 @@
 {
   "name": "understudy-backend",
+  // Without this, every non-interactive wrangler command against an operator
+  // with more than one account exits on "More than one account available".
+  // `wrangler tail` does so writing NOTHING to stdout, which reads exactly like
+  // a healthy tail observing no traffic — a production misdiagnosis was built
+  // on that silence once. Pinning the account makes the failure impossible.
+  "account_id": "056cbaa6f5c3d8ff5584f1aa84bbe050",
   "main": "src/index.ts",
   // Pinned at-or-before the pinned wrangler release date (see package.json)
   // so the bundled workerd is guaranteed to recognize this compatibility date.
