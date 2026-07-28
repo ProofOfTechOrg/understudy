@@ -87,6 +87,20 @@ async function openSession(callerToken: string): Promise<string> {
   return body.sessionId;
 }
 
+/**
+ * An attended creation as it actually arrives OVER THE WIRE. A bodiless POST
+ * is not bodiless once it is real HTTP: every client sends `Content-Length: 0`,
+ * so the Worker sees an empty-but-non-null stream. Building the Request with an
+ * explicit empty body reproduces that, which `{ method: "POST" }` alone does
+ * not — and that gap let a regression ship where attended creation answered
+ * 400 for every real caller while these tests stayed green.
+ */
+function wireAttendedRequest(token: string, idempotencyKey?: string): Request {
+  const headers = new Headers({ Authorization: `Bearer ${token}`, "Content-Length": "0" });
+  if (idempotencyKey) headers.set("Idempotency-Key", idempotencyKey);
+  return new Request(`${BASE}/v1/sessions`, { method: "POST", headers, body: "" });
+}
+
 async function openIdempotentSession(callerToken: string, idempotencyKey: string): Promise<Response> {
   return exports.default.fetch(
     authedRequest("/v1/sessions", callerToken, {
@@ -278,6 +292,48 @@ describe("GET /health", () => {
     const res = await exports.default.fetch(new Request(`${BASE}/health`));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
+  });
+});
+
+describe("POST /v1/sessions attended over the wire", () => {
+  it("treats an empty body as attended, not as a malformed unattended request", async () => {
+    // The regression this pins: a bodiless POST arrives as Content-Length: 0,
+    // fell through to the unattended branch, and answered 400 for every caller
+    // that was not an in-process Request — which is every real one.
+    const res = await exports.default.fetch(wireAttendedRequest(CALLER_TOKEN_A));
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sessionId?: string; mode?: string };
+    expect(typeof body.sessionId).toBe("string");
+    // Attended responses carry no mode discriminator and no device.
+    expect(body.mode).toBeUndefined();
+  });
+
+  it("still replays the same session for one idempotency key over the wire", async () => {
+    const key = "11111111-2222-4333-8444-555555555555";
+    const first = await exports.default.fetch(wireAttendedRequest(CALLER_TOKEN_A, key));
+    const second = await exports.default.fetch(wireAttendedRequest(CALLER_TOKEN_A, key));
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    const a = (await first.json()) as { sessionId: string };
+    const b = (await second.json()) as { sessionId: string };
+    expect(b.sessionId).toBe(a.sessionId);
+  });
+
+  it("still rejects a body that is present but not a valid unattended request", async () => {
+    // Empty means attended; NON-empty must still be validated, so a malformed
+    // body cannot quietly open an attended session.
+    const headers = new Headers({
+      Authorization: `Bearer ${CALLER_TOKEN_A}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": "99999999-8888-4777-8666-555555555555",
+    });
+    const res = await exports.default.fetch(
+      new Request(`${BASE}/v1/sessions`, { method: "POST", headers, body: "{}" }),
+    );
+
+    expect(res.status).toBe(400);
   });
 });
 

@@ -26,6 +26,8 @@ import type { DispatchOutcome, Env, V2DispatchOutcome } from "./types";
 import {
   canonicalizeUnattendedRequest,
   parseBoundedStrictJson,
+  parseStrictJsonText,
+  readBoundedBodyText,
   RequestBodyError,
 } from "./validation";
 import { emitTelemetry } from "./telemetry";
@@ -67,7 +69,21 @@ app.post("/v1/sessions", async (c) => {
     return c.json({ error: "idempotency-key must be a UUID" }, 400);
   }
 
-  if (c.req.raw.body === null) {
+  // Attended creation is defined as "no body". `body === null` alone only holds
+  // for a Request built in-process — over the wire every client, a Worker
+  // subrequest to a public hostname included, sends `Content-Length: 0`, which
+  // arrives as an empty but non-null stream. Reading the body once and treating
+  // empty as absent is what makes the attended path reachable by any real
+  // caller; discriminating on `body === null` made it reachable only from this
+  // Worker's own in-process tests.
+  let rawBody: string;
+  try {
+    rawBody = await readBoundedBodyText(c.req.raw);
+  } catch (error) {
+    return bodyError(c, error);
+  }
+
+  if (rawBody === "") {
     const actorPseudonym = await telemetryPseudonym("actor", actor.actor, c.env);
     if (
       !(await getTenantStub(c.env, actor.tenantId).consumeSessionCreateQuota(
@@ -89,7 +105,7 @@ app.post("/v1/sessions", async (c) => {
 
   let request: z.infer<typeof UnattendedSessionRequestSchema>;
   try {
-    request = await parseBoundedStrictJson(c.req.raw, UnattendedSessionRequestSchema);
+    request = parseStrictJsonText(rawBody, UnattendedSessionRequestSchema);
   } catch (error) {
     return bodyError(c, error);
   }
