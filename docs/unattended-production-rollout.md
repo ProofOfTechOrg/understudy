@@ -38,9 +38,10 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Gate | State | Approved SHA | Deployment | Evidence | Completed | Owner |
 |---|---|---|---|---|---|---|
 | Phase 0a: release-flow baseline | Passed | `4843b6bccd8e1028c8fb6dba7812d643a4106778` | Not applicable: package and branch-flow gate | [PR #20](https://github.com/ProofOfTechOrg/understudy/pull/20), [PR #21](https://github.com/ProofOfTechOrg/understudy/pull/21), [master CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565127), [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255262164), [Release](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565196) | `2026-07-27T09:51:30Z` | Release operator |
-| Phase 0b: rollout runbook merged | In progress | Pending | Not applicable: documentation gate | This file; merge pull request pending | Pending | Engineering |
-| Phase 1: Metamind compatible and recoverable in attended mode | Not started | Pending | Current baseline: deployment `f85a53c6-7b90-4b6f-a427-2e8cef7df637`, version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a` | Pending | Pending | Engineering |
-| Phase 2: Understudy `v2`, flags-off rollback baseline | Not started | Pending | Current baseline: deployment `b73220f0-8035-40d2-9987-243770d96306`, version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Pending | Pending | Release operator |
+| Phase 0b: rollout runbook merged | In progress | Pending | Not applicable: documentation gate | This file, committed to `dev@ee105ac7de0b0a8022e815f601fc991a0c8144d7`; `dev → master` promotion pull request pending | Pending | Engineering |
+| Phase 1a: Metamind implementation | In progress | Metamind `e602b3b32426e35490d8f1df6bdc3f7ebebbd9de` (branch `feat/unattended-phase-1`, not yet merged) | Not applicable: implementation gate | Local lane green: typecheck, 716 tests, Biome (0 errors), proof-runner self-test both modes, `pnpm build` + `validate-build.sh`, `git diff --check`. Both migration copies apply to SQLite with identical schemas and the additive file is idempotent. Not merged, not deployed, no CI run yet | Pending | Engineering |
+| Phase 1b: Metamind attended deployment and proof | Not started | Pending | Current baseline: deployment `f85a53c6-7b90-4b6f-a427-2e8cef7df637`, version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a` | Pending: needs the D1 lease migration, a stamped deploy with `UNDERSTUDY_SESSION_MODE=attended`, `/health.commit` verification, and the attended production proof | Pending | Release operator |
+| Phase 2: Understudy `v2`, flags-off rollback baseline | Not started | Pending | Current baseline: deployment `b73220f0-8035-40d2-9987-243770d96306`, version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Source preconditions verified on `dev@ee105ac7de0b0a8022e815f601fc991a0c8144d7` (no deployment): `pnpm install --frozen-lockfile`, `build`, `typecheck`, `test` (194 backend) all pass, and `wrangler deploy --dry-run` confirms migration `v2`, the `SESSION`/`DEVICE`/`TENANT_CONTROL` bindings, `ANALYTICS`, `RATE_LIMITER`, `VAULT`, quota policy, and both rollout variables at `"[]"`. Still pending: `wrangler secret list`, the deploy itself, and the active-version inspection | Pending | Release operator |
 | Phase 3a: canary device acceptance | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 3b: 24-hour read-only soak | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 4: governed Metamind unattended proof | Not started | Pending | Pending | Pending | Pending | Canary operator |
@@ -144,6 +145,8 @@ Set the synthetic canary origins to exactly:
 
 Reject a record origin that is absent from this list before creating an Understudy session. Expanding production scope requires one reviewed change that updates both Metamind’s source-controlled allowlist and the extension’s local origin policy.
 
+The list binds BOTH modes whenever it is set, covers every origin the workflow visits (the record’s own and the portal it authenticates against), and is re-checked at each approved side-effect boundary so a run suspended across a policy narrowing cannot resume against origins the list no longer permits. Note the operational consequence: once Phase 1b deploys these canary origins while the mode is still `attended`, attended enrichment of any other origin is refused with `403 origin_not_allowed` until that origin is added by reviewed change. That is the intended fail-closed behavior, not a regression.
+
 ### Create attended and unattended sessions correctly
 
 Attended creation must omit both `body` and `Content-Type`. Understudy treats any body, including `"{}"`, as an unattended request.
@@ -219,9 +222,16 @@ Use this state machine:
 
 ```text
 minting → active → cleanup_pending → released
+                                   ↘ abandoned
 ```
 
-Persist the mint intent before calling Understudy. A crash must not lose the business idempotency key or request needed to recover the mint.
+`released` means Understudy CONFIRMED cleanup with `204`. `abandoned` is a separate terminal state for a lease that provably owns nothing — Understudy refused the creation outright, or had already disposed of the session. The two are deliberately distinct: an operator auditing confirmed cleanups must not silently get rows where nothing was ever confirmed, and a lease left in `cleanup_pending` for a session that never existed would retry and alert forever, failing the ramp gate on what is ordinary, self-clearing device contention.
+
+Persist the mint intent before calling Understudy, and the session id before waiting for it to connect. A crash must not lose the business idempotency key or request needed to recover the mint; recording the id before the connect wait is what lets an interrupted creation be resolved with a `DELETE` instead of another creation.
+
+Classify a failed mint before cleaning up after it. A refusal (`409`, `429`, `503`) means nothing was created, so the lease is abandoned. Any other failure means the outcome is unknown and something may exist, so the lease is LEFT in `minting` for the sweep to replay and discover — moving it out disables the only path that can find that orphan.
+
+Never re-mint under a terminal lease that held a session. Flowsafe can forget a completed run once its retention window passes, so "no run found" is not proof that none ever ran; re-minting would silently re-execute the workflow's browser writes. Refuse with a conflict and require a fresh idempotency key.
 
 On workflow-start failure or a terminal FlowSafe status, move the lease to `cleanup_pending`. Terminal statuses are `success`, `failed`, `tripwire`, `canceled`, `bailed`, and `skipped`.
 
@@ -264,6 +274,10 @@ Keep the existing attended path and extension-token handling for attended proof 
 ### Stamp Metamind deployment provenance
 
 Replace the static `COMMIT=local` deployment path with an automated clean-tree deploy. The source-controlled deployment command must calculate the full SHA, reject a dirty tree, pass the SHA through Wrangler’s `COMMIT` variable, and include it in the deployment message.
+
+A deploy-time `--var` alone is not sufficient, because it stamps only the path that passes it. Metamind also auto-deploys its default branch through Cloudflare Workers Builds, whose deploy command is a bare `wrangler deploy` — that path would ship the `COMMIT` placeholder from `wrangler.jsonc` and silently un-stamp a previously stamped deployment, invalidating recorded evidence after the fact and with no signal. The commit is therefore ALSO baked into the bundle at build time (`packages/worker/vite.config.ts`, from `WORKERS_CI_COMMIT_SHA` or `git rev-parse HEAD`) and preferred by `/health`. Both deploy paths then report a real SHA.
+
+Confirm before Phase 1b that a merge to Metamind’s default branch cannot land an unstamped deployment over a stamped one — either the auto-deploy is disabled for the rollout, or it is running a build that carries the SHA.
 
 The automated command must implement this sequence:
 
