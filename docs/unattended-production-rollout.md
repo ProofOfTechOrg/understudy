@@ -52,7 +52,9 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 
 ## Unplanned Phase 1b deployment (2026-07-28)
 
-Pushing the Metamind Phase 1a branch `feat/unattended-phase-1` deployed it to **production**. Cloudflare Workers Builds is building and deploying non-production branches, which `docs/deploy.md` in the Metamind repository states is off. Nothing was merged; the push alone was sufficient.
+Pushing the Metamind Phase 1a branch `feat/unattended-phase-1` deployed it to **production**. Nothing was merged; the push alone was sufficient.
+
+A built branch does not preview here, it deploys. Non-production branch builds normally produce a preview version because Cloudflare runs `wrangler versions upload` for them — the preview behavior comes from the COMMAND, not the branch. Metamind's configured deploy command is `npx wrangler deploy`, which creates a deployment at 100% traffic on whatever branch it runs. Deployment `0b7c23c4-8c32-41ac-ac68-92cca84d255c` records exactly that: version `998ca9c2` at 100%, not a version upload.
 
 | Fact | Value |
 |---|---|
@@ -73,9 +75,24 @@ Metamind pull request #17 (Phase 1a) is held open and green, unmerged, because m
 
 Before any further Metamind deployment:
 
-1. Turn off non-production branch builds in the Metamind Workers Builds configuration, or disable the auto-deploy for the rollout. Until then, any push to any branch redeploys production. **This is the actual defect** — the rollback does not prevent a recurrence.
-2. Correct the Workers Builds table in Metamind's `docs/deploy.md`, which currently documents the opposite.
-3. Then merge pull request #17 and execute Phase 1b in order: additive D1 migration, stamped deploy with `UNDERSTUDY_SESSION_MODE=attended`, `/health.commit` verification, attended production proof.
+1. Turn off non-production branch builds in the Metamind Workers Builds configuration. Until then, any push to any branch redeploys production. **This is the actual defect** — the rollback does not prevent a recurrence. If branch builds are ever wanted back, their deploy command must be `wrangler versions upload`; and even a correct preview binds production D1, KV, and Durable Objects here, because there is one wrangler environment with top-level bindings.
+2. Correct the Workers Builds table in Metamind's `docs/deploy.md`, which documents the opposite. (Done in Metamind `8173ddd`, held unpushed until step 1.)
+
+Then merge Metamind pull request #17 and execute Phase 1b.
+
+### Phase 1b ordering, with the auto-deploy in the picture
+
+The promotion to Metamind's default branch **is** the production deploy. `pnpm deploy:prod` is not what ships production in the normal flow — the merge is. That removes the window this runbook's Phase 1 sequence assumes between deploying code and applying its schema, so:
+
+Apply `packages/worker/sql/add-browser-session-leases.sql` to production D1 **before** promoting to `master`, not after. The deployed code queries that table on the enrichment path; promoting first repeats the failure this section records.
+
+Either keep the default-branch auto-deploy and accept that the merge deploys — provenance still holds, because the commit is baked at build time — or turn it off for the rollout and deploy explicitly with `pnpm deploy:prod`, which additionally refuses a dirty tree, stamps the deployment message with the SHA, and rejects the deployment on a `/health.commit` mismatch. Record which was chosen.
+
+### Verifying `/health.commit` after a deployment
+
+A deployment propagates across the edge over seconds to minutes, and during that window `/health` legitimately answers with EITHER version depending on which isolate serves the request — observed mixed for roughly two minutes after the rollback below. A single `curl` is therefore not a verification: it can read an un-propagated isolate and reject a good deployment, and one matching read only proves one isolate updated while traffic may still run the old code.
+
+Poll for at least three minutes and require several CONSECUTIVE matching reads before accepting the gate. Metamind's `scripts/deploy.sh` does this (`8173ddd`); a hand-run check must do the same.
 
 The deployment was only detectable because Phase 1's build-time provenance stamp was already in place. Under the previous `COMMIT=local` placeholder, `/health` would have reported `local` both before and after, and this would have been invisible.
 
