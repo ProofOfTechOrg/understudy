@@ -131,6 +131,37 @@ Fixed in Metamind `7f92720` by splitting the two: `POST /records/:id/browser-ses
 
 The route caught every unmapped error and returned `502` without logging it, so Workers request logs showed a clean `ok` outcome with no exception and no clue. The 502 fallback now logs the error before returning. An error path that discards its own cause is not a failure mode worth preserving.
 
+## The lease sweep cannot reach Understudy from cron (2026-07-28, OPEN)
+
+The SWEEP_CRON recovery pass — the durable backstop for browser-session cleanup — cannot call Understudy. Three orphaned `minting` leases have been retrying every 15 minutes and failing identically:
+
+```json
+{"type":"browser-lease-recovery-error","state":"minting","transient":false,
+ "error":"Error: understudy session mint failed (404)"}
+```
+
+Evidence, in the order it rules things out:
+
+| Observation | Rules out |
+|---|---|
+| The same `POST /v1/sessions` with the same idempotency keys returns `200` from curl | The keys, the route, the payload |
+| Understudy's `.workers.dev` host serves `/health` `200`; an unknown path returns `404` (Hono `notFound`) | The hostname being unrouted |
+| The Metamind fetch-context mint at `05:46Z` succeeded and minted a real session | Metamind's caller token and `UNDERSTUDY_URL` |
+| Tailing Understudy across a full cron tick shows **zero** requests from the sweep, while Metamind logs the 404 for that same tick | Understudy rejecting it — the request never arrives |
+
+So the 404 is produced before the request reaches the Worker, and only from the scheduled-handler context. Fetch-context subrequests to the same URL work.
+
+Confidence: **high** that cron-context subrequests to the `*.workers.dev` hostname do not arrive; **unknown** as to Cloudflare's precise reason.
+
+Impact: Phase 1's durable cleanup guarantee is not met in production. The synchronous release on the resume path still works — that is what released the one successful run's lease — but the crash backstop does not, so a lease orphaned by a crash stays orphaned and its device slot is held until Understudy's own idle expiry. The Phase 5 ramp gate "no stale `minting`, `active`, or `cleanup_pending` lease after a terminal workflow" cannot pass while this holds.
+
+Two candidate fixes, neither applied:
+
+1. **Service binding.** The correct Worker-to-Worker mechanism for two Workers on one account: no DNS, no public hop, no egress. It changes the connector's egress model, which pins to a hostname, so it is the larger change.
+2. **Custom domain for Understudy.** Point `UNDERSTUDY_URL` at a routed domain instead of `*.workers.dev`. Smaller, and testable immediately, but unverified — it assumes the workers.dev hostname is the cause rather than the scheduled context.
+
+Prefer (1) on architecture and (2) to unblock quickly. Verify either by tailing Understudy across a cron tick and confirming the sweep's request arrives.
+
 ## Start from the verified baseline
 
 The following state was verified on 2026-07-27. Recheck it before operational work because deployments and remote refs can change.
