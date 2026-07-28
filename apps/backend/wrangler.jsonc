@@ -7,6 +7,26 @@
   // on that silence once. Pinning the account makes the failure impossible.
   "account_id": "056cbaa6f5c3d8ff5584f1aa84bbe050",
   "main": "src/index.ts",
+  // The production address consumers are configured with. A `*.workers.dev`
+  // subdomain is tied to one operator's account name, which is the wrong
+  // identity for a service other repositories depend on — and Metamind's
+  // SWEEP_CRON could not reach the workers.dev host at all (see
+  // docs/unattended-production-rollout.md), while its fetch-path calls to the
+  // same URL succeeded.
+  //
+  // MUST stay explicit. Wrangler disables workers.dev by default as soon as a
+  // route is declared and the key is absent, which silently retires the old
+  // hostname — and consumers are configured with a URL, so a consumer still
+  // pointed at it breaks the moment this deploys. Kept on so the cutover is
+  // additive; removing it is a separate, deliberate step once no consumer
+  // resolves the old name.
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "understudy.proofof.tech",
+      "custom_domain": true
+    }
+  ],
   // Pinned at-or-before the pinned wrangler release date (see package.json)
   // so the bundled workerd is guaranteed to recognize this compatibility date.
   "compatibility_date": "2026-07-01",
