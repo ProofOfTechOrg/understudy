@@ -65,14 +65,18 @@ function wsBase(httpBase) {
   return httpBase.replace(/^http/, "ws");
 }
 
+// `body === undefined` sends NO body, which is how attended creation is
+// discriminated (see the "Attended creation is defined as no body" comment in
+// src/index.ts). Sending `{}` instead makes the request UNATTENDED and it fails
+// the unattended schema with a 400 before any flag is consulted.
 async function postJson(path, body) {
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
       Authorization: `Bearer ${CALLER_TOKEN}`,
     },
-    body: JSON.stringify(body),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const text = await res.text();
   let json;
@@ -134,7 +138,7 @@ async function main() {
   console.log("understudy stub consumer - M3 runbook harness");
   console.log(`BASE_URL=${BASE_URL}`);
 
-  const { sessionId } = await postJson("/v1/sessions", {});
+  const { sessionId } = await postJson("/v1/sessions");
   console.log(`\nsession opened: ${sessionId}`);
 
   const wsUrl = `${wsBase(BASE_URL)}/agents/session/${sessionId}?token=${EXTENSION_TOKEN}`;

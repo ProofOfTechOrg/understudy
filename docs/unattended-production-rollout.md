@@ -40,7 +40,7 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Phase 0a: release-flow baseline | Passed | `4843b6bccd8e1028c8fb6dba7812d643a4106778` | Not applicable: package and branch-flow gate | [PR #20](https://github.com/ProofOfTechOrg/understudy/pull/20), [PR #21](https://github.com/ProofOfTechOrg/understudy/pull/21), [master CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565127), [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255262164), [Release](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565196) | `2026-07-27T09:51:30Z` | Release operator |
 | Phase 0b: rollout runbook merged | Passed | `464763bd6c39b86f6154fcb7c95ed3edfe75ef4e` | Not applicable: documentation gate | [PR #22](https://github.com/ProofOfTechOrg/understudy/pull/22) merged; [CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913062) and [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913036) passing. Release workflow is a no-op: no pending changesets, no published-package code changed | `2026-07-28T02:51:30Z` | Engineering |
 | Phase 1a: Metamind implementation | Passed | Metamind `fb6a7b706106306d95861ebe4a7abf0f5c65c6b8` (merged to `dev`) | Not applicable: implementation gate; production still on the baseline | [PR #17](https://github.com/ProofOfTechOrg/metamind/pull/17) merged, [CI passing](https://github.com/ProofOfTechOrg/metamind/actions/runs/30325493776) (app, worker, preflight). Worker lane covers typecheck, 716 tests, Biome, proof-runner self-test in both modes, `pnpm build` + `validate-build.sh`. Both migration copies apply to SQLite with identical schemas; the additive file is idempotent | `2026-07-28T03:21:33Z` | Engineering |
-| Phase 1b: Metamind attended deployment and proof | Passed | Metamind `434c1a7f5c368d4910c78c59997623762185fda8` (merged to `master`) | Version `3f1ba280-6cbe-480c-89fd-47b4daf2f731` at `2026-07-28T06:18:01Z`, message `release 434c1a7f5c368d4910c78c59997623762185fda8`. Superseded at `2026-07-28T16:29:30Z` by version `56fb278f-15f3-40f1-ab3b-a0276d123bfa` (`b70c40e39b74a98f79199634a5390d32610b180e`), which repointed `UNDERSTUDY_URL` at the routed domain | D1 lease migration applied BEFORE the first promotion: `changes: 1, changed_db: true, num_tables: 34`; `browser_session_leases` present with both indexes and queryable post-deploy. `/health.commit` confirmed by consecutive matching reads at each deploy. [PR #18](https://github.com/ProofOfTechOrg/metamind/pull/18), [PR #19](https://github.com/ProofOfTechOrg/metamind/pull/19), [PR #20](https://github.com/ProofOfTechOrg/metamind/pull/20). Smoke: `/` 302 to `/app/`, `/app/` 200, `/v1` 401 unauthenticated. **Attended production proof PASSED** on run `metamind_efefdb2e-2aed-441a-af6b-527e640c816f` — all eight gates in the table below, including a datum read from behind a portal login and a lease `released` on a confirmed 204. Three attempts were needed; the first two failed on consumer defects, all fixed. **Phase 1's durable-cleanup guarantee is also now met**: the `16:30Z` sweep cleared four real orphans (three `minting`, one `cleanup_pending` carrying the 404) to `released` with null errors | `2026-07-28T16:30:22Z` | Release operator |
+| Phase 1b: Metamind attended deployment and proof | Passed | Metamind `434c1a7f5c368d4910c78c59997623762185fda8` (merged to `master`) | Version `3f1ba280-6cbe-480c-89fd-47b4daf2f731` at `2026-07-28T06:18:01Z`, message `release 434c1a7f5c368d4910c78c59997623762185fda8`. Superseded at `2026-07-28T16:29:30Z` by version `56fb278f-15f3-40f1-ab3b-a0276d123bfa` (`b70c40e39b74a98f79199634a5390d32610b180e`), which repointed `UNDERSTUDY_URL` at the routed domain | D1 lease migration applied BEFORE the first promotion: `changes: 1, changed_db: true, num_tables: 34`; `browser_session_leases` present with both indexes and queryable post-deploy. `/health.commit` confirmed by consecutive matching reads at each deploy. [PR #18](https://github.com/ProofOfTechOrg/metamind/pull/18), [PR #19](https://github.com/ProofOfTechOrg/metamind/pull/19), [PR #20](https://github.com/ProofOfTechOrg/metamind/pull/20). Smoke: `/` 302 to `/app/`, `/app/` 200, `/v1` 401 unauthenticated. **Attended production proof PASSED** on run `metamind_efefdb2e-2aed-441a-af6b-527e640c816f` — all eight gates in the table below, including a datum read from behind a portal login and a lease `released` on a confirmed 204. Three attempts were needed; the first two failed on consumer defects, all fixed. **Phase 1's durable-cleanup guarantee is met on the attended path**: the `16:30Z` sweep cleared four real orphans (three `minting`, one `cleanup_pending` carrying the 404) to `released` with null errors. All six leases are `mode=attended`, so the unattended replay remains unproven until Phase 4 — see the scope limit under the resolution | `2026-07-28T16:30:22Z` | Release operator |
 | Phase 2: Understudy `v2`, flags-off rollback baseline | Passed | `5cc969024b32380f1a3e14ff6f72e8d0c808b086` (deployed; approved at `dd7c100343cfc15e02802d93831600e0535670ed`) | Deployment `1c32a8e9-bf87-49eb-89a5-253ea4e47d1a`, version **`7eff2d11-2ba5-420b-b1f2-113faf0d6f73`** at `2026-07-28T04:29:57Z`, message `release dd7c100343cfc15e02802d93831600e0535670ed`. Previous baseline was version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Verified at the approved SHA on a detached checkout: `pnpm install --frozen-lockfile`, `build`, `typecheck`, `test` (408 tests: 194 backend, 139 extension, 43 protocol, 32 connector), `wrangler deploy --dry-run`. All six secret names confirmed present — `DEVICE_TOKENS` and `WS_TICKET_SECRET` were MISSING and were provisioned first (see below). Active version exports `SessionAgent`, `DeviceAgent`, `TenantDeviceCoordinator`; binds `SESSION`, `DEVICE`, `TENANT_CONTROL`, `ANALYTICS`, `RATE_LIMITER`, `VAULT`, all six secrets, `QUOTA_POLICY`, and both rollout variables at `"[]"`. `/health` returns `{"ok":true}`; an unmapped token gets `401`; a well-formed unattended request gets `503 unattended sessions are disabled`, proving the flags-off baseline. Caller token rotated on both sides (Metamind confirmed as the only caller). The attended `curl` smoke test returns `200` with a `sessionId` after Understudy `e0351f6` (version `8ec9be79-76bb-4140-9530-402b4a46a40e`) fixed the empty-body discrimination — it had answered `400` for every over-the-wire caller. Baseline then advanced to `5cc969024b32380f1a3e14ff6f72e8d0c808b086` (version `fd67173d-e402-420d-9437-77dbc1e6be4a` at `2026-07-28T09:43:59Z`), which serves Understudy at `understudy.proofof.tech` while keeping `workers.dev` explicitly enabled; both hostnames return `200` on `/health`. The Metamind attended proof PASSED against this version | `2026-07-28T11:03:08Z` | Release operator |
 | Phase 3a: canary device acceptance | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 3b: 24-hour read-only soak | Not started | Pending | Pending | Pending | Pending | Canary operator |
@@ -155,7 +155,26 @@ All four are `released` with `last_error` null, and the already-`released` atten
 
 **This is conclusive without needing a tail.** `released` is reachable only through a CONFIRMED 204 from Understudy — the sweep's own contract — so a request that never arrives cannot produce it. The four transitions prove the subrequest now arrives, is authorized, and is answered. `ea5acce7` is the strongest single datum: it carried the 404 in its durable `last_error` for six hours and cleared seconds after the deploy.
 
-The `minting` rows also exercised the full recovery path rather than a shortcut: each had no session id, so the sweep had to replay the mint under the lease's original idempotency key, learn the session id, then release it — mint *and* delete both reached Understudy.
+The `minting` rows exercised the full recovery path rather than a shortcut. `recoverMintingLease` replays only when the lease has no session id — `lease.sessionId ? {kind:"session", …} : await replayMint(…)` — so the recorded `understudy session mint failed (404)` is itself proof those three had none. The sweep therefore had to replay the create under each lease's original idempotency key, learn the session id, then release it: **mint and delete both reached Understudy.**
+
+**Scope limit — read this before treating the sweep as proven.** All six leases are `mode=attended`; Metamind is deployed `UNDERSTUDY_SESSION_MODE=attended`, so every row stores the literal four-character string `null` in `request_json` (the column is `NOT NULL` in `migrations/0001_init.sql`, so a SQL NULL is impossible — a `d1 execute` readout showing `null` is that string). `replayMint` routes an attended lease to `createAttendedSession`, and Understudy answers an absent body from the attended branch and **returns before** the `UNATTENDED_ENABLED_TENANTS` gate:
+
+```ts
+// apps/backend/src/index.ts — attended returns at the c.json({ sessionId }) above
+if (!enabledForTenant(c.env.UNATTENDED_ENABLED_TENANTS, actor.tenantId)) {
+  return c.json({ error: "unattended sessions are disabled" }, 503);
+}
+```
+
+So what is proven is routing plus the attended replay path. The **unattended** replay is untested in production and cannot be tested while the flags are `"[]"` — it would draw the `503`, which `REFUSAL_STATUSES` reads as a refusal. Phase 4 is its first real exercise.
+
+**The flags MUST be flipped at Understudy before Metamind's mode, never the reverse.** This is not a preference. With the allowlist empty, an unattended create returns `503` inside Understudy's strict single-key `{"error":…}` envelope, so Metamind mints an `UnderstudySessionRejectedError` — and on the *request* path `mintLeasedSession` abandons the lease immediately. `listRecoverableBrowserLeases` excludes `abandoned`, so the sweep can never pick it back up. Flipping Metamind first would irreversibly abandon one lease per enrichment request, synchronously. The rollback order in "Roll back safely" is the correct mirror: Metamind to attended first, then Understudy.
+
+### Carry into Phase 4: the quarantine gate is wider than `REFUSAL_STATUSES`
+
+The sweep's 24-hour quarantine keys on `understudyAnswered(error)`, which is true for **any** response carrying Understudy's error envelope — not only the refusal statuses. That includes `404 device not found` and `426 extension lacks safe-write-v2`, neither of which is in `REFUSAL_STATUSES`.
+
+The consequence is delayed and therefore easy to misread: a persistent misconfiguration — an unenrolled or renamed device, a downgraded connector — produces those statuses on every tick, writes `last_error`, and changes no state for 24 hours. It looks benign. At the 24-hour boundary the sweep begins abandoning leases instead. **Treat a repeating `browser-lease-recovery-error` with a 404 or 426 as urgent even though nothing has transitioned yet**; the absence of a state change is not the absence of a problem. This predates the rollout and is not introduced by any change in it.
 
 Confidence: **high** that the routing fault is gone. Still **unknown**: Cloudflare's precise reason for 404-ing the cron-context subrequest to `*.workers.dev` while the identical fetch-context request succeeded. The fix routes around it rather than explaining it, and that distinction is left in the record deliberately — if a future service ever needs a `*.workers.dev` hop from a scheduled handler, this is unexplained, not solved.
 
@@ -723,7 +742,7 @@ Confirm the device reports:
 - Usage 0
 - A recent heartbeat
 
-After the upgraded Metamind connector is live, deploy this Understudy configuration:
+Once the upgraded Metamind connector is live **and the device above reports protocol 2 with a recent heartbeat**, deploy this Understudy configuration:
 
 ```json
 {
@@ -732,9 +751,19 @@ After the upgraded Metamind connector is live, deploy this Understudy configurat
 }
 ```
 
-Do not use `"*"`.
+Do not use `"*"`. `enabledForTenant` honours it, so a wildcard admits every tenant holding a caller token.
+
+The device confirmation comes first because the allowlist deployment is recorded as an evidence gate — recording it against a device that has never connected proves nothing. Nothing about either flag touches the device, so the order costs nothing.
+
+The acceptance suite below creates unattended sessions, so it **cannot** run before this flip: every create would draw the `503`. This is why the flip precedes acceptance rather than following it.
+
+These are `vars` in `apps/backend/wrangler.jsonc`, which is deliberate — `wrangler rollback` restores a version *including* its vars, so the rollback in "Roll back safely" disables unattended creation atomically with the code. A runtime-mutable flag store would break that, and would let production diverge from reviewed source with no pull-request trail.
+
+Understudy's `/health` returns only `{"ok":true}` — there is **no commit stamp on this service**, unlike Metamind. Deploying from a working tree therefore leaves the recorded version ID mapping to no SHA at all. Commit first and deploy from a committed SHA.
 
 Record the allowlist deployment and version IDs before running acceptance.
+
+**`SAFE_WRITE_REQUIRED_TENANTS` is not an active control here — do not record it as one.** Its check sits on the legacy command path, reached only when the caller omits `understudy-command-contract: 2` *and* the extension is protocol-1. `@understudy/connector` has sent that header unconditionally since 0.5.0, and Metamind routes every command through the connector, so the flag cannot fire for this tenant in any phase. The protection it is named for is already unconditional for every tenant in `dispatchV2`, which refuses a non-dryRun write from a protocol-1 extension with the identical 426. Set it as a downgrade guard against a future caller on an older connector; expect it never to fire, and do not read its silence as evidence.
 
 ### Run the Chromium acceptance suite
 
@@ -895,7 +924,7 @@ Do not advance a stage on an unexplained anomaly. Set the current gate to `Block
 Close the rollout only after the all-allowlisted 24-hour soak passes.
 
 1. Leave `UNATTENDED_ENABLED_TENANTS=["metamind"]`.
-2. Leave `SAFE_WRITE_REQUIRED_TENANTS=["metamind"]`.
+2. Leave `SAFE_WRITE_REQUIRED_TENANTS=["metamind"]`, recording it as the downgrade guard it is — not as a safety control that was exercised. See Phase 3.
 3. Do not switch either flag to wildcard enablement.
 4. Fill every ledger field with full SHAs, CI URLs, deployment and version IDs, D1 evidence, device acceptance, telemetry, proof artifacts, and UTC timestamps.
 5. Verify the recorded rollback version still exists among Cloudflare’s available Worker versions.

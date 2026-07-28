@@ -97,13 +97,19 @@ Copy `.dev.vars.example` to `.dev.vars` for local development. Never commit `.de
 
 Non-secret Wrangler variables include:
 
-| Variable | Default | Purpose |
+| Variable | Shipped value | Purpose |
 |---|---|---|
-| `UNATTENDED_ENABLED_TENANTS` | `[]` | Tenant allowlist for new unattended leases |
-| `SAFE_WRITE_REQUIRED_TENANTS` | `[]` | Tenant allowlist that rejects protocol-1 writes |
+| `UNATTENDED_ENABLED_TENANTS` | `["metamind"]` | Tenant allowlist for new unattended leases |
+| `SAFE_WRITE_REQUIRED_TENANTS` | `["metamind"]` | Legacy-path downgrade guard (see below) |
 | `QUOTA_POLICY` | Built-in JSON | Exact SQLite quota configuration |
 
-Use `["*"]` only after the protocol-2 extension rollout completes. Keep unattended creation disabled during the initial backend deployment.
+Both allowlists start at `[]` and are set per tenant during rollout; `wrangler.jsonc` is authoritative for what is deployed.
+
+Never use `["*"]` for either allowlist. `enabledForTenant` honours it, so a wildcard admits every tenant holding a caller token — the blast radius the named allowlist exists to bound. Wildcard enablement is a rejected option in the [rollout runbook](../../docs/unattended-production-rollout.md); onboard tenants by name, one at a time.
+
+Keep unattended creation disabled during the initial backend deployment. Enable it for a named tenant once that tenant's canary device is enrolled and reporting protocol 2 — the Chromium acceptance suite creates unattended sessions and cannot run against an empty allowlist.
+
+`SAFE_WRITE_REQUIRED_TENANTS` is a downgrade guard, not the safe-write control: its check is on the legacy command path, reached only when a caller omits `understudy-command-contract: 2` *and* the extension is protocol-1. `@understudy/connector` has sent that header unconditionally since 0.5.0. Protocol-1 writes are already refused for every tenant by `dispatchV2`, flag or no flag.
 
 The default exact quotas are:
 

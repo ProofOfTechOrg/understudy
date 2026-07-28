@@ -91,8 +91,21 @@
   },
   "vars": {
     "QUOTA_POLICY": "{\"sessionCreatesPerActorMinute\":10,\"commandsPerSessionMinute\":120,\"commandsPerTenantMinute\":600,\"credentialFillsPerActorMinute\":30,\"deviceTicketsPerDeviceMinute\":30,\"sessionCommandCap\":10000}",
-    "UNATTENDED_ENABLED_TENANTS": "[]",
-    "SAFE_WRITE_REQUIRED_TENANTS": "[]"
+    // Gates ONLY the unattended create branch in src/index.ts; a request with an
+    // empty body returns from the attended branch above that gate, so attended
+    // callers never reach it. This is the live blast-radius control for
+    // unattended traffic: named tenants only, NEVER "*" — enabledForTenant
+    // honours "*" and it would admit every tenant that holds a caller token.
+    "UNATTENDED_ENABLED_TENANTS": "[\"metamind\"]",
+    // A downgrade guard, NOT the safe-write control. Its check in src/index.ts
+    // sits on the legacy command path, reached only when the CALLER omits
+    // `understudy-command-contract: 2` AND the extension is protocol-1.
+    // @understudy/connector has sent that header unconditionally since 0.5.0, so
+    // this never fires for a consumer on a current connector — it guards a caller
+    // on an older one, or a hand-rolled POST. The protection it is named for is
+    // already unconditional for every tenant: dispatchV2 in src/session.ts
+    // refuses a non-dryRun write from a protocol-1 extension with the same 426.
+    "SAFE_WRITE_REQUIRED_TENANTS": "[\"metamind\"]"
   },
   "analytics_engine_datasets": [
     {
