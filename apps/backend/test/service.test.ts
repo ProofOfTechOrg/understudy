@@ -354,13 +354,9 @@ describe("UNATTENDED_ENABLED_TENANTS gate", () => {
 
   async function createUnattended(token: string, key: string): Promise<Response> {
     return exports.default.fetch(
-      new Request(`${BASE}/v1/sessions`, {
+      authedRequest("/v1/sessions", token, {
         method: "POST",
-        headers: new Headers({
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          "Idempotency-Key": key,
-        }),
+        headers: { "Content-Type": "application/json", "Idempotency-Key": key },
         body: unattendedBody,
       }),
     );
@@ -395,7 +391,23 @@ describe("UNATTENDED_ENABLED_TENANTS gate", () => {
       const res = await createUnattended(CALLER_TOKEN_A, "aaaaaaaa-0000-4000-8000-000000000002");
 
       // #then it passes the gate and fails later, on there being no device.
-      // Same 503, different reason — which is exactly why the message matters.
+      // The status is asserted too: "same 503, different reason" is the premise
+      // the whole block rests on, so it must be pinned rather than assumed.
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "no online compatible device" });
+    });
+  });
+
+  it("admits every tenant on a wildcard, which is why the wildcard is banned", async () => {
+    // #given a wildcard allowlist, and a tenant no rollout ever named
+    await withAllowlist('["*"]', async () => {
+      // #when tenantB asks for an unattended session
+      const res = await createUnattended(CALLER_TOKEN_B, "aaaaaaaa-0000-4000-8000-000000000003");
+
+      // #then it is admitted. Every doc that bans "*" cites this behaviour, so
+      // deleting the `includes("*")` branch as an unused escape hatch must fail
+      // here rather than silently making those documents wrong.
+      expect(res.status).toBe(503);
       expect(await res.json()).toEqual({ error: "no online compatible device" });
     });
   });
@@ -417,6 +429,94 @@ describe("UNATTENDED_ENABLED_TENANTS gate", () => {
       expect(await res.json()).toEqual({ error: "unattended sessions are disabled" });
     });
   });
+});
+
+describe("SAFE_WRITE_REQUIRED_TENANTS legacy-path guard", () => {
+  // On the legacy command path this flag is the ONLY refusal: `dispatch()` does
+  // not check the protocol version, so an unlisted tenant's protocol-1 write
+  // executes for real. `dispatchV2` refuses the same write, but the legacy path
+  // is by definition the one that never reaches it — which is why this needs
+  // its own coverage in BOTH directions rather than resting on dispatchV2.
+  //
+  // The path is reached only when all of: the caller omits
+  // `understudy-command-contract: 2` (postCommand does), the session is
+  // attended, and the extension is protocol-1 (connectFakeExtension sends no
+  // hello, so protocolVersion stays at its default of 1).
+  const write = { type: "click", commandId: "c-legacy-write", ref: "r1" } as const;
+
+  async function withSafeWrite(value: string, run: () => Promise<void>): Promise<void> {
+    const previous = env.SAFE_WRITE_REQUIRED_TENANTS;
+    env.SAFE_WRITE_REQUIRED_TENANTS = value;
+    try {
+      await run();
+    } finally {
+      env.SAFE_WRITE_REQUIRED_TENANTS = previous;
+    }
+  }
+
+  it("refuses a protocol-1 write for a listed tenant", async () => {
+    // #given a listed tenant and a session with no protocol-2 extension
+    const sessionId = await openSession(CALLER_TOKEN_A);
+
+    await withSafeWrite('["tenantA"]', async () => {
+      // #when a real write is posted without the contract header
+      const res = await postCommand(sessionId, CALLER_TOKEN_A, write);
+
+      // #then it is refused before reaching the extension
+      expect(res.status).toBe(426);
+      expect(await res.json()).toEqual({ error: "extension lacks safe-write-v2" });
+    });
+  });
+
+  it("does not refuse a dryRun write, which cannot touch the page", async () => {
+    // #given the same listed tenant
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+
+    try {
+      await withSafeWrite('["tenantA"]', async () => {
+        // #when the same command is posted as a dryRun
+        const dispatched = answerResolveRefsWith(socket, [write.ref]);
+        const res = await postCommand(sessionId, CALLER_TOKEN_A, write, true);
+
+        // #then the guard does not fire — its condition is `!dryRun`, and a
+        // dryRun cannot touch the page. It reaches the extension as a ref
+        // PROBE rather than the write itself, which is what makes it safe.
+        expect(res.status).toBe(200);
+        expect(dispatched.map((command) => command.type)).toEqual(["resolve_ref"]);
+      });
+    } finally {
+      socket.close(1000, "done");
+    }
+  });
+
+  it("dispatches the identical write when the tenant is NOT listed", async () => {
+    // #given an EMPTY allowlist and the same protocol-1 session
+    const sessionId = await openSession(CALLER_TOKEN_A);
+    const socket = await connectFakeExtension(sessionId);
+
+    try {
+      await withSafeWrite("[]", async () => {
+        // #when the same real write is posted
+        const incoming = waitForCommand(socket);
+        const resPromise = postCommand(sessionId, CALLER_TOKEN_A, write);
+
+        // #then it REACHES the extension. This is the half that proves the flag
+        // is the only thing refusing: unset it and a protocol-1 write executes
+        // against the page. Nothing else on this path would have stopped it.
+        await expect(incoming).resolves.toMatchObject({ commandId: write.commandId });
+
+        // Answer it so the request settles here rather than parking for the
+        // full per-command timeout and bleeding into the next test.
+        socket.send(
+          JSON.stringify({ type: "action_result", commandId: write.commandId, ok: true }),
+        );
+        expect((await resPromise).status).toBe(200);
+      });
+    } finally {
+      socket.close(1000, "done");
+    }
+  }, 20_000);
 });
 
 describe("POST /v1/sessions idempotency", () => {
@@ -2476,3 +2576,4 @@ describe("dialog surfacing (extension → DO state → GET /v1/sessions/:id)", (
     }
   });
 });
+

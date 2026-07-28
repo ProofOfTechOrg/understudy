@@ -97,19 +97,21 @@ Copy `.dev.vars.example` to `.dev.vars` for local development. Never commit `.de
 
 Non-secret Wrangler variables include:
 
-| Variable | Shipped value | Purpose |
+| Variable | Default | Purpose |
 |---|---|---|
-| `UNATTENDED_ENABLED_TENANTS` | `["metamind"]` | Tenant allowlist for new unattended leases |
-| `SAFE_WRITE_REQUIRED_TENANTS` | `["metamind"]` | Legacy-path downgrade guard (see below) |
+| `UNATTENDED_ENABLED_TENANTS` | `[]` | Tenant allowlist for new unattended leases |
+| `SAFE_WRITE_REQUIRED_TENANTS` | `[]` | Legacy-path write guard (see below) |
 | `QUOTA_POLICY` | Built-in JSON | Exact SQLite quota configuration |
 
-Both allowlists start at `[]` and are set per tenant during rollout; `wrangler.jsonc` is authoritative for what is deployed.
+Both allowlists are set per tenant during rollout. `wrangler.jsonc` is authoritative for what is deployed; do not restate their values elsewhere.
 
 Never use `["*"]` for either allowlist. `enabledForTenant` honours it, so a wildcard admits every tenant holding a caller token — the blast radius the named allowlist exists to bound. Wildcard enablement is a rejected option in the [rollout runbook](../../docs/unattended-production-rollout.md); onboard tenants by name, one at a time.
 
 Keep unattended creation disabled during the initial backend deployment. Enable it for a named tenant once that tenant's canary device is enrolled and reporting protocol 2 — the Chromium acceptance suite creates unattended sessions and cannot run against an empty allowlist.
 
-`SAFE_WRITE_REQUIRED_TENANTS` is a downgrade guard, not the safe-write control: its check is on the legacy command path, reached only when a caller omits `understudy-command-contract: 2` *and* the extension is protocol-1. `@understudy/connector` has sent that header unconditionally since 0.5.0. Protocol-1 writes are already refused for every tenant by `dispatchV2`, flag or no flag.
+`SAFE_WRITE_REQUIRED_TENANTS` guards the **legacy** command path, which is reached only when all of: the caller omits `understudy-command-contract: 2`, the session is attended, and the extension is protocol-1. `@understudy/connector` has sent that header unconditionally since 0.5.0, so a consumer on a current connector never reaches it.
+
+On that path this flag is the **only** refusal. `dispatch()` does not check the protocol version, so with the tenant unlisted a protocol-1 write executes. `dispatchV2` returns the same 426 for a protocol-1 write, but only for callers that reach it — and the legacy path is by definition the one that does not. Enable this flag for a tenant whenever that tenant is enabled for unattended sessions.
 
 The default exact quotas are:
 

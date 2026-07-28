@@ -78,7 +78,7 @@ The Release workflow publishes the promoted versions with npm provenance. It rej
 
 Do not merge `master` back into `dev`. `NPM_TOKEN` needs publish access to the `@understudy` scope.
 
-Backend deployment remains a separate Wrangler operation. Keep `UNATTENDED_ENABLED_TENANTS=[]` until the canary device is enrolled and reporting protocol 2, then enable it for that tenant by name — the acceptance suite creates unattended sessions, so it cannot run while the allowlist is empty. Named tenants only, never `"*"`. Follow the [unattended production rollout runbook](docs/unattended-production-rollout.md) for deployment order, evidence gates, and rollback.
+Backend deployment remains a separate Wrangler operation. The tenant allowlists live in `apps/backend/wrangler.jsonc`, which is authoritative — enable a tenant only once its canary device is enrolled and reporting protocol 2, and name tenants explicitly, never `"*"`. Follow the [unattended production rollout runbook](docs/unattended-production-rollout.md) for deployment order, evidence gates, and rollback.
 
 ## Preserve attended proof history
 

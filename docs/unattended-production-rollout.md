@@ -776,7 +776,11 @@ Understudy's `/health` returns only `{"ok":true}` — there is **no commit stamp
 
 Record the allowlist deployment and version IDs before running acceptance.
 
-**`SAFE_WRITE_REQUIRED_TENANTS` is not an active control here — do not record it as one.** Its check sits on the legacy command path, reached only when the caller omits `understudy-command-contract: 2` *and* the extension is protocol-1. `@understudy/connector` has sent that header unconditionally since 0.5.0, and Metamind routes every command through the connector, so the flag cannot fire for this tenant in any phase. The protection it is named for is already unconditional for every tenant in `dispatchV2`, which refuses a non-dryRun write from a protocol-1 extension with the identical 426. Set it as a downgrade guard against a future caller on an older connector; expect it never to fire, and do not read its silence as evidence.
+**`SAFE_WRITE_REQUIRED_TENANTS` will not fire for Metamind — but it is not redundant, so set it.** Its check sits on the legacy command path, reached only when all of: the caller omits `understudy-command-contract: 2`, the session is attended, and the extension is protocol-1. `@understudy/connector` has sent that header unconditionally since 0.5.0 and Metamind routes every command through the connector, so Metamind never reaches it.
+
+On that path, however, this flag is the **only** refusal: `dispatch()` in `apps/backend/src/session.ts` does not check the protocol version, so with the tenant unlisted a protocol-1 write executes against a logged-in profile. `dispatchV2` refuses the same write with an identical 426, but only for callers that reach it — and the legacy path is by definition the one that does not.
+
+Record it as an armed guard that this tenant's traffic never exercises. Do not record its silence as evidence that it works, and do not omit it for a future tenant on the grounds that `dispatchV2` covers the case: it does not cover this one.
 
 ### Run the Chromium acceptance suite
 

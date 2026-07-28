@@ -17,6 +17,12 @@ export default defineConfig({
           CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),
           EXTENSION_TOKENS: JSON.stringify(EXTENSION_TOKENS),
           DEVICE_TOKENS: "{}",
+          // Pinned so the suite's baseline is a TEST value, not whatever the
+          // rollout has left in wrangler.jsonc. Without these the allowlists are
+          // inherited from a production knob, and editing that knob silently
+          // moves every test that does not set them explicitly.
+          UNATTENDED_ENABLED_TENANTS: "[]",
+          SAFE_WRITE_REQUIRED_TENANTS: "[]",
           WS_TICKET_SECRET: "test-ticket-secret-do-not-use-in-prod",
           VAULT_MASTER_KEY: TEST_VAULT_MASTER_KEY,
           QUOTA_POLICY: JSON.stringify({

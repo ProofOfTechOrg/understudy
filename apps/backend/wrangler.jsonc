@@ -96,16 +96,20 @@
     // callers never reach it. This is the live blast-radius control for
     // unattended traffic: named tenants only, NEVER "*" — enabledForTenant
     // honours "*" and it would admit every tenant that holds a caller token.
-    "UNATTENDED_ENABLED_TENANTS": "[\"metamind\"]",
-    // A downgrade guard, NOT the safe-write control. Its check in src/index.ts
-    // sits on the legacy command path, reached only when the CALLER omits
-    // `understudy-command-contract: 2` AND the extension is protocol-1.
-    // @understudy/connector has sent that header unconditionally since 0.5.0, so
-    // this never fires for a consumer on a current connector — it guards a caller
-    // on an older one, or a hand-rolled POST. The protection it is named for is
-    // already unconditional for every tenant: dispatchV2 in src/session.ts
-    // refuses a non-dryRun write from a protocol-1 extension with the same 426.
-    "SAFE_WRITE_REQUIRED_TENANTS": "[\"metamind\"]"
+    "UNATTENDED_ENABLED_TENANTS": "[]",
+    // On the LEGACY command path this flag is the only thing refusing a
+    // protocol-1 write — `dispatch()` in src/session.ts does not check the
+    // protocol version, so with this empty the write executes. Only `dispatchV2`
+    // refuses one, and the legacy path is by definition the path that does not
+    // reach it. Do not read this as redundant with dispatchV2.
+    //
+    // That path is reached only when ALL of: the caller omits
+    // `understudy-command-contract: 2`, the session is attended, and the
+    // extension is protocol-1. @understudy/connector has sent that header
+    // unconditionally since 0.5.0, so a consumer on a current connector never
+    // gets there — this guards a caller on an older one, or a hand-rolled POST.
+    // Enable it for a tenant whenever that tenant is enabled above.
+    "SAFE_WRITE_REQUIRED_TENANTS": "[]"
   },
   "analytics_engine_datasets": [
     {
