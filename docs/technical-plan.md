@@ -214,18 +214,19 @@ Analytics Engine receives content-free events for authentication, allocation, li
 
 ## Rollout gates
 
-Production configuration starts with `UNATTENDED_ENABLED_TENANTS=[]`. Deploy the additive Durable Object migration and dual-protocol backend before enabling any tenant.
+Production configuration starts with `UNATTENDED_ENABLED_TENANTS=[]`. Deploy the additive Durable Object migration and dual-protocol backend before enabling any tenant. The [unattended production rollout runbook](unattended-production-rollout.md) is the canonical execution procedure and status ledger.
 
-Rollout order:
+The conceptual rollout order is:
 
-1. Build and load the production extension in a tenant-dedicated profile
-2. Enroll one canary device and confirm protocol 2
-3. Enable one tenant
-4. Complete the real-Chromium acceptance suite
-5. Run a 24-hour read-only soak
-6. Enable remaining tenants after zero unexpected unknown writes and correct expiry behavior
+1. Make the governed Metamind consumer compatible and recoverable while it remains attended
+2. Establish a migration-`v2`, flags-off Understudy rollback baseline
+3. Accept one canary device and complete the real-Chromium suite
+4. Run a 24-hour read-only soak
+5. Prove one unattended Metamind workflow with correlated audit and durable cleanup
+6. Ramp allowlisted traffic through `1 → 5 → all`
+7. Complete the final 24-hour operational soak
 
-Rollback disables new leases first, drains or terminalizes active leases and granted commands, then rolls back application code. Never remove the additive migration or deploy protocol-1-only code while protocol-2 leases exist.
+Rollback returns Metamind to attended mode, returns Understudy to the recorded migration-`v2`, flags-off version, confirms new leases are disabled, and drains active leases. Never remove the additive migration, target the earlier migration-`v1` version, or deploy protocol-1-only code while protocol-2 leases exist.
 
 ## Historical attended proof
 
