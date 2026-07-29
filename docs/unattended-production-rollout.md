@@ -919,7 +919,32 @@ Two operational notes:
 - **`wrangler secret put` is not immediately visible.** A freshly added digest answered `401` for roughly eight seconds before answering `400`. Checking straight after the put yields a false negative; poll until it flips.
 - **Keep the canonical credential file canonical.** `~/.understudy-canary/device-credential.json` now holds the live v2 credential; the superseded one is `device-credential-v1-REVOKED.json`. Leaving a dead credential under the name every runbook step references is a trap for the next re-enrolment, which — see the enrolment-loss entry above — may be needed without warning.
 
-Still outstanding, each needing an operator at the browser or elapsed time: hard and idle expiry, attended compatibility. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
+#### Attended compatibility PASSED, run concurrently with unattended (2026-07-29)
+
+Run as a **coexistence** test rather than the minimum the scenario describes: an unattended session was left hosting a controlled tab while the operator attached an attended session to a tab of their own. "Reports only that tab" is only meaningful when there is another controlled tab in the same profile for it to fail to report.
+
+| Criterion | Evidence |
+|---|---|
+| Attaches to the user's own tab | Attended session bound tab `2134210639` (`https://www.google.com/`), operator-opened |
+| Reports only that tab | `get_tabs` returned exactly it; the unattended tab `2134210638` was invisible to it |
+| **Negotiates protocol 2 after attachment** | A **write sent with no `understudy-command-contract` header** was accepted. With `SAFE_WRITE_REQUIRED_TENANTS` naming this tenant, a protocol-1 extension would have drawn `426` on that exact request. It did not, so the extension negotiated v2 itself rather than the caller's header carrying it |
+| Snapshot and an approved action | a11y snapshot returned 25 nodes on the correct `tabId`; `key` write `ok: true` |
+| Coexistence | Throughout, the unattended session still reported only tab `2134210638` and device usage held at `1/2` |
+| Detach leaves the tab open | Operator-confirmed: the tab survived `Detach tab` |
+
+The protocol-2 check is worth reusing. Sending a write **without** the contract header turns `SAFE_WRITE_REQUIRED_TENANTS` into a live probe of what the *extension* negotiated — the only way to test it from the caller side, since supplying the header would satisfy the v2 branch regardless of the extension.
+
+**Observation — `Detach tab` does not change the reported status.** After detaching, the session still reads `status: "connected"` with `browser` present, while every command answers:
+
+```json
+{"type":"action_result","ok":false,"error":"no active CDP session"}
+```
+
+`detached` is set only when the WebSocket itself closes, or on an epoch change, device revocation, or terminal close. Detaching the debugger keeps the socket open and reports nothing to the backend, and the attended status enum — `pending | connected | detached` — has no state for "socket up, nothing attached".
+
+Not a silent failure: the consumer gets an explicit per-command error rather than a false success, and Metamind's flow surfaces it. But a consumer that gates on status alone would see `connected` and be wrong. Recorded as an observation, not a defect — the status plausibly tracks the socket by design — and left for the owner to decide.
+
+Still outstanding: hard and idle expiry, which are best evidenced by the Phase 3b soak rather than waited on. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
 
 ### Run the read-only soak
 
