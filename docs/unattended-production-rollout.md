@@ -942,7 +942,11 @@ The protocol-2 check is worth reusing. Sending a write **without** the contract 
 
 `detached` is set only when the WebSocket itself closes, or on an epoch change, device revocation, or terminal close. Detaching the debugger keeps the socket open and reports nothing to the backend, and the attended status enum — `pending | connected | detached` — has no state for "socket up, nothing attached".
 
-Not a silent failure: the consumer gets an explicit per-command error rather than a false success, and Metamind's flow surfaces it. But a consumer that gates on status alone would see `connected` and be wrong. Recorded as an observation, not a defect — the status plausibly tracks the socket by design — and left for the owner to decide.
+Not a silent failure: the consumer gets an explicit per-command error rather than a false success, and Metamind's flow surfaces it. But a consumer that gates on status alone would see `connected` and be wrong.
+
+**Ruled a defect, and deferred rather than dismissed** — see [`DEFERRED.md`](../DEFERRED.md), "Attended session status cannot express *connected but not attached*". It is deferred because the fix adds a value to `AttendedSessionStatusSchema`, which consumers parse with, so it is a breaking protocol change needing a connector release and a coordinated consumer upgrade — not something to land mid-acceptance. It does not block Phase 3a: execution is correct, only the reported status is wrong.
+
+The wider case matters more than the button. `chrome.debugger.onDetach` fires when the controlled tab is **closed**, or when the operator clicks **Cancel** on Chrome's debugger banner, and neither notifies the backend either. That is the mechanical reason the extension runbook says not to touch that banner.
 
 Still outstanding: hard and idle expiry, which are best evidenced by the Phase 3b soak rather than waited on. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
 
