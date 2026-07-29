@@ -895,7 +895,31 @@ Both halves of the safety property therefore hold: the service says `unknown` wh
 
 Not reproduced: a kill landing *inside* execution, which needs a long-running write (`navigate` is the only command that waits on page load). Every candidate slow page on the practice site returned in under a second, so the window was never wide enough to aim at. Recorded as un-run rather than passed.
 
-Still outstanding, each needing an operator at the browser or elapsed time: device credential rotation, hard and idle expiry, attended compatibility. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
+#### Device credential rotation PASSED, with zero downtime (2026-07-29)
+
+Rotated by overlap — the new digest is added beside the old, the extension switches, then the old digest is removed. The device never left `online`.
+
+| Stage | v1 credential | v2 credential |
+|---|---|---|
+| Both digests in `DEVICE_TOKENS` | `400` — authenticates | `400` — authenticates |
+| Extension re-enrolled on v2 | **`404 device not found`** | active, device `online` |
+| v1 digest removed | **`401`** | `400` |
+
+The two refusals are at different layers, and the difference is the point. While its digest was still present, v1 **authenticated** (`authenticateDevice` found it) but was **not authorized**: `authorizeCredential` in `src/device.ts` rejects `credentialVersion 1` against an authority advanced to `2`. Only after the digest was deleted did it fail authentication outright. Rotation is therefore enforced by the recorded authority, not merely by removing the secret — deleting the digest is cleanup, not the control.
+
+Against the phase's four conditions:
+
+- **New credential reconnects** — confirmed, device `online` on v2 unaided.
+- **Old control socket closes** — by construction: a version advance closes every open connection with `1008 device credential rotated`, which is not one of the blocking close codes, so the extension reconnects rather than latching to `error`. Not observed directly; the extension had already reconnected before the first poll. The authority advance is proven independently by v1's `404`.
+- **Old tickets fail** — v1 cannot mint one at all (`404`). For an *already-minted* ticket, `src/device.ts` requires `claims.credentialVersion === authority.credential_version` — exact equality — and checks it **twice**, re-reading the authority after `consumeTicket` so a rotation racing an in-flight accept still closes as `1008 stale device ticket`. Tickets are single-use besides.
+- **No replayed ticket replaces the authoritative socket** — verified by code inspection only. It could not be executed: rotation fences minting first, so no valid unexpired v1 ticket can exist afterwards to replay. That is a stronger guarantee than the condition contemplates, but it is inspection rather than execution and is recorded as such.
+
+Two operational notes:
+
+- **`wrangler secret put` is not immediately visible.** A freshly added digest answered `401` for roughly eight seconds before answering `400`. Checking straight after the put yields a false negative; poll until it flips.
+- **Keep the canonical credential file canonical.** `~/.understudy-canary/device-credential.json` now holds the live v2 credential; the superseded one is `device-credential-v1-REVOKED.json`. Leaving a dead credential under the name every runbook step references is a trap for the next re-enrolment, which — see the enrolment-loss entry above — may be needed without warning.
+
+Still outstanding, each needing an operator at the browser or elapsed time: hard and idle expiry, attended compatibility. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
 
 ### Run the read-only soak
 
