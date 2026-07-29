@@ -802,6 +802,29 @@ Execute every scenario in [`apps/extension/RUNBOOK.md`](../apps/extension/RUNBOO
 
 Stop the rollout on any cross-tab routing, duplicate tab, capacity leak, unexpected recovery, origin escape, expiry mismatch, or granted write replay.
 
+#### Results: the API-driven scenarios PASSED (2026-07-29)
+
+Run against Understudy version `e0673967-0ca5-4cca-81ee-50d4088cec33` on device `aaf119f2-a85f-46b4-8b53-8e92196d6275`, with two sessions on the enrolled origins — `https://example.com` / `account_one` and `https://practice.expandtesting.com` / `account_two_b`.
+
+| Scenario | Evidence |
+|---|---|
+| Two-tab routing isolation | Both `201 connected`. Each status reports exactly one tab, with **distinct** ids (`2048900216`, `2048900218`) |
+| Command routing, reads | Concurrent `get_tabs` to both sessions returned only each session's own tab |
+| Command routing, writes | `type` landed in its own session (`value: "canary-acceptance"`); the other session unchanged — same tab id, same URL |
+| **Cross-session ref isolation** | The identical ref that succeeds in one session is refused in the other: `stale or unknown ref`. Refs embed the session id, so a write cannot be aimed across sessions |
+| Capacity failure | Third session → `429 device capacity exhausted` |
+| Origin collision failure | Overlapping origin, new profile key → `409` |
+| Profile-state collision failure | Disjoint origin, reused profile key → `409`. **Control:** disjoint origin + new profile key → `201`, so the refusals are the collision and nothing else |
+| Redirect containment | Same-origin `302` followed to `/status-codes` with `ok: true` — containment does not break legitimate redirects |
+| **Exact-origin boundary** | A session scoped to `practice.expandtesting.com` is refused `expandtesting.com` — the parent domain is a different origin. A suffix-matching implementation would have passed this and must not |
+| Paused-popup containment | Clicking `/windows`' new-window link left the session at **one** tab, still on `/windows` |
+| Cross-origin subresources | `/iframe` rendered 60 nodes — containment is top-level navigation only, as intended |
+| One-slot cleanup | `DELETE` → `202`, status `closed` on the first poll, device usage `2 → 1` |
+
+Origin containment is enforced **per session**, not merely per device: session one was refused `practice.expandtesting.com` even though the device's own policy allows it.
+
+Still outstanding, each needing an operator at the browser or elapsed time: service-worker eviction, Chrome restart, unknown write outcome, device credential rotation, hard and idle expiry, attended compatibility. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
+
 ### Run the read-only soak
 
 Run the complete 24-hour read-only soak. Do not proceed if any event remains unexplained:
