@@ -853,25 +853,49 @@ Run as the phase specifies — a **graceful** quit, reopened inside the 90-secon
 
 The device also reconnected **on its own** — `recovering → online` in about thirteen seconds, usage held at `2/2`.
 
-#### An unclean kill de-enrols the device (2026-07-29)
+#### A device lost its enrolment once, cause UNKNOWN (2026-07-29)
 
-Found by accident, and worth recording because it is invisible from the extension UI.
+**Observed once. Not reproducible. An earlier revision of this section blamed `SIGKILL`; that explanation is retracted — the second run disproved it.**
 
-The first attempt at this test used `pkill -9 chrome`, to combine it with the unknown-write scenario. On reopen the device never came back. The cause was not a control block or a revoked credential: the extension's **entire enrolment was gone from `chrome.storage.local`** — service origin, device id, credential and origin policy all blank, and unattended hosting unticked. `ProfileClient` therefore loaded `config === null` and reported status `disabled`.
+What happened. The first attempt at the restart test used `pkill -9 chrome`, to combine it with the unknown-write scenario. On reopen the device never returned, and not because of a control block or a revoked credential: the extension's **entire enrolment was gone from `chrome.storage.local`** — service origin, device id, credential and origin policy all showing placeholder text, unattended hosting unticked. `ProfileClient` loaded `config === null` and reported status `disabled`.
 
-A graceful quit, run immediately afterwards on the same profile, preserved the enrolment completely. That isolates it: `SIGKILL` discarded `storage.local` writes that a clean shutdown flushes.
+A graceful quit immediately afterwards preserved the enrolment, which looked like clean isolation: `SIGKILL` discards writes a clean shutdown flushes. It was written up that way.
 
-Consequences for operating an unattended fleet:
+Then the unknown-write test ran a **second** `pkill -9 chrome` on the same profile, and the enrolment survived intact — the panel came back `connected` with no operator action. Same command, same machine, same profile, opposite result.
 
-- A browser crash, OOM kill, or power loss can silently disarm an unattended host. Recovery needs a human, because the credential field is write-only and cannot be read back from the extension.
-- The extension surfaces this as `disabled`, which is **indistinguishable from an operator having switched hosting off**. The reliable signal is server-side: the device stops heart-beating and `GET /v1/devices` reports it `offline`. Alert on that, not on extension status.
-- The leases do not survive it either. They aged past `BROWSER_LEASE_UNSTARTED_GRACE_MS` while nothing reconnected and went `lost`, which is correct behaviour but means an unclean kill costs the in-flight work outright.
+The timing argues against the flush theory too. The enrolment that vanished was about 82 minutes old; the one that survived was about 8. An unflushed-write explanation predicts the opposite.
 
-This is a durability property of `chrome.storage.local` under `SIGKILL`, not a defect in this repo's code. It is recorded because the ramp plan assumes an unattended host recovers unaided, and across an unclean termination it does not.
+So the cause is unknown. Candidates, none verified:
 
-Method note: combining the restart and unknown-write scenarios into a single kill was a mistake — it ran the restart test under a termination it was never specified for, and confounded two findings that have very different severity. Run them separately.
+- the first reopen landed on a **different Chrome profile** — unpacked extensions and their storage are per-profile, which would explain empty storage completely, and is the cheapest thing to rule out next time by checking the profile before drawing any conclusion;
+- a one-off loss or corruption of that profile's extension storage;
+- something left over from the service-worker eviction test that immediately preceded the first kill.
 
-Still outstanding, each needing an operator at the browser or elapsed time: unknown write outcome, device credential rotation, hard and idle expiry, attended compatibility. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
+What to do with this: **do not treat enrolment loss as an expected consequence of an unclean shutdown, and do not treat it as impossible either.** If it recurs, capture the Chrome profile path and `chrome://version` before reopening. What is worth carrying regardless is the failure signature — a de-enrolled extension reports `disabled`, which is indistinguishable from an operator having switched hosting off. The dependable signal is server-side: the device stops heart-beating and `GET /v1/devices` reports it `offline`. Alert on that, never on extension status.
+
+Method note: combining the restart and unknown-write scenarios into a single kill was a mistake — it ran the restart test under a termination it was never specified for, produced a finding that took a second run to falsify, and cost a re-enrolment. Run them separately.
+
+#### Unknown write outcome: PASSED, with a better answer than the gate asks for
+
+The gate expects a write killed in flight to poll back `command_outcome_unknown` with `safeToRetry: false`. What happens is more precise than that, and the distinction is worth understanding before anyone "fixes" it.
+
+Writes are two-phase — `write_prepare` → `write_ready` → `write_grant` → execute → result. The extension journals each transition, so the backend knows which phase a dead attempt died in. Killing Chrome under a continuous stream of `key` writes produced:
+
+| Command | Sent | Durable status |
+|---|---|---|
+| ten writes | `200` | `completed`, `safeToRetry: false` |
+| the one killed in flight | `504` | **`not_started`, `safeToRetry: true`** |
+| the next one | `503` | no record — refused before one existed |
+
+The killed write is reported `not_started` **and safe to retry**, because the journal proves it never reached execution. That is strictly better than `unknown`: the caller can retry it without risking a double write. Reporting `unknown` there would be a needless loss of information.
+
+`command_outcome_unknown` with `safeToRetry: false` is reached on the restart path instead, and was confirmed under "Chrome restart" above — after the browser epoch changes, every write for the session answers exactly that until the caller deletes it.
+
+Both halves of the safety property therefore hold: the service says `unknown` when it genuinely cannot know, and refuses to say `unknown` when it *can* prove nothing executed. The truly ambiguous window is only the CDP execution itself, which for a `key` command is milliseconds — by design, and why a kill lands in the safe window nearly every time.
+
+Not reproduced: a kill landing *inside* execution, which needs a long-running write (`navigate` is the only command that waits on page load). Every candidate slow page on the practice site returned in under a second, so the window was never wide enough to aim at. Recorded as un-run rather than passed.
+
+Still outstanding, each needing an operator at the browser or elapsed time: device credential rotation, hard and idle expiry, attended compatibility. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
 
 ### Run the read-only soak
 
