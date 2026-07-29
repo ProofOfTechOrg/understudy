@@ -1023,9 +1023,50 @@ So Chrome was running normally, the machine was awake, and the extension's contr
 
 The device was `online` again when checked twelve hours later, so it recovered unaided — but **the recovery time is unknown**, and that is the single fact worth having. See the driver note below.
 
-**Leading hypothesis, unproven:** MV3 service-worker eviction with delayed revival. The extension keeps its socket alive with a 22-second pong and depends on a 30-second `chrome.alarms` backstop to revive an evicted worker. The Phase 3a eviction scenario recovered in about thirteen seconds — but that was with an operator at the machine driving it. Chrome throttles background work and alarm delivery aggressively once the system is idle, which would stretch the revival past the 75-second offline threshold and past the lease grace. Idle is exactly the condition an unattended host runs in, and exactly the condition Phase 3a never tested.
+**Trigger identified: a local network reconfiguration.** `journalctl` for the window shows Tailscale activating its interface and **reconfiguring DNS** at `06:02:16Z` — between the last good sample (`05:49:44Z`) and the death (`06:09:49Z`):
 
-If that is the cause, it is a **material finding for unattended operation**, not a soak artifact: it would mean an unattended device silently loses its sessions whenever the machine is left alone long enough, which is most of the time.
+```
+06:02:16Z  tailscaled: magicsock: derp-23 connected; connGen=1
+06:02:16Z  device (tailscale0): unmanaged -> unavailable -> ... -> activated
+06:02:16Z  tailscaled: wgengine: Reconfig: configuring DNS
+06:03:00Z  1password: The B5 Notifier has disconnected
+06:03:06Z  1password: The B5 Notifier has connected
+```
+
+1Password's long-lived notifier socket is the control: it dropped on the same event and was **back in six seconds**.
+
+**The product finding is the recovery, not the trigger.** A six-second network interruption is unremarkable — a VPN connecting, a Wi-Fi roam, a DNS change. Understudy's device was still `offline` at `06:09:49Z`, nearly seven minutes later, and its lease was already `lost`. One brief blip destroyed every session on the device, terminally.
+
+**Likely mechanism, inferred from timing rather than proven.** `ReconnectingWs` schedules its reconnect backoff with `setTimeout` (500 ms doubling to a 30 s cap). A `setTimeout` does not survive service-worker eviction — and once the socket is gone the worker has no activity keeping it alive, so it is evicted with the pending retry still queued. Recovery then depends on the 30-second `chrome.alarms` backstop, and a failed attempt repeats the cycle. Against `DEVICE_LOST_MS = 90_000` there is no margin.
+
+**A competing hypothesis that remains UNTESTED — the attempt to test it was invalid.** The first explanation offered here was MV3 eviction under system idle or a backgrounded Chrome. An 18-minute run was set up to test it, sampling the device every 15 seconds, and all 70 samples came back `online` with the heartbeat age never exceeding 23 seconds — tracking the 22-second pong exactly.
+
+That result proves nothing about the hypothesis, because the operator was opening and switching windows throughout: **Chrome was never sustainedly backgrounded, so the condition under test never actually held.** The run establishes only that the device is stable under normal interactive use, which was not in doubt.
+
+To test it properly the machine must be left genuinely alone — no window activity, Chrome fully occluded — for longer than the eviction and alarm cycle, with the device sampled from another host. Until then, treat backgrounding as **an open question, neither supported nor excluded**. The network-event explanation above stands on its own evidence and does not depend on resolving this.
+
+#### The 90-second cliff, and what it costs
+
+`apps/backend/src/tenant-coordinator.ts`:
+
+```ts
+const DEVICE_OFFLINE_MS = 75_000;   // reported offline
+const DEVICE_LOST_MS    = 90_000;   // every lease on the device -> 'lost'
+```
+
+At ninety seconds without a heartbeat the coordinator sets `status = 'lost'` **and `release_at`** on every lease the device holds. That is terminal: the session answers `410`, and the consumer must mint a new one. Ninety seconds is roughly four missed heartbeats, against a recovery path gated on a thirty-second alarm.
+
+**And the lost lease leaks a browser window.** The closure list a device receives on sync is:
+
+```sql
+WHERE device_id = ? AND status IN ('closing','expired') AND release_at IS NULL
+```
+
+A `lost` lease has `release_at` set, so it is **excluded** — the extension is never told to close that tab. Confirmed on this incident: run 1's tab `2134210655` was still open in its own window hours later, with the server reporting `used 1/2` and the side panel reporting `1/2`. The server's accounting is correct; the window is simply orphaned, and only a human will ever close it.
+
+**This is invisible to the soak.** The `capacity_leak` check tests `deviceUsed > 1`, which is server-side, and the server is right. A leaked *browser window* cannot be detected through the API at all — this one surfaced only because the operator looked at their own screen. The "no capacity leak" gate has therefore been measuring something narrower than its name suggests.
+
+Operational aside from the same incident: Chrome's debugger banner appears on windows of **other profiles**, not just the controlled one. The extension runbook says not to click its detach control, but an operator seeing it on an unrelated profile may reasonably dismiss it there — detaching the canary's debugger without realising.
 
 **Driver defect, mine.** v1 exited the moment the session went terminal. That preserved the failure evidence and stopped watching the device in the same instant — so the recovery, the one thing that would discriminate between hypotheses, went unrecorded. v2 never stops: it samples the device every 60 seconds and logs each status transition, continuing after the session dies, since a dead session is the beginning of the interesting part rather than the end of it. Reads stop when there is nothing left to refresh; device sampling does not.
 
