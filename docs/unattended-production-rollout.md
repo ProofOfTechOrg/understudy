@@ -43,7 +43,7 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Phase 1b: Metamind attended deployment and proof | Passed | Metamind `434c1a7f5c368d4910c78c59997623762185fda8` (merged to `master`) | Version `3f1ba280-6cbe-480c-89fd-47b4daf2f731` at `2026-07-28T06:18:01Z`, message `release 434c1a7f5c368d4910c78c59997623762185fda8`. Superseded at `2026-07-28T16:29:30Z` by version `56fb278f-15f3-40f1-ab3b-a0276d123bfa` (`b70c40e39b74a98f79199634a5390d32610b180e`), which repointed `UNDERSTUDY_URL` at the routed domain | D1 lease migration applied BEFORE the first promotion: `changes: 1, changed_db: true, num_tables: 34`; `browser_session_leases` present with both indexes and queryable post-deploy. `/health.commit` confirmed by consecutive matching reads at each deploy. [PR #18](https://github.com/ProofOfTechOrg/metamind/pull/18), [PR #19](https://github.com/ProofOfTechOrg/metamind/pull/19), [PR #20](https://github.com/ProofOfTechOrg/metamind/pull/20). Smoke: `/` 302 to `/app/`, `/app/` 200, `/v1` 401 unauthenticated. **Attended production proof PASSED** on run `metamind_efefdb2e-2aed-441a-af6b-527e640c816f` — all eight gates in the table below, including a datum read from behind a portal login and a lease `released` on a confirmed 204. Three attempts were needed; the first two failed on consumer defects, all fixed. **Phase 1's durable-cleanup guarantee is met on the attended path**: the `16:30Z` sweep cleared four real orphans (three `minting`, one `cleanup_pending` carrying the 404) to `released` with null errors. All six leases are `mode=attended`, so the unattended replay remains unproven until Phase 4 — see the scope limit under the resolution | `2026-07-28T16:30:22Z` | Release operator |
 | Phase 2: Understudy `v2`, flags-off rollback baseline | Passed | `5cc969024b32380f1a3e14ff6f72e8d0c808b086` (deployed; approved at `dd7c100343cfc15e02802d93831600e0535670ed`) | Deployment `1c32a8e9-bf87-49eb-89a5-253ea4e47d1a`, version **`7eff2d11-2ba5-420b-b1f2-113faf0d6f73`** at `2026-07-28T04:29:57Z`, message `release dd7c100343cfc15e02802d93831600e0535670ed`. Previous baseline was version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Verified at the approved SHA on a detached checkout: `pnpm install --frozen-lockfile`, `build`, `typecheck`, `test` (408 tests: 194 backend, 139 extension, 43 protocol, 32 connector), `wrangler deploy --dry-run`. All six secret names confirmed present — `DEVICE_TOKENS` and `WS_TICKET_SECRET` were MISSING and were provisioned first (see below). Active version exports `SessionAgent`, `DeviceAgent`, `TenantDeviceCoordinator`; binds `SESSION`, `DEVICE`, `TENANT_CONTROL`, `ANALYTICS`, `RATE_LIMITER`, `VAULT`, all six secrets, `QUOTA_POLICY`, and both rollout variables at `"[]"`. `/health` returns `{"ok":true}`; an unmapped token gets `401`; a well-formed unattended request gets `503 unattended sessions are disabled`, proving the flags-off baseline. Caller token rotated on both sides (Metamind confirmed as the only caller). The attended `curl` smoke test returns `200` with a `sessionId` after Understudy `e0351f6` (version `8ec9be79-76bb-4140-9530-402b4a46a40e`) fixed the empty-body discrimination — it had answered `400` for every over-the-wire caller. Baseline then advanced to `5cc969024b32380f1a3e14ff6f72e8d0c808b086` (version `fd67173d-e402-420d-9437-77dbc1e6be4a` at `2026-07-28T09:43:59Z`), which serves Understudy at `understudy.proofof.tech` while keeping `workers.dev` explicitly enabled; both hostnames return `200` on `/health`. The Metamind attended proof PASSED against this version | `2026-07-28T11:03:08Z` | Release operator |
 | Phase 3a: canary device acceptance | In progress | `3493b243c0aa61fb06ec19ad5dcb4eb197a2d670` | Allowlist deployment: version **`e0673967-0ca5-4cca-81ee-50d4088cec33`** at `2026-07-29T03:12Z`, message `release 3493b243c0aa61fb06ec19ad5dcb4eb197a2d670 - enable unattended for metamind`. Uploaded bindings confirm `UNATTENDED_ENABLED_TENANTS` and `SAFE_WRITE_REQUIRED_TENANTS` both `["metamind"]`. Previous flags-off baseline was version `fd67173d-e402-420d-9437-77dbc1e6be4a` | Device `aaf119f2-a85f-46b4-8b53-8e92196d6275` enrolled and `GET /v1/devices` reports `status: "online"`, `capacity: 2`, `used: 0`, `Chrome/150.0.0.0`, extension `0.1.1`, heartbeat 41s against the 75s offline threshold. Protocol 2 is ENFORCED, not merely reported: `src/device.ts` closes the control socket on a `protocolVersion` mismatch, and `listDevices` reports `incompatible` without the `safe-write-v2` capability, so `online` is unreachable below protocol 2. Device stayed `online` across the allowlist deploy (heartbeat 6s after). Both hostnames return `200`. **Remaining: the 13-scenario Chromium acceptance suite**, which needs an operator at the browser | Pending | Canary operator |
-| Phase 3b: 24-hour read-only soak | Not started | Pending | Pending | Pending | Pending | Canary operator |
+| Phase 3b: 24-hour read-only soak | In progress | Understudy `3493b243c0aa61fb06ec19ad5dcb4eb197a2d670` | Version `e0673967-0ca5-4cca-81ee-50d4088cec33` (unchanged for the duration) | Read-only session on `https://example.com`, tab `2134210655`, started `2026-07-29T05:28:35Z`, hard expiry due `2026-07-30T05:28:35Z`. Driven by `~/.understudy-canary/soak-driver.sh` — one `get_tabs` every 20 minutes, inside the 2h idle window with margin — appending a JSONL sample per read to `~/.understudy-canary/soak.jsonl`. First sample clean: `tabs_result`, `connected`, one tab, `deviceUsed: 1`, no anomalies; `idleExpiresAt` advanced on the read, confirming the refresh mechanism. **Remaining: 24 hours of elapsed time, then the closeout audit** | Pending | Canary operator |
 | Phase 4: governed Metamind unattended proof | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 5a: one-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 5b: five-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
@@ -948,7 +948,21 @@ Not a silent failure: the consumer gets an explicit per-command error rather tha
 
 The wider case matters more than the button. `chrome.debugger.onDetach` fires when the controlled tab is **closed**, or when the operator clicks **Cancel** on Chrome's debugger banner, and neither notifies the backend either. That is the mechanical reason the extension runbook says not to touch that banner.
 
-Still outstanding: hard and idle expiry, which are best evidenced by the Phase 3b soak rather than waited on. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
+#### The two visual confirmations, re-run properly (2026-07-29)
+
+Both had been asserted server-side earlier but never seen, so they were re-run with an operator watching rather than signed off on inference. Two sessions were provisioned — each lands in its **own extension-created window** (`windows.create` in the extension's provisioner), so the observable unit is windows, not tabs.
+
+| Check | Operator observation |
+|---|---|
+| Baseline | 2 extension windows |
+| Popup containment | Clicked `/windows`' new-window link. **Still 2** — no third window survived. Server-side the session stayed at one tab on `/windows` and usage held `2/2` |
+| One-slot cleanup | `DELETE` of one session left **exactly 1** window, the surviving session's, still showing its own page. Server-side: deleted session `closed`, usage `2 → 1`, survivor answered a live command on its original tab id |
+
+Both now rest on what was seen, not on what was inferred from a tab count in a status response.
+
+### Phase 3a is complete except expiry
+
+Fifteen of the suite's scenarios pass. The one remaining — **hard and idle expiry** — cannot be compressed from the caller side: idle is two hours and hard is twenty-four. It is evidenced by the Phase 3b soak rather than waited on separately, since that run exercises both bounds by construction: continuous reads must keep idle from ever firing, and hard expiry must fire at the 24-hour mark regardless.
 
 ### Run the read-only soak
 
@@ -962,6 +976,30 @@ Run the complete 24-hour read-only soak. Do not proceed if any event remains une
 - Hard-expiry or idle-expiry mismatch
 
 Record the device acceptance operator record, extension SHA, Understudy deployment and version IDs, start and end timestamps, telemetry, and final device usage.
+
+#### Soak in progress — started 2026-07-29T05:28:35Z
+
+| Field | Value |
+|---|---|
+| Session | read-only, `https://example.com`, tab `2134210655` |
+| Understudy | `3493b243c0aa61fb06ec19ad5dcb4eb197a2d670`, version `e0673967-0ca5-4cca-81ee-50d4088cec33` |
+| Extension | `0.1.1`, built from `5cc969024b32380f1a3e14ff6f72e8d0c808b086` |
+| Device | `aaf119f2-a85f-46b4-8b53-8e92196d6275`, credential **version 2** after the rotation above |
+| Hard expiry due | `2026-07-30T05:28:35Z` |
+| Driver | `~/.understudy-canary/soak-driver.sh`, one `get_tabs` every 20 minutes |
+| Evidence | `~/.understudy-canary/soak.jsonl`, one JSON line per read |
+
+**The driver runs detached on purpose.** A schedule living inside an assistant session dies with that session; idle expiry would then fire at the two-hour mark and fail the soak for a reason that has nothing to do with the service. It is started with `setsid nohup` so it outlives whatever started it, and stops on `touch ~/.understudy-canary/soak.stop` or when the session answers `410`.
+
+Each sample records session status, tab count and id, current URL, both expiry stamps, device status and usage, and an `anomalies` array keyed to exactly the six events listed above — plus `needs_reconciliation`, which is the earliest visible sign of several of them. Audit at the end with:
+
+```bash
+node -e 'const l=require("fs").readFileSync(process.env.HOME+"/.understudy-canary/soak.jsonl","utf8").trim().split("\n").map(JSON.parse);
+console.log("samples:",l.length,"| with anomalies:",l.filter(s=>s.anomalies&&s.anomalies.length).length);
+for(const s of l.filter(s=>s.anomalies&&s.anomalies.length)) console.log(s.at,s.anomalies.join(","));'
+```
+
+Operator prerequisite for the duration: the machine and Chrome stay awake, and the canary profile stays logged in. A laptop suspending mid-soak invalidates the run — it reads as an unexplained recovery rather than as the sleep it was.
 
 ## Phase 4: Switch Metamind to unattended and prove governance
 
