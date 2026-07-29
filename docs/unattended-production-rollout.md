@@ -1072,9 +1072,13 @@ Operational aside from the same incident: Chrome's debugger banner appears on wi
 
 Run 1's evidence is archived as `~/.understudy-canary/soak-run1-FAILED-*.jsonl`.
 
-#### Run 2 — started 2026-07-29T18:10:33Z
+#### Run 2 — HALTED DELIBERATELY after 61 clean minutes
 
-Same shape, on the v2 driver. Session tab `2134211768`, hard expiry due `2026-07-30T18:10:33Z`. A recurrence now produces a timestamped `device_change` transition rather than a silence.
+Started `2026-07-29T18:10:33Z` on the v2 driver, stopped `19:12:23Z`. Four reads, **zero anomalies**, one `device_change` event (`none -> online:1`) at start and nothing after — the device held `online:1` throughout.
+
+It was halted, not failed. It had already passed the 40-minute mark where run 1 died, which supports the network event as run 1's cause rather than anything periodic. Stopped because the diagnosis in `docs/plan-network-blip-resilience.md` deliberately breaks connectivity, which would destroy a running soak and confuse the two results. Evidence archived as `~/.understudy-canary/soak-run2-HALTED-*.jsonl`.
+
+**Phase 3b restarts from zero once the network-blip work concludes.** A soak that passes while that defect is live proves little, and one that fails on a random network transition costs another day.
 
 ## Phase 4: Switch Metamind to unattended and prove governance
 
