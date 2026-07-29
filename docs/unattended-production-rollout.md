@@ -823,7 +823,55 @@ Run against Understudy version `e0673967-0ca5-4cca-81ee-50d4088cec33` on device 
 
 Origin containment is enforced **per session**, not merely per device: session one was refused `practice.expandtesting.com` even though the device's own policy allows it.
 
-Still outstanding, each needing an operator at the browser or elapsed time: service-worker eviction, Chrome restart, unknown write outcome, device credential rotation, hard and idle expiry, attended compatibility. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
+#### Service-worker eviction PASSED (2026-07-29)
+
+The worker was stopped from its DevTools while two sessions were live. Understudy saw the control socket drop — device `recovering`, heartbeat ageing 10s → 21s — and the extension's own 30-second `ws-backstop` alarm revived it without operator action.
+
+| Criterion | Evidence |
+|---|---|
+| Same-epoch restore, not recreate | Tab ids **unchanged** across the eviction (`2048900216`, `2048900221`) |
+| No duplicate tabs | One tab per session throughout |
+| No capacity leak | Device usage held `2/2` |
+| Live afterwards | Both sessions answered a real `get_tabs` |
+
+URLs survived as well, which is correct here and is exactly what must NOT happen on a restart — `chrome.storage.session` persists across eviction and clears across restart. That difference is the discriminator between the two tests.
+
+Not covered: "a completed unacknowledged result replays" needs a command that finishes while its ack is lost, which this run did not produce.
+
+#### Chrome restart PASSED (2026-07-29)
+
+Run as the phase specifies — a **graceful** quit, reopened inside the 90-second grace.
+
+| Criterion | Evidence |
+|---|---|
+| Fresh blank tab per live lease | Both tabs `about:blank` |
+| Attachments and refs rotate | Tab ids `2134210334 → 2134210476`, `2134210336 → 2134210478` |
+| No prior URL restored | `https://example.com/` and `/login` both gone |
+| Session reports reconciliation | Both `connected`, `needsReconciliation: false` |
+| New writes blocked | Reads still `200`; every write `409 command_outcome_unknown`, `safeToRetry: false` |
+| Until DELETE and a new session | After `DELETE` (usage `2 → 0`) a fresh session accepted a write, `ok: true` |
+
+The device also reconnected **on its own** — `recovering → online` in about thirteen seconds, usage held at `2/2`.
+
+#### An unclean kill de-enrols the device (2026-07-29)
+
+Found by accident, and worth recording because it is invisible from the extension UI.
+
+The first attempt at this test used `pkill -9 chrome`, to combine it with the unknown-write scenario. On reopen the device never came back. The cause was not a control block or a revoked credential: the extension's **entire enrolment was gone from `chrome.storage.local`** — service origin, device id, credential and origin policy all blank, and unattended hosting unticked. `ProfileClient` therefore loaded `config === null` and reported status `disabled`.
+
+A graceful quit, run immediately afterwards on the same profile, preserved the enrolment completely. That isolates it: `SIGKILL` discarded `storage.local` writes that a clean shutdown flushes.
+
+Consequences for operating an unattended fleet:
+
+- A browser crash, OOM kill, or power loss can silently disarm an unattended host. Recovery needs a human, because the credential field is write-only and cannot be read back from the extension.
+- The extension surfaces this as `disabled`, which is **indistinguishable from an operator having switched hosting off**. The reliable signal is server-side: the device stops heart-beating and `GET /v1/devices` reports it `offline`. Alert on that, not on extension status.
+- The leases do not survive it either. They aged past `BROWSER_LEASE_UNSTARTED_GRACE_MS` while nothing reconnected and went `lost`, which is correct behaviour but means an unclean kill costs the in-flight work outright.
+
+This is a durability property of `chrome.storage.local` under `SIGKILL`, not a defect in this repo's code. It is recorded because the ramp plan assumes an unattended host recovers unaided, and across an unclean termination it does not.
+
+Method note: combining the restart and unknown-write scenarios into a single kill was a mistake — it ran the restart test under a termination it was never specified for, and confounded two findings that have very different severity. Run them separately.
+
+Still outstanding, each needing an operator at the browser or elapsed time: unknown write outcome, device credential rotation, hard and idle expiry, attended compatibility. Two visual confirmations also remain — that cleanup closed exactly one tab, and that no stray popup window survived.
 
 ### Run the read-only soak
 
