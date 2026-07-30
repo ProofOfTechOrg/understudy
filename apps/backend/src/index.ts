@@ -1,35 +1,34 @@
 import { Hono, type Context } from "hono";
-import { getAgentByName, routeAgentRequest } from "agents";
+import { routeAgentRequest } from "agents";
 import { z } from "zod";
 import {
   CommandRequestSchema,
   SESSION_RESULT_FRAME_MAX_BYTES,
   UnattendedSessionRequestSchema,
-  isWriteCommand,
 } from "@understudy/protocol";
 import {
   authenticate,
   authenticatedRateAllowed,
   authenticateDevice,
-  mintSessionId,
   mintWsTicket,
   scopeSession,
   SESSION_IDEMPOTENCY_KEY_PATTERN,
-  telemetryPseudonym,
   verifyExtensionToken,
   verifyWsTicket,
 } from "./auth";
-import type { DeviceAgent } from "./device";
-import type { SessionAgent } from "./session";
-import type { TenantDeviceCoordinator } from "./tenant-coordinator";
-import type { DispatchOutcome, Env, V2DispatchOutcome } from "./types";
 import {
-  canonicalizeUnattendedRequest,
-  parseBoundedStrictJson,
-  parseStrictJsonText,
-  readBoundedBodyText,
-  RequestBodyError,
-} from "./validation";
+  createAttendedSession,
+  createSession,
+  deleteSession,
+  dispatchCommand,
+  getSessionStatus,
+  getTenantStub,
+  listDevices,
+  pollCommand,
+} from "./api/sessions";
+import type { DeviceAgent } from "./device";
+import type { Env, V2DispatchOutcome } from "./types";
+import { parseBoundedStrictJson, readBoundedBodyText, parseStrictJsonText, RequestBodyError } from "./validation";
 import { emitTelemetry } from "./telemetry";
 import type { Actor, DeviceIdentity } from "./auth";
 
@@ -41,17 +40,6 @@ const app = new Hono<{ Bindings: Env }>();
 const DeviceTicketRequestSchema = z
   .object({ browserEpoch: z.string().min(1).max(128) })
   .strict();
-
-function getSessionStub(env: Env, sessionId: string): Promise<DurableObjectStub<SessionAgent>> {
-  return getAgentByName(env.SESSION, sessionId);
-}
-
-function getTenantStub(
-  env: Env,
-  tenantId: string,
-): DurableObjectStub<TenantDeviceCoordinator> {
-  return env.TENANT_CONTROL.getByName(tenantId);
-}
 
 app.get("/health", (c) => c.json({ ok: true }));
 
@@ -84,23 +72,10 @@ app.post("/v1/sessions", async (c) => {
   }
 
   if (rawBody === "") {
-    const actorPseudonym = await telemetryPseudonym("actor", actor.actor, c.env);
-    if (
-      !(await getTenantStub(c.env, actor.tenantId).consumeSessionCreateQuota(
-        actorPseudonym,
-      ))
-    ) {
-      return c.json({ error: "session creation quota exceeded" }, 429);
-    }
-    const sessionId = await mintSessionId(actor.tenantId, c.env, idempotencyKey);
-    await emitTelemetry(c.env, {
-      event: "session_create",
-      outcome: "attended",
-      tenantId: actor.tenantId,
-      actor: actor.actor,
-      sessionId,
-    });
-    return c.json({ sessionId });
+    const result = await createAttendedSession(c.env, actor, idempotencyKey);
+    return result.kind === "quota_exceeded"
+      ? c.json({ error: "session creation quota exceeded" }, 429)
+      : c.json({ sessionId: result.sessionId });
   }
 
   let request: z.infer<typeof UnattendedSessionRequestSchema>;
@@ -112,42 +87,21 @@ app.post("/v1/sessions", async (c) => {
   if (idempotencyKey === undefined) {
     return c.json({ error: "idempotency-key is required for unattended sessions" }, 400);
   }
-  if (!enabledForTenant(c.env.UNATTENDED_ENABLED_TENANTS, actor.tenantId)) {
-    return c.json({ error: "unattended sessions are disabled" }, 503);
-  }
 
-  let canonical;
-  try {
-    canonical = await canonicalizeUnattendedRequest(request, actor.tenantId, c.env);
-  } catch (error) {
-    return bodyError(c, error);
-  }
-  const sessionId = await mintSessionId(actor.tenantId, c.env, idempotencyKey);
-  const actorPseudonym = await telemetryPseudonym("actor", actor.actor, c.env);
-  const coordinator = getTenantStub(c.env, actor.tenantId);
-  const allocation = await coordinator.createLease({
+  const result = await createSession(c.env, actor, {
+    request,
     idempotencyKey,
-    fingerprint: canonical.fingerprint,
-    sessionId,
-    ...(canonical.deviceId === undefined ? {} : { deviceId: canonical.deviceId }),
-    allowedOrigins: canonical.allowedOrigins,
-    profileStateHash: canonical.profileStateHash,
-    actorPseudonym,
+    requestUrl: c.req.url,
   });
-  await emitTelemetry(c.env, {
-    event: allocation.kind === "replay" ? "session_replay" : "session_create",
-    outcome: allocation.kind,
-    tenantId: actor.tenantId,
-    actor: actor.actor,
-    sessionId,
-    ...("lease" in allocation ? { deviceId: allocation.lease.deviceId } : {}),
-  });
-
-  switch (allocation.kind) {
-    case "conflict":
+  switch (result.kind) {
+    case "bad_request":
+      return c.json({ error: result.message }, result.status);
+    case "disabled":
+      return c.json({ error: "unattended sessions are disabled" }, 503);
+    case "idempotency_conflict":
       return c.json({ error: "idempotency key conflicts with its original request" }, 409);
     case "terminal":
-      return c.json({ sessionId, mode: "unattended", status: allocation.status }, 410);
+      return c.json({ sessionId: result.sessionId, mode: "unattended", status: result.status }, 410);
     case "device_not_found":
       return c.json({ error: "device not found" }, 404);
     case "no_device":
@@ -156,45 +110,20 @@ app.post("/v1/sessions", async (c) => {
       return c.json({ error: "device capacity exhausted" }, 429);
     case "collision":
       return c.json({ error: "origin or profile-state collision" }, 409);
-    case "created":
-    case "replay": {
-      const session = await getSessionStub(c.env, sessionId);
-      if (allocation.created) {
-        try {
-          await session.initializeUnattended(actor.tenantId, allocation.lease);
-          const device = c.env.DEVICE.getByName(
-            allocation.lease.deviceId,
-          ) as DurableObjectStub<DeviceAgent>;
-          if (!(await device.requestProvision(allocation.lease))) {
-            throw new Error("device connection unavailable");
-          }
-        } catch {
-          await coordinator.markProvisionFailed({
-            sessionId,
-            leaseId: allocation.lease.leaseId,
-            deviceId: allocation.lease.deviceId,
-            leaseEpoch: allocation.lease.leaseEpoch,
-            browserEpoch: allocation.lease.browserEpoch,
-          });
-          await session.markLifecycle("closing", true);
-          return c.json({ error: "device connection unavailable" }, 503);
-        }
-      }
-      const connected = await session.waitForProtocolV2Connection(5_000);
-      const location = sessionLocation(c.req.raw, sessionId);
-      if (!connected) {
-        c.header("Location", location);
-        c.header("Retry-After", "2");
-        return c.json(
-          { sessionId, mode: "unattended", status: allocation.lease.status },
-          202,
-        );
-      }
+    case "provision_failed":
+      return c.json({ error: "device connection unavailable" }, 503);
+    case "pending":
+      c.header("Location", result.location);
+      c.header("Retry-After", "2");
       return c.json(
-        { sessionId, mode: "unattended", status: "connected" as const },
-        allocation.created ? 201 : 200,
+        { sessionId: result.sessionId, mode: "unattended", status: result.status },
+        202,
       );
-    }
+    case "connected":
+      return c.json(
+        { sessionId: result.sessionId, mode: "unattended", status: "connected" as const },
+        result.created ? 201 : 200,
+      );
   }
 });
 
@@ -203,7 +132,7 @@ app.get("/v1/devices", async (c) => {
   if (authentication.kind === "unauthorized") return c.json({ error: "unauthorized" }, 401);
   if (authentication.kind === "rate_limited") return c.json({ error: "rate limited" }, 429);
   const actor = authentication.actor;
-  return c.json({ devices: await getTenantStub(c.env, actor.tenantId).listDevices() });
+  return c.json({ devices: await listDevices(c.env, actor) });
 });
 
 app.get("/v1/sessions/:sessionId", async (c) => {
@@ -211,21 +140,9 @@ app.get("/v1/sessions/:sessionId", async (c) => {
   if (authentication.kind === "unauthorized") return c.json({ error: "unauthorized" }, 401);
   if (authentication.kind === "rate_limited") return c.json({ error: "rate limited" }, 429);
   const actor = authentication.actor;
-  const sessionId = c.req.param("sessionId");
-  if ((await scopeSession(sessionId, actor.tenantId, c.env)) === "not-found") {
-    return c.json({ error: "not found" }, 404);
-  }
-  const session = await getSessionStub(c.env, sessionId);
-  const status = await session.getStatus();
-  if ("mode" in status && status.mode === "unattended") {
-    return status.status === "closed" ||
-      status.status === "expired" ||
-      status.status === "lost"
-      ? c.json(status, 410)
-      : c.json(status);
-  }
-  if (await session.isTerminal()) return c.json(status, 410);
-  return c.json(status);
+  const result = await getSessionStatus(c.env, actor, c.req.param("sessionId"));
+  if (result.kind === "not_found") return c.json({ error: "not found" }, 404);
+  return result.terminal ? c.json(result.status, 410) : c.json(result.status);
 });
 
 app.delete("/v1/sessions/:sessionId", async (c) => {
@@ -233,54 +150,15 @@ app.delete("/v1/sessions/:sessionId", async (c) => {
   if (authentication.kind === "unauthorized") return c.json({ error: "unauthorized" }, 401);
   if (authentication.kind === "rate_limited") return c.json({ error: "rate limited" }, 429);
   const actor = authentication.actor;
-  const sessionId = c.req.param("sessionId");
-  if ((await scopeSession(sessionId, actor.tenantId, c.env)) === "not-found") {
-    return c.json({ error: "not found" }, 404);
+  const result = await deleteSession(c.env, actor, c.req.param("sessionId"), c.req.url);
+  switch (result.kind) {
+    case "not_found":
+      return c.json({ error: "not found" }, 404);
+    case "closed":
+      return c.body(null, 204);
+    case "closing":
+      return c.body(null, 202, { Location: result.location });
   }
-  const session = await getSessionStub(c.env, sessionId);
-  const status = await session.getStatus();
-  if (!("mode" in status) || status.mode !== "unattended") {
-    const confirmed = await session.requestCloseAttended();
-    await emitTelemetry(c.env, {
-      event: "session_close",
-      outcome: confirmed ? "confirmed" : "pending",
-      tenantId: actor.tenantId,
-      actor: actor.actor,
-      sessionId,
-    });
-    return confirmed
-      ? c.body(null, 204)
-      : c.body(null, 202, { Location: sessionLocation(c.req.raw, sessionId) });
-  }
-  const coordinator = getTenantStub(c.env, actor.tenantId);
-  const closing = await coordinator.closeLease(sessionId);
-  if (!closing.found) return c.json({ error: "not found" }, 404);
-  if (closing.cleanupConfirmed) {
-    await emitTelemetry(c.env, {
-      event: "session_close",
-      outcome: "confirmed",
-      tenantId: actor.tenantId,
-      actor: actor.actor,
-      sessionId,
-    });
-    return c.body(null, 204);
-  }
-  if (closing.lease !== undefined) {
-    await session.markLifecycle("closing", closing.lease.needsReconciliation);
-    const device = c.env.DEVICE.getByName(
-      closing.lease.deviceId,
-    ) as DurableObjectStub<DeviceAgent>;
-    await device.requestClose(closing.lease);
-  }
-  await emitTelemetry(c.env, {
-    event: "session_close",
-    outcome: "pending",
-    tenantId: actor.tenantId,
-    actor: actor.actor,
-    sessionId,
-    deviceId: closing.lease?.deviceId,
-  });
-  return c.body(null, 202, { Location: sessionLocation(c.req.raw, sessionId) });
 });
 
 app.post("/v1/sessions/:sessionId/commands", async (c) => {
@@ -289,6 +167,9 @@ app.post("/v1/sessions/:sessionId/commands", async (c) => {
   if (authentication.kind === "rate_limited") return c.json({ error: "rate limited" }, 429);
   const actor = authentication.actor;
   const sessionId = c.req.param("sessionId");
+  // Early ownership check so a cross-tenant request 404s before its body is
+  // parsed, exactly as before the service extraction; dispatchCommand
+  // re-derives the same check for non-HTTP callers.
   if ((await scopeSession(sessionId, actor.tenantId, c.env)) === "not-found") {
     return c.json({ error: "not found" }, 404);
   }
@@ -302,74 +183,46 @@ app.post("/v1/sessions/:sessionId/commands", async (c) => {
     }
     return bodyError(c, error);
   }
-  const dryRun = body.dryRun ?? false;
-  const stub = await getSessionStub(c.env, sessionId);
-  if (await stub.isTerminal()) {
-    return c.json({ error: "session is terminal" }, 410);
-  }
   const contractV2 = c.req.header("understudy-command-contract") === "2";
-
-  if (contractV2 || (await stub.usesV2CommandProtocol())) {
-    const statusUrl = commandLocation(c.req.raw, sessionId, body.command.commandId);
-    const actorPseudonym = await telemetryPseudonym("actor", actor.actor, c.env);
-    const outcome = await stub.dispatchV2(body.command, dryRun, actorPseudonym, statusUrl);
-    await emitTelemetry(c.env, {
-      event: "command",
-      outcome: outcome.kind,
-      tenantId: actor.tenantId,
-      actor: actor.actor,
-      sessionId,
-      commandType: body.command.type,
-    });
-    return contractV2
-      ? v2Outcome(c, outcome, sessionId)
-      : compatibilityV2Outcome(c, outcome, sessionId);
-  }
-
-  if (
-    isWriteCommand(body.command) &&
-    !dryRun &&
-    enabledForTenant(c.env.SAFE_WRITE_REQUIRED_TENANTS, actor.tenantId)
-  ) {
-    return c.json({ error: "extension lacks safe-write-v2" }, 426);
-  }
-
-  const actorPseudonym = await telemetryPseudonym("actor", actor.actor, c.env);
-  const admitted = await getTenantStub(c.env, actor.tenantId).authorizeAttendedCommand({
-    sessionId,
-    actorPseudonym,
-    credentialFill: body.command.type === "fill_secret" && !dryRun,
+  const result = await dispatchCommand(c.env, actor, sessionId, {
+    command: body.command,
+    dryRun: body.dryRun ?? false,
+    contractV2,
+    requestUrl: c.req.url,
   });
-  if (!admitted) return c.json({ code: "command_quota_exceeded" }, 429);
-
-  const outcome: DispatchOutcome =
-    body.command.type === "fill_secret"
-      ? await stub.fillSecret(body.command, dryRun)
-      : await stub.dispatch(body.command, dryRun);
-  await emitTelemetry(c.env, {
-    event: "command",
-    outcome: outcome.ok ? "legacy_terminal" : `legacy_${outcome.reason}`,
-    tenantId: actor.tenantId,
-    actor: actor.actor,
-    sessionId,
-    commandType: body.command.type,
-  });
-  if (outcome.ok) return c.json(outcome.event);
-  switch (outcome.reason) {
-    case "not_connected":
-      return c.json({ error: "extension not connected" }, 503);
-    case "timed_out":
-      return c.json({ error: "command timed out" }, 504);
-    case "resynced":
-      return c.json({ error: "session resynced mid-command" }, 503);
-    case "duplicate_in_flight":
-      return c.json({ error: "command already in flight" }, 409);
-    case "session_busy":
-      return c.json({ code: "session_busy" }, 429);
+  switch (result.kind) {
+    case "not_found":
+      return c.json({ error: "not found" }, 404);
     case "terminal_session":
       return c.json({ error: "session is terminal" }, 410);
-    case "id_conflict":
-      return c.json({ code: "command_id_conflict" }, 409);
+    case "v2":
+      return contractV2
+        ? v2Outcome(c, result.outcome, sessionId)
+        : compatibilityV2Outcome(c, result.outcome, sessionId);
+    case "legacy_unsupported_write":
+      return c.json({ error: "extension lacks safe-write-v2" }, 426);
+    case "legacy_quota_exceeded":
+      return c.json({ code: "command_quota_exceeded" }, 429);
+    case "legacy": {
+      const outcome = result.outcome;
+      if (outcome.ok) return c.json(outcome.event);
+      switch (outcome.reason) {
+        case "not_connected":
+          return c.json({ error: "extension not connected" }, 503);
+        case "timed_out":
+          return c.json({ error: "command timed out" }, 504);
+        case "resynced":
+          return c.json({ error: "session resynced mid-command" }, 503);
+        case "duplicate_in_flight":
+          return c.json({ error: "command already in flight" }, 409);
+        case "session_busy":
+          return c.json({ code: "session_busy" }, 429);
+        case "terminal_session":
+          return c.json({ error: "session is terminal" }, 410);
+        case "id_conflict":
+          return c.json({ code: "command_id_conflict" }, 409);
+      }
+    }
   }
 });
 
@@ -378,19 +231,20 @@ app.get("/v1/sessions/:sessionId/commands/:commandId", async (c) => {
   if (authentication.kind === "unauthorized") return c.json({ error: "unauthorized" }, 401);
   if (authentication.kind === "rate_limited") return c.json({ error: "rate limited" }, 429);
   const actor = authentication.actor;
-  const sessionId = c.req.param("sessionId");
-  if ((await scopeSession(sessionId, actor.tenantId, c.env)) === "not-found") {
-    return c.json({ error: "not found" }, 404);
-  }
-  const commandId = c.req.param("commandId");
-  if (commandId.length < 1 || commandId.length > 128) {
-    return c.json({ error: "invalid command id" }, 400);
-  }
-  const status = await (await getSessionStub(c.env, sessionId)).getCommandStatus(
-    commandId,
+  const result = await pollCommand(
+    c.env,
+    actor,
+    c.req.param("sessionId"),
+    c.req.param("commandId"),
   );
-  if (status === null) return c.json({ error: "not found" }, 404);
-  return c.json(status);
+  switch (result.kind) {
+    case "not_found":
+      return c.json({ error: "not found" }, 404);
+    case "invalid_command_id":
+      return c.json({ error: "invalid command id" }, 400);
+    case "ok":
+      return c.json(result.record);
+  }
 });
 
 app.post("/v1/device/connect-ticket", async (c) => {
@@ -681,26 +535,6 @@ function bodyError(c: HonoContext, error: unknown) {
 }
 
 type HonoContext = Context<{ Bindings: Env }>;
-
-function enabledForTenant(raw: string, tenantId: string): boolean {
-  try {
-    const parsed = JSON.parse(raw || "[]") as unknown;
-    return Array.isArray(parsed) && (parsed.includes("*") || parsed.includes(tenantId));
-  } catch {
-    return false;
-  }
-}
-
-function sessionLocation(request: Request, sessionId: string): string {
-  return new URL(`/v1/sessions/${encodeURIComponent(sessionId)}`, request.url).toString();
-}
-
-function commandLocation(request: Request, sessionId: string, commandId: string): string {
-  return new URL(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/commands/${encodeURIComponent(commandId)}`,
-    request.url,
-  ).toString();
-}
 
 app.onError((_error, c) => {
   console.error("unhandled route error");
