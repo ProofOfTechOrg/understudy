@@ -523,6 +523,23 @@ export async function authenticatedRateAllowed(
   return (await env.RATE_LIMITER.limit({ key })).success;
 }
 
+/**
+ * Per-IP abuse backstop for endpoints that exist BEFORE authentication (OTP
+ * request, pairing claim, DCR). Fail-open when the limiter binding is absent
+ * (tests/dev) — the authoritative guards on those endpoints are their
+ * single-use/attempt-capped semantics, not this limiter.
+ */
+export async function unauthenticatedRateAllowed(
+  request: Request,
+  env: Env,
+  domain: string,
+): Promise<boolean> {
+  if (env.RATE_LIMITER === undefined) return true;
+  const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+  const key = await telemetryPseudonym(`rate-limit-ip-${domain}`, ip, env);
+  return (await env.RATE_LIMITER.limit({ key })).success;
+}
+
 async function importHmacKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",

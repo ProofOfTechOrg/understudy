@@ -70,6 +70,13 @@ export interface VaultBinding {
     list_complete: boolean;
     cursor?: string;
   }>;
+  /**
+   * Envelope write for the dashboard vault upload (vault.ts's
+   * writeVaultSecret). Optional for the same test-fake reason as list;
+   * writes through this seam are ALWAYS pre-sealed v1 envelopes, never
+   * plaintext.
+   */
+  put?(secretRef: string, envelope: string): Promise<void>;
 }
 
 /** Worker bindings and environment configuration, wired in wrangler.jsonc. */
@@ -128,6 +135,16 @@ export interface Env {
    * `secrets.required`, like the token maps.
    */
   VAULT_MASTER_KEY: string;
+  /**
+   * base64url PKCS#8 of the P-256 private key the dashboard's client-side
+   * vault upload encrypts to (dashboard/vault-upload.ts). Defense against
+   * accidental plaintext exposure in transit/logs — not against a malicious
+   * server, which serves the encrypting JavaScript. Required via
+   * `secrets.required`.
+   */
+  VAULT_UPLOAD_PRIVATE_KEY: string;
+  /** Email Sending binding for sign-in OTPs; absent in the test pool (the send seam no-ops). */
+  EMAIL?: SendEmail;
 }
 
 /**

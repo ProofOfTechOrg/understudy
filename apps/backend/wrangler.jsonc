@@ -105,9 +105,19 @@
       "EXTENSION_TOKENS",
       "DEVICE_TOKENS",
       "WS_TICKET_SECRET",
-      "VAULT_MASTER_KEY"
+      "VAULT_MASTER_KEY",
+      // base64url PKCS#8 P-256 private key for the dashboard's client-side
+      // vault-secret upload (§ vault-upload.ts). Listing it here is load-
+      // bearing twice over: deploys fail without it, and — because this key
+      // is also the .dev.vars allowlist — omitting it there would silently
+      // drop it in dev.
+      "VAULT_UPLOAD_PRIVATE_KEY"
     ]
   },
+  // Transactional email (sign-in OTPs) via Cloudflare Email Sending; the
+  // proofof.tech domain is onboarded (wrangler email sending list). In local
+  // dev the binding needs `wrangler dev --remote` to actually send.
+  "send_email": [{ "name": "EMAIL" }],
   "vars": {
     "QUOTA_POLICY": "{\"sessionCreatesPerActorMinute\":10,\"commandsPerSessionMinute\":120,\"commandsPerTenantMinute\":600,\"credentialFillsPerActorMinute\":30,\"deviceTicketsPerDeviceMinute\":30,\"sessionCommandCap\":10000}",
     // Gates ONLY the unattended create branch (src/api/sessions.ts); a request

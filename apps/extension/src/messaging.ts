@@ -44,13 +44,23 @@ export interface StopAllMsg {
   type: "stopAll";
 }
 
+export interface PairMsg {
+  type: "pair";
+  code: string;
+  /** Overrides the production service origin (dev/support only). */
+  serviceOrigin?: string;
+}
+
 export type PanelMsg =
   | GetStateMsg
   | AttachMsg
   | DetachMsg
   | SetWsUrlMsg
   | ConfigureProfileMsg
-  | StopAllMsg;
+  | StopAllMsg
+  | PairMsg;
+
+export type PairingPhase = "pairing" | "paired" | "error";
 
 export interface StateMsg {
   type: "state";
@@ -65,6 +75,13 @@ export interface StateMsg {
     deviceId: string;
     originPolicy: string[];
   } | null;
+  /** Progress of the most recent side-panel pairing attempt, if any. */
+  pairing?: { phase: PairingPhase; message?: string };
+  /**
+   * Why profileStatus is "error", when the client knows (ControlBlock reason
+   * or a revoked credential) — the panel renders per-reason recovery copy.
+   */
+  profileStatusReason?: string;
   logs: LogEntry[];
 }
 

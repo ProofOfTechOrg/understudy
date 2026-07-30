@@ -1,6 +1,11 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
-import { CALLER_TOKENS, EXTENSION_TOKENS, TEST_VAULT_MASTER_KEY } from "./test/tokens";
+import {
+  CALLER_TOKENS,
+  EXTENSION_TOKENS,
+  TEST_VAULT_MASTER_KEY,
+  TEST_VAULT_UPLOAD_PRIVATE_KEY,
+} from "./test/tokens";
 
 export default defineConfig({
   plugins: [
@@ -25,6 +30,7 @@ export default defineConfig({
           SAFE_WRITE_REQUIRED_TENANTS: "[]",
           WS_TICKET_SECRET: "test-ticket-secret-do-not-use-in-prod",
           VAULT_MASTER_KEY: TEST_VAULT_MASTER_KEY,
+          VAULT_UPLOAD_PRIVATE_KEY: TEST_VAULT_UPLOAD_PRIVATE_KEY,
           QUOTA_POLICY: JSON.stringify({
             sessionCreatesPerActorMinute: 10_000,
             commandsPerSessionMinute: 10_000,

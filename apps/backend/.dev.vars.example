@@ -33,3 +33,9 @@ WS_TICKET_SECRET=dev-ticket-secret-change-me
 # refuses refs outside the session's own tenant, and the dev tenant is
 # "dev-tenant" above): node scripts/vault-put.mjs 'vault://dev-tenant/ref' --local
 VAULT_MASTER_KEY=ZGV2LXZhdWx0LW1hc3Rlci1rZXktMDEyMzQ1Njc4OSE
+
+# base64url PKCS#8 of the P-256 private key the dashboard's client-side
+# vault-secret upload encrypts to (src/dashboard/vault-upload.ts). Dev-only
+# placeholder; generate a real one for production with:
+#   node -e "crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},true,['deriveBits']).then(async p=>console.log(Buffer.from(await crypto.subtle.exportKey('pkcs8',p.privateKey)).toString('base64url')))"
+VAULT_UPLOAD_PRIVATE_KEY=MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcmO5-On_WESihHpUNBdOBh90clMvrEOD7r5JU7Y792OhRANCAASl_9tbnm5mtv0a-UdQhfejPVDESCp5EzESV_2KVpEPOwOqqjswS8OJuVr40MZtRO9C-RnFH-C5vkohb2ppPaif

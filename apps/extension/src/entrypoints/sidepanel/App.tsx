@@ -78,6 +78,8 @@ export function App(): ReactElement {
   const wsUrl = swState?.wsUrl ?? seedWsUrl;
   const attached = swState?.attached ?? null;
   const profileStatus = swState?.profileStatus ?? "disabled";
+  const profileStatusReason = swState?.profileStatusReason;
+  const pairing = swState?.pairing ?? null;
   const controlledTabs = swState?.controlledTabs ?? 0;
   const profileConfig = swState?.profileConfig ?? null;
   const logs = swState?.logs ?? [];
@@ -87,6 +89,16 @@ export function App(): ReactElement {
     const trimmed = rawUrl.trim();
     if (trimmed.length === 0 || trimmed === wsUrl) return;
     send({ type: "setWsUrl", url: trimmed });
+  };
+
+  const submitPairing = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const code = String(data.get("pairingCode") ?? "").trim();
+    if (code.length === 0) return;
+    send({ type: "pair", code });
+    const input = event.currentTarget.elements.namedItem("pairingCode");
+    if (input instanceof HTMLInputElement) input.value = "";
   };
 
   const configureProfile = (event: FormEvent<HTMLFormElement>): void => {
@@ -132,6 +144,43 @@ export function App(): ReactElement {
       <section className="card">
         <div className="section-heading">
           <div>
+            <p className="section-index">00</p>
+            <h2>Pair with your account</h2>
+          </div>
+        </div>
+        <form className="enrollment-form" onSubmit={submitPairing}>
+          <label>
+            <span>Pairing code</span>
+            <input
+              name="pairingCode"
+              type="text"
+              required
+              placeholder="K7Q2-M9XR"
+              spellCheck={false}
+              autoCapitalize="characters"
+              autoComplete="off"
+            />
+          </label>
+          <div className="form-actions">
+            <button
+              className="button button-primary"
+              type="submit"
+              disabled={pairing?.phase === "pairing"}
+            >
+              {pairing?.phase === "pairing" ? "Pairing…" : "Pair"}
+            </button>
+          </div>
+        </form>
+        <PairingStatus pairing={pairing} statusReason={profileStatusReason} />
+        <p className="privacy-note">
+          Get a code from your dashboard at understudy.proofof.tech/dashboard. Pairing replaces
+          this browser&rsquo;s previous enrollment.
+        </p>
+      </section>
+
+      <section className="card">
+        <div className="section-heading">
+          <div>
             <p className="section-index">01</p>
             <h2>Dedicated profile host</h2>
           </div>
@@ -139,7 +188,8 @@ export function App(): ReactElement {
             Stop all
           </button>
         </div>
-
+        <details>
+        <summary>Advanced: manual configuration</summary>
         <form className="enrollment-form" key={formKey} onSubmit={configureProfile}>
           <label>
             <span>Service origin</span>
@@ -201,6 +251,7 @@ export function App(): ReactElement {
             </button>
           </div>
         </form>
+        </details>
         <p className="privacy-note">
           Credential input is write-only. Execution state stays in browser session storage and clears on restart.
         </p>
@@ -235,6 +286,38 @@ export function App(): ReactElement {
       <LogBook logs={logs} />
     </main>
   );
+}
+
+const BLOCK_REASON_COPY: Record<string, string> = {
+  ticket_rejected:
+    "The service rejected this browser's credential. Pair again with a fresh code.",
+  invalid_ticket:
+    "The service rejected this browser's credential. Pair again with a fresh code.",
+  replaced: "Another browser took over this pairing. Pair again with a fresh code.",
+  terminal_close:
+    "The service ended this browser's enrollment. Pair again with a fresh code.",
+  credential_revoked:
+    "This browser's pairing was revoked in the dashboard. Pair again with a fresh code.",
+};
+
+function PairingStatus({
+  pairing,
+  statusReason,
+}: {
+  pairing: { phase: string; message?: string } | null;
+  statusReason: string | undefined;
+}): ReactElement | null {
+  if (pairing?.phase === "error") {
+    return <p className="warning">{pairing.message ?? "Pairing failed. Try a fresh code."}</p>;
+  }
+  if (pairing?.phase === "paired") {
+    return <p className="privacy-note">Paired. Unattended hosting is enabled on this browser.</p>;
+  }
+  if (statusReason !== undefined) {
+    const copy = BLOCK_REASON_COPY[statusReason];
+    if (copy !== undefined) return <p className="warning">{copy}</p>;
+  }
+  return null;
 }
 
 function AttendedControls({

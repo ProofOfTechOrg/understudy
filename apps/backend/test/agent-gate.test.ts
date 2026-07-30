@@ -103,8 +103,10 @@ describe("OAuth path delegation", () => {
     const health = await get(`${CANONICAL}/health`);
     expect(health.status).toBe(200);
     expect(await health.json()).toEqual({ ok: true });
-    // A dashboard path resolves to the placeholder app, not the /v1 pipeline.
+    // A dashboard path resolves to the dashboard app (login page when
+    // signed out), not the /v1 pipeline.
     const dash = await get(`${CANONICAL}/dashboard`);
-    expect(dash.status).toBe(404);
+    expect(dash.status).toBe(200);
+    expect(await dash.text()).toContain("Sign in");
   });
 });

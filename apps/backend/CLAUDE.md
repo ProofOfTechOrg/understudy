@@ -25,7 +25,7 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `src/account-agent.ts` | `AccountAgent` — per-tenant DO for MCP: session binding, refsValid/refsEpoch staleness guard, one-command mutex, dispatch retry/poll loops over the service layer | Changing MCP session lifecycle, ref guard, or retry semantics |
 | `src/oauth.ts` | The `OAuthProvider` instance (apiRoute `/mcp`, DCR, S256-only PKCE, RFC 8414/9728 metadata); delegated to by `src/index.ts` for a closed path list | Changing OAuth endpoints, scopes, or token TTLs |
 | `src/mcp/` | MCP surface: `props` (shared auth shape + 401), `static-auth` (usk_ fast path + 60s cache), `handler` (rate limit + serve), `mcp-agent` (`UnderstudyMcp` DO), `tools` (14-tool catalog), `outcomes` (single result mapper) | Adding/changing tools, auth branches, or result texts |
-| `src/dashboard/app.ts` | The provider's defaultHandler (dashboard + consent pages) | Changing dashboard routes |
+| `src/dashboard/` | The provider's defaultHandler: `app` (routes), `pages` (hono/html + CSP-nonced client JS), `auth` (cookie/CSRF/next guards), `email` (OTP send seam), `vault-upload` (ECDH unseal → re-seal) | Changing dashboard routes, consent, sign-in, or the vault upload |
 | `src/secrets.ts` | `resolveSecret` — vault lookup only, no dispatch | Changing the vault backend, debugging secret resolution failures |
 | `src/vault.ts` | AES-256-GCM envelope codec + `EncryptedKvVault`/`createVault` — KV holds ciphertext only | Changing the envelope format/key handling (mirror `scripts/vault-put.mjs`) |
 | `src/base64url.ts` | base64url codec shared by auth.ts and vault.ts | Rarely — codec changes |

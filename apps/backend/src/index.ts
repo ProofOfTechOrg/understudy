@@ -13,9 +13,12 @@ import {
   mintWsTicket,
   scopeSession,
   SESSION_IDEMPOTENCY_KEY_PATTERN,
+  taggedHmacHex,
+  unauthenticatedRateAllowed,
   verifyExtensionToken,
   verifyWsTicket,
 } from "./auth";
+import { normalizePairingCode } from "./account-directory";
 import {
   createAttendedSession,
   createSession,
@@ -51,6 +54,7 @@ const app = new Hono<{ Bindings: Env }>();
 const DeviceTicketRequestSchema = z
   .object({ browserEpoch: z.string().min(1).max(128) })
   .strict();
+const PairingClaimSchema = z.object({ code: z.string().min(1).max(64) }).strict();
 
 app.get("/health", (c) => c.json({ ok: true }));
 
@@ -293,6 +297,52 @@ app.post("/v1/device/connect-ticket", async (c) => {
     ticket,
     expiresIn: 60,
     websocketPath: `/agents/device/${encodeURIComponent(device.deviceId)}`,
+  });
+});
+
+/**
+ * Extension pairing: the one-time code IS the credential, so this route is
+ * unauthenticated by design. The device identity and udt_ credential are
+ * minted at redeem time inside the directory's consume-once transaction;
+ * every failure mode is the same 404 (no code-state oracle). Deliberately on
+ * this Hono app, NOT delegated to the OAuth provider — it is device-facing
+ * /v1 surface, a sibling of /v1/device/connect-ticket.
+ */
+app.post("/v1/pairing/claim", async (c) => {
+  if (!(await unauthenticatedRateAllowed(c.req.raw, c.env, "pairing-claim"))) {
+    return c.json({ error: "rate_limited" }, 429);
+  }
+  let body: z.infer<typeof PairingClaimSchema>;
+  try {
+    body = await parseBoundedStrictJson(c.req.raw, PairingClaimSchema, 4 * 1024);
+  } catch (error) {
+    return bodyError(c, error);
+  }
+  const normalized = normalizePairingCode(body.code);
+  if (!/^[0-9A-Z]{8}$/.test(normalized)) {
+    return c.json({ error: "invalid_or_expired_code" }, 404);
+  }
+  const claimed = await c.env.ACCOUNT_DIRECTORY.getByName("directory").claimPairingCode(
+    await taggedHmacHex(c.env, "pair-v1", normalized),
+  );
+  if (claimed.kind !== "ok") {
+    return c.json({ error: "invalid_or_expired_code" }, 404);
+  }
+  await emitTelemetry(c.env, {
+    event: "device_connect",
+    outcome: "paired",
+    tenantId: claimed.tenantId,
+    deviceId: claimed.deviceId,
+  });
+  // This body satisfies the extension's normalizeProfileConfig by
+  // construction: origin-only https serviceOrigin, uuid deviceId, bounded
+  // credential, 1..32 canonical origins.
+  return c.json({
+    serviceOrigin: new URL(c.req.url).origin,
+    deviceId: claimed.deviceId,
+    deviceCredential: claimed.deviceCredential,
+    originPolicy: claimed.originPolicy,
+    unattendedEnabled: true,
   });
 });
 
@@ -618,6 +668,15 @@ export default {
         // discovery-grade 401.
         const staticResult = await tryStaticMcpAuth(request, env, ctx);
         if (staticResult !== null) return staticResult;
+      }
+      // Open DCR (RFC 7591) is unauthenticated by spec; per-IP limiting is
+      // the abuse backstop. Registration grants nothing — consent is always
+      // human-in-the-loop on /oauth/authorize.
+      if (
+        url.pathname === "/oauth/register" &&
+        !(await unauthenticatedRateAllowed(request, env, "dcr"))
+      ) {
+        return Response.json({ error: "rate_limited" }, { status: 429 });
       }
       return oauthProvider.fetch(request, env, ctx);
     }

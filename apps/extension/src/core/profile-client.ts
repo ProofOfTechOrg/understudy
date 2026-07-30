@@ -29,11 +29,13 @@ const TICKET_BACKOFF_BASE_MS = 500;
 const TICKET_BACKOFF_CAP_MS = 30_000;
 
 type ControlPurpose = "hosting" | "cleanup";
-type ControlBlockReason =
+export type ControlBlockReason =
   | "replaced"
   | "terminal_close"
   | "ticket_rejected"
   | "invalid_ticket";
+
+export type ProfileBlockReason = ControlBlockReason | "credential_revoked";
 
 interface ControlBlock {
   version: 1;
@@ -150,6 +152,21 @@ export class ProfileClient {
 
   currentStatus(): ProfileStatus {
     return this.status;
+  }
+
+  /**
+   * Why reconnects are suppressed, when known — read-only over the
+   * already-parsed ControlBlock and the revocation flag; touches no
+   * connect/backoff path. Briefly null while a fresh block is still being
+   * persisted (the panel polls state, so the reason appears on the next
+   * push).
+   */
+  blockedReason(): ProfileBlockReason | null {
+    if (this.credentialRevoked) return "credential_revoked";
+    if (this.isControlBlocked() && this.controlBlock !== null) {
+      return this.controlBlock.reason;
+    }
+    return null;
   }
 
   publicConfig(): Omit<ProfileConfig, "deviceCredential"> | null {

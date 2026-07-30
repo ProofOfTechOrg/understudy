@@ -19,6 +19,13 @@ const ENVELOPE_VERSION = "v1";
 const IV_BYTES = 12;
 const MASTER_KEY_BYTES = 32;
 
+/**
+ * What a vault secret NAME (the tail after `vault://<tenantId>/`) may look
+ * like, shared by the MCP fill_secret tool and the dashboard upload form.
+ * No "/" — a name can never straddle another tenant's prefix.
+ */
+export const VAULT_SECRET_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+
 async function importMasterKey(masterKey: string, usage: "encrypt" | "decrypt"): Promise<CryptoKey> {
   let raw: Uint8Array;
   try {
@@ -125,4 +132,22 @@ export async function listVaultSecretNames(
 /** The one production wiring: Env.VAULT ciphertext + VAULT_MASTER_KEY. */
 export function createVault(env: Env): VaultBinding {
   return new EncryptedKvVault(env.VAULT, env.VAULT_MASTER_KEY);
+}
+
+/**
+ * Seals one plaintext into the standard envelope and writes it under the
+ * tenant's namespace. The only server-side vault write path (the dashboard
+ * upload); scripts/vault-put.mjs remains the operator CLI equivalent.
+ */
+export async function writeVaultSecret(
+  env: Env,
+  tenantId: string,
+  name: string,
+  plaintext: string,
+): Promise<void> {
+  if (env.VAULT.put === undefined) {
+    throw new Error("vault store is not writable");
+  }
+  const envelope = await encryptSecret(env.VAULT_MASTER_KEY, plaintext);
+  await env.VAULT.put(`vault://${tenantId}/${name}`, envelope);
 }

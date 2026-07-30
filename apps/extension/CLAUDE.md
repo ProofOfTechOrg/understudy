@@ -25,6 +25,8 @@ WXT + React MV3 extension driving protocol Commands into a real Chromium tab via
 | `src/driver/cdp-events.test.ts` | Unit tests for `classifyCdpEvent` + `dialogDisposition` (main-frame filter, load URL, generation bumps, per-type dialog disposition) | Verifying CDP event classification |
 | `src/driver/cdp.ts` | `CdpSession` — FIFO-queued `chrome.debugger` channel; executors for every protocol Command (`snapshotA11y`, `screenshot`, `click`, `type`, `key`, `scroll`, `wait`, `navigate`, `resolveRefCheck`) | Adding/changing a command executor, debugging a CDP call |
 | `src/driver/cdp.test.ts` | Unit tests for ref probes/binding, exact snapshot target brackets, failure invalidation, and aggregate deadlines | Changing resolveRefCheck, snapshot identity/deadlines, or the ref/generation model |
+| `src/core/pairing-client.ts` | `normalizePairingCode`/`redeemPairingCode`/`PairingError` — one-time-code redemption at `/v1/pairing/claim`; all pairing logic (profile-client takes no diff) | Changing pairing UX, claim contract, or error copy |
+| `src/core/pairing-client.test.ts` | Unit tests for code normalization and per-status redemption errors | Verifying pairing redemption |
 | `src/core/ws-client.ts` | `ReconnectingWs` — WebSocket with backoff reconnect and self-driven pong heartbeat | Changing reconnect/backoff/heartbeat behavior |
 | `src/core/ws-client.test.ts` | Unit tests for ordinary reconnect and terminal backend replacement close code 4001 | Changing reconnect termination behavior |
 | `src/core/command-ingress.ts` | `CommandIngress` — serial command-admission queue plus drain barrier for WebSocket session changes | Changing wire-order or session-switch command draining |

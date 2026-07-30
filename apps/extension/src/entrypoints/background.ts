@@ -16,6 +16,7 @@ import {
 } from "../core/dialog-outbox";
 import { sendIfPeerCurrent } from "../core/peer-binding";
 import { routeCommand } from "../core/router";
+import { PairingError, redeemPairingCode } from "../core/pairing-client";
 import { ReconnectingWs } from "../core/ws-client";
 import { ProfileClient } from "../core/profile-client";
 import { WriteJournal } from "../core/write-journal";
@@ -66,6 +67,8 @@ let wsSwitchTail: Promise<unknown> = Promise.resolve();
 
 let session: CdpSession | null = null;
 let attachedTitle: string | undefined;
+// Progress of the most recent pairing attempt, surfaced in StateMsg.pairing.
+let pairingState: StateMsg["pairing"];
 
 // Write-replay record (idempotent-retry contract); hydrates lazily from
 // storage.session, so rebuilding it each wake loses nothing.
@@ -822,7 +825,41 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
     case "stopAll":
       fireAndForget("stopAll", () => profileClient.stopAll());
       break;
+    case "pair":
+      fireAndForget("pair", () => pairDevice(msg.code, msg.serviceOrigin));
+      break;
   }
+}
+
+// Redeems a dashboard pairing code and feeds the minted config through the
+// SAME profileClient.configure path the manual form uses — a fresh
+// deviceId+credential per redemption means the new profileKey can never
+// match a stored ControlBlock, so pairing again is the universal recovery.
+async function pairDevice(code: string, serviceOrigin?: string): Promise<void> {
+  pairingState = { phase: "pairing" };
+  broadcastState();
+  try {
+    const result = await redeemPairingCode(code, serviceOrigin);
+    await profileClient.configure({
+      serviceOrigin: result.serviceOrigin,
+      unattendedEnabled: result.unattendedEnabled,
+      deviceId: result.deviceId,
+      deviceCredential: result.deviceCredential,
+      originPolicy: result.originPolicy,
+    });
+    pairingState = { phase: "paired" };
+    log("paired with account; unattended hosting enabled");
+  } catch (cause) {
+    pairingState = {
+      phase: "error",
+      message:
+        cause instanceof PairingError
+          ? cause.message
+          : "Pairing failed. Generate a fresh code and try again.",
+    };
+    log(`pairing failed: ${errorMessage(cause)}`, "error");
+  }
+  broadcastState();
 }
 
 // ── State + logging ──────────────────────────────────────────────────────────
@@ -834,6 +871,7 @@ function buildAttached(): AttachedTab | null {
 }
 
 function buildState(): StateMsg {
+  const blockedReason = profileClient.blockedReason();
   return {
     type: "state",
     wsStatus,
@@ -842,6 +880,8 @@ function buildState(): StateMsg {
     profileStatus: profileClient.currentStatus(),
     controlledTabs: profileClient.sessions.assignments().length,
     profileConfig: profileClient.publicConfig(),
+    ...(pairingState === undefined ? {} : { pairing: pairingState }),
+    ...(blockedReason === null ? {} : { profileStatusReason: blockedReason }),
     logs: [...logBuffer],
   };
 }

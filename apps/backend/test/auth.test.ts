@@ -52,6 +52,7 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
     UNATTENDED_ENABLED_TENANTS: "[]",
     SAFE_WRITE_REQUIRED_TENANTS: "[]",
     VAULT_MASTER_KEY: "unused-by-auth-tests",
+    VAULT_UPLOAD_PRIVATE_KEY: "unused-by-auth-tests",
     ...overrides,
   };
 }

@@ -1,0 +1,136 @@
+/**
+ * POST /v1/pairing/claim (PR 4): the code-for-credential exchange the
+ * extension's side panel drives, and the composite device auth path the
+ * minted credential then traverses. Direct module fetch — the response's
+ * serviceOrigin comes from the request URL.
+ */
+
+import { env } from "cloudflare:workers";
+import { describe, expect, it } from "vitest";
+import mainModule from "../src/index";
+import { clearDeviceCredentialCache } from "../src/auth";
+
+const CANONICAL = "https://understudy.proofof.tech";
+const directory = () => env.ACCOUNT_DIRECTORY.getByName("directory");
+
+function fetchApp(request: Request): Promise<Response> {
+  return mainModule.fetch(
+    request,
+    env as never,
+    { waitUntil() {}, passThroughOnException() {} } as never,
+  );
+}
+
+function claimRequest(code: string): Request {
+  return new Request(`${CANONICAL}/v1/pairing/claim`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+}
+
+async function pairableUser(): Promise<{ userId: string; tenantId: string; code: string }> {
+  const requested = await directory().requestOtp(`${crypto.randomUUID()}@example.com`);
+  if (requested.kind !== "ok") throw new Error("otp request failed");
+  const verified = await directory().verifyOtp(requested.challengeId, requested.code);
+  if (verified.kind !== "ok") throw new Error("otp verify failed");
+  await directory().setAllowedOrigins(verified.userId, ["https://example.com"]);
+  const created = await directory().createPairingCode(verified.userId);
+  if (created.kind !== "ok") throw new Error("pairing code failed");
+  return { userId: verified.userId, tenantId: verified.tenantId, code: created.code };
+}
+
+interface ClaimBody {
+  serviceOrigin: string;
+  deviceId: string;
+  deviceCredential: string;
+  originPolicy: string[];
+  unattendedEnabled: boolean;
+}
+
+describe("POST /v1/pairing/claim", () => {
+  it("exchanges a mangled-but-normalizable code for a config the extension accepts", async () => {
+    const user = await pairableUser();
+    // Lowercase + display dashes, exactly as a human might paste it.
+    const pasted = `${user.code.slice(0, 4).toLowerCase()}-${user.code.slice(4).toLowerCase()}`;
+    const res = await fetchApp(claimRequest(pasted));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as ClaimBody;
+
+    // The contract: this body must satisfy the extension's strict
+    // normalizeProfileConfig by construction.
+    const origin = new URL(body.serviceOrigin);
+    expect(origin.origin).toBe(CANONICAL);
+    expect(origin.protocol).toBe("https:");
+    expect(body.deviceId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(body.deviceCredential).toMatch(/^udt_v1_[A-Za-z0-9_-]{43}$/);
+    expect(body.deviceCredential.length).toBeLessThanOrEqual(4096);
+    expect(body.originPolicy).toEqual(["https://example.com"]);
+    expect(body.originPolicy.length).toBeGreaterThanOrEqual(1);
+    expect(body.originPolicy.length).toBeLessThanOrEqual(32);
+    expect(body.unattendedEnabled).toBe(true);
+  });
+
+  it("collapses reuse, expiry, and unknown codes to one indistinguishable 404", async () => {
+    const user = await pairableUser();
+    expect((await fetchApp(claimRequest(user.code))).status).toBe(200);
+
+    const reused = await fetchApp(claimRequest(user.code));
+    const unknown = await fetchApp(claimRequest("ZZZZ-ZZZZ"));
+    const malformed = await fetchApp(claimRequest("AB"));
+    expect(reused.status).toBe(404);
+    expect(unknown.status).toBe(404);
+    expect(malformed.status).toBe(404);
+    expect(await reused.json()).toEqual({ error: "invalid_or_expired_code" });
+    expect(await unknown.json()).toEqual({ error: "invalid_or_expired_code" });
+    expect(await malformed.json()).toEqual({ error: "invalid_or_expired_code" });
+  });
+
+  it("mints a credential that traverses the existing connect-ticket pipeline", async () => {
+    clearDeviceCredentialCache();
+    const user = await pairableUser();
+    const claim = (await (await fetchApp(claimRequest(user.code))).json()) as ClaimBody;
+
+    // #when the freshly minted udt_ credential asks for a connect ticket
+    const ticketRes = await fetchApp(
+      new Request(`${CANONICAL}/v1/device/connect-ticket`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${claim.deviceCredential}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ browserEpoch: crypto.randomUUID() }),
+      }),
+    );
+
+    // #then the composite verifier + DeviceAgent bootstrap admit it with
+    // zero edits to device.ts / tenant-coordinator.ts
+    expect(ticketRes.status).toBe(200);
+    const ticket = (await ticketRes.json()) as { ticket: string; websocketPath: string };
+    expect(ticket.ticket.length).toBeGreaterThan(0);
+    expect(ticket.websocketPath).toBe(
+      `/agents/device/${encodeURIComponent(claim.deviceId)}`,
+    );
+  });
+
+  it("stops honoring a revoked device at the next uncached ticket request", async () => {
+    clearDeviceCredentialCache();
+    const user = await pairableUser();
+    const claim = (await (await fetchApp(claimRequest(user.code))).json()) as ClaimBody;
+    await directory().revokeDevice(user.userId, claim.deviceId);
+    clearDeviceCredentialCache();
+    const ticketRes = await fetchApp(
+      new Request(`${CANONICAL}/v1/device/connect-ticket`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${claim.deviceCredential}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ browserEpoch: crypto.randomUUID() }),
+      }),
+    );
+    expect(ticketRes.status).toBe(401);
+  });
+});
