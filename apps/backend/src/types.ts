@@ -22,6 +22,7 @@ import type {
 import type { SessionAgent } from "./session";
 import type { DeviceAgent } from "./device";
 import type { TenantDeviceCoordinator } from "./tenant-coordinator";
+import type { AccountDirectory } from "./account-directory";
 
 /**
  * The non-tabs fields of the extension's hello event: what it reports about
@@ -62,6 +63,12 @@ export interface Env {
   SESSION: DurableObjectNamespace<SessionAgent>;
   DEVICE: DurableObjectNamespace<DeviceAgent>;
   TENANT_CONTROL: DurableObjectNamespace<TenantDeviceCoordinator>;
+  /**
+   * Singleton account store (instance "directory") for self-serve users,
+   * devices, tokens, OTP challenges, and pairing codes. Never on the
+   * per-command hot path — see account-directory.ts.
+   */
+  ACCOUNT_DIRECTORY: DurableObjectNamespace<AccountDirectory>;
   VAULT: VaultBinding;
   /** Signs/verifies server-minted sessionIds so scopeSession can verify tenant ownership statelessly (M-006, DL-008). */
   AUTH_HMAC_SECRET: string;

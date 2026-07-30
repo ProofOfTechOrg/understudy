@@ -105,7 +105,7 @@ Non-secret Wrangler variables include:
 
 Both allowlists are set per tenant during rollout. `wrangler.jsonc` is authoritative for what is deployed; do not restate their values elsewhere.
 
-Never use `["*"]` for either allowlist. `enabledForTenant` honours it, so a wildcard admits every tenant holding a caller token — the blast radius the named allowlist exists to bound. Wildcard enablement is a rejected option in the [rollout runbook](../../docs/unattended-production-rollout.md); onboard tenants by name, one at a time.
+Allowlist entries are exact tenant ids (`"metamind"`) or an explicit class prefix (`"prefix:acct-"`, the self-serve accounts AccountDirectory mints). A prefix entry is a scoped, auditable statement about one namespace, reviewed in source and atomic with `wrangler rollback`. `enabledForTenant` no longer honours `"*"` at all: a wildcard would admit every tenant holding a caller token — the blast radius the allowlist exists to bound — and wildcard enablement is a rejected option in the [rollout runbook](../../docs/unattended-production-rollout.md). Onboard consumer tenants by name, one at a time; self-serve accounts arrive as the `acct-` class.
 
 Keep unattended creation disabled during the initial backend deployment. Enable it for a named tenant once that tenant's canary device is enrolled and reporting protocol 2 — the Chromium acceptance suite creates unattended sessions and cannot run against an empty allowlist.
 

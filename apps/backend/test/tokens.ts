@@ -9,12 +9,16 @@
 
 export const CALLER_TOKEN_A = "test-caller-a";
 export const CALLER_TOKEN_B = "test-caller-b";
+/** A caller in the self-serve account class (an AccountDirectory-shaped tenant id). */
+export const CALLER_TOKEN_ACCT = "test-caller-acct";
+export const ACCT_TEST_TENANT = "acct-testtenant";
 export const EXTENSION_TOKEN_A = "test-ext-a";
 export const EXTENSION_TOKEN_B = "test-ext-b";
 
 export const CALLER_TOKENS = {
   [CALLER_TOKEN_A]: { actor: "caller-a", tenantId: "tenantA" },
   [CALLER_TOKEN_B]: { actor: "caller-b", tenantId: "tenantB" },
+  [CALLER_TOKEN_ACCT]: { actor: "caller-acct", tenantId: ACCT_TEST_TENANT },
 };
 
 export const EXTENSION_TOKENS = {

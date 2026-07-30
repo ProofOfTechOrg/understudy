@@ -46,10 +46,26 @@ export function getTenantStub(
   return env.TENANT_CONTROL.getByName(tenantId);
 }
 
+/**
+ * Tenant allowlist check for UNATTENDED_ENABLED_TENANTS /
+ * SAFE_WRITE_REQUIRED_TENANTS. Entries are exact tenant ids or
+ * `prefix:<p>` for a tenant class (e.g. "prefix:acct-" for self-serve
+ * accounts). A bare "*" deliberately enables nothing: the docs forbid
+ * wildcard enablement, and a capability the code carries but policy forbids
+ * is a standing footgun — a prefix entry is the auditable replacement.
+ */
 export function enabledForTenant(raw: string, tenantId: string): boolean {
   try {
     const parsed = JSON.parse(raw || "[]") as unknown;
-    return Array.isArray(parsed) && (parsed.includes("*") || parsed.includes(tenantId));
+    if (!Array.isArray(parsed)) return false;
+    return parsed.some(
+      (entry) =>
+        entry === tenantId ||
+        (typeof entry === "string" &&
+          entry.startsWith("prefix:") &&
+          entry.length > "prefix:".length &&
+          tenantId.startsWith(entry.slice("prefix:".length))),
+    );
   } catch {
     return false;
   }

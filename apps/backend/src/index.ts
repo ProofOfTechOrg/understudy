@@ -9,7 +9,7 @@ import {
 import {
   authenticate,
   authenticatedRateAllowed,
-  authenticateDevice,
+  authenticateDeviceComposite,
   mintWsTicket,
   scopeSession,
   SESSION_IDEMPOTENCY_KEY_PATTERN,
@@ -32,6 +32,7 @@ import { parseBoundedStrictJson, readBoundedBodyText, parseStrictJsonText, Reque
 import { emitTelemetry } from "./telemetry";
 import type { Actor, DeviceIdentity } from "./auth";
 
+export { AccountDirectory } from "./account-directory";
 export { DeviceAgent } from "./device";
 export { SessionAgent } from "./session";
 export { TenantDeviceCoordinator } from "./tenant-coordinator";
@@ -331,7 +332,7 @@ async function authenticateDeviceCaller(
   request: Request,
   env: Env,
 ): Promise<DeviceAuthentication> {
-  const device = await authenticateDevice(request, env);
+  const device = await authenticateDeviceComposite(request, env);
   if (device === null) {
     await emitTelemetry(env, { event: "authentication", outcome: "device_unauthorized" });
     return { kind: "unauthorized" };

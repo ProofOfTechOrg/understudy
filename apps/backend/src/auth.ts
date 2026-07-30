@@ -203,6 +203,72 @@ export async function verifyExtensionToken(
   return tenantId ? { tenantId } : null;
 }
 
+/**
+ * Positive-only cache for directory device credentials, keyed by sha256
+ * digest. Bounds AccountDirectory RPCs on the connect-ticket path to one per
+ * device per minute; never caches misses, so a credential minted by a pairing
+ * claim works on the very next request. Revocation therefore takes up to
+ * DEVICE_CACHE_TTL_MS beyond the directory row flip.
+ */
+const DEVICE_CACHE_TTL_MS = 60_000;
+const DEVICE_CACHE_MAX_ENTRIES = 1024;
+const deviceCredentialCache = new Map<
+  string,
+  { identity: DeviceIdentity; expiresAt: number }
+>();
+
+function deviceCacheGet(digest: string): DeviceIdentity | undefined {
+  const entry = deviceCredentialCache.get(digest);
+  if (entry === undefined) return undefined;
+  if (entry.expiresAt <= Date.now()) {
+    deviceCredentialCache.delete(digest);
+    return undefined;
+  }
+  return entry.identity;
+}
+
+function deviceCachePut(digest: string, identity: DeviceIdentity): void {
+  if (deviceCredentialCache.size >= DEVICE_CACHE_MAX_ENTRIES) {
+    const oldest = deviceCredentialCache.keys().next().value;
+    if (oldest !== undefined) deviceCredentialCache.delete(oldest);
+  }
+  deviceCredentialCache.set(digest, {
+    identity,
+    expiresAt: Date.now() + DEVICE_CACHE_TTL_MS,
+  });
+}
+
+/** Test seam: the cache is module state, shared across a pool-worker run. */
+export function clearDeviceCredentialCache(): void {
+  deviceCredentialCache.clear();
+}
+
+/**
+ * Device auth for both device classes: the legacy DEVICE_TOKENS blob first
+ * (zero new I/O, byte-identical for the canary), then AccountDirectory-
+ * minted `udt_` credentials. Only a `udt_`-prefixed bearer ever pays the
+ * directory RPC, so an unknown non-directory credential costs no I/O.
+ */
+export async function authenticateDeviceComposite(
+  req: Request,
+  env: Env,
+): Promise<DeviceIdentity | null> {
+  const legacy = await authenticateDevice(req, env);
+  if (legacy !== null) return legacy;
+  const header = req.headers.get("Authorization");
+  if (!header?.startsWith(BEARER_PREFIX)) return null;
+  const credential = header.slice(BEARER_PREFIX.length).trim();
+  if (!credential.startsWith("udt_")) return null;
+  const digest = await sha256Hex(credential);
+  const cached = deviceCacheGet(digest);
+  if (cached !== undefined) return cached;
+  const identity = await env.ACCOUNT_DIRECTORY.getByName("directory").verifyDeviceCredential(
+    digest,
+  );
+  if (identity !== null) deviceCachePut(digest, identity);
+  return identity;
+}
+
 export async function authenticateDevice(
   req: Request,
   env: Env,
@@ -409,6 +475,22 @@ export async function hashProfileStateKey(
   return toHex(new Uint8Array(signature));
 }
 
+/**
+ * Domain-separated HMAC over AUTH_HMAC_SECRET (D8): `<tag>|<value>`, hex.
+ * Tags in use: otp-v1, pair-v1, csrf-v1, consent-v1. Reuses the one existing
+ * secret rather than adding rotation surface inside the same trust boundary;
+ * the tag prefix keeps every use uncorrelatable with the others and with
+ * telemetryPseudonym (which uses NUL-separated framing).
+ */
+export async function taggedHmacHex(env: Env, tag: string, value: string): Promise<string> {
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    await importHmacKey(env.AUTH_HMAC_SECRET),
+    new TextEncoder().encode(`${tag}|${value}`),
+  );
+  return toHex(new Uint8Array(signature));
+}
+
 export async function telemetryPseudonym(
   domain: string,
   value: string,
@@ -456,7 +538,7 @@ async function importNamedHmacKey(secret: string): Promise<CryptoKey> {
   return importHmacKey(secret);
 }
 
-async function sha256Hex(value: string): Promise<string> {
+export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return toHex(new Uint8Array(digest));
 }

@@ -20,7 +20,8 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `src/session.ts` | `SessionAgent` — the per-session Durable Object: WS auth, event routing, `dispatch`/`fillSecret` RPCs (typed `DispatchOutcome`, write-replay cache) | Changing session lifecycle, dryRun behavior, fill_secret dispatch, idempotent replay |
 | `src/coordinator.ts` | `SessionCoordinator` — portable command↔event correlation interface + failure-prefix constants, no Cloudflare imports | Understanding the portable seam, swapping the CF impl |
 | `src/coordinator-cf.ts` | `CfSessionCoordinator` — CF impl: pending map (+ duplicate-in-flight guard) + persisted awaiting-marker + hibernation reconciliation | Debugging a stuck/timed-out command, hibernation edge cases |
-| `src/auth.ts` | Caller bearer-token auth, fresh/idempotent sessionId minting, HMAC tenant scope, extension-token verification | Changing auth, session creation, token types, or 401/404 behavior |
+| `src/auth.ts` | Caller bearer-token auth, fresh/idempotent sessionId minting, HMAC tenant scope, extension-token verification, composite device auth (`udt_` via directory + 60s positive cache), `taggedHmacHex` | Changing auth, session creation, token types, or 401/404 behavior |
+| `src/account-directory.ts` | `AccountDirectory` — singleton SQLite DO: users (acct- tenants), email OTP, dashboard cookie sessions, paired devices, pairing codes, `usk_` MCP tokens; daily sweep alarm | Changing accounts, OTP/pairing semantics, credential formats, or display-once rules |
 | `src/secrets.ts` | `resolveSecret` — vault lookup only, no dispatch | Changing the vault backend, debugging secret resolution failures |
 | `src/vault.ts` | AES-256-GCM envelope codec + `EncryptedKvVault`/`createVault` — KV holds ciphertext only | Changing the envelope format/key handling (mirror `scripts/vault-put.mjs`) |
 | `src/base64url.ts` | base64url codec shared by auth.ts and vault.ts | Rarely — codec changes |

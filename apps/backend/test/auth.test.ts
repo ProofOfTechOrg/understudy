@@ -33,6 +33,12 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
     SESSION: {} as unknown as Env["SESSION"],
     DEVICE: {} as unknown as Env["DEVICE"],
     TENANT_CONTROL: {} as unknown as Env["TENANT_CONTROL"],
+    // Throws if reached: nothing in these unit tests may pay a directory RPC.
+    ACCOUNT_DIRECTORY: {
+      getByName() {
+        throw new Error("directory RPC in an auth unit test");
+      },
+    } as unknown as Env["ACCOUNT_DIRECTORY"],
     VAULT: {} as unknown as Env["VAULT"],
     AUTH_HMAC_SECRET: "test-hmac-secret-do-not-use-in-prod",
     CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),

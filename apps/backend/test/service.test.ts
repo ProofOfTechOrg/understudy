@@ -14,6 +14,7 @@ import type { SessionStatus } from "../src/types";
 import { encryptSecret } from "../src/vault";
 import {
   CALLER_TOKEN_A,
+  CALLER_TOKEN_ACCT,
   CALLER_TOKEN_B,
   EXTENSION_TOKEN_A,
   EXTENSION_TOKEN_B,
@@ -398,15 +399,31 @@ describe("UNATTENDED_ENABLED_TENANTS gate", () => {
     });
   });
 
-  it("admits every tenant on a wildcard, which is why the wildcard is banned", async () => {
+  it("admits nobody on a wildcard — the banned capability no longer exists", async () => {
     // #given a wildcard allowlist, and a tenant no rollout ever named
     await withAllowlist('["*"]', async () => {
       // #when tenantB asks for an unattended session
       const res = await createUnattended(CALLER_TOKEN_B, "aaaaaaaa-0000-4000-8000-000000000003");
 
-      // #then it is admitted. Every doc that bans "*" cites this behaviour, so
-      // deleting the `includes("*")` branch as an unused escape hatch must fail
-      // here rather than silently making those documents wrong.
+      // #then it is refused by the gate. The docs have always banned "*";
+      // enabledForTenant used to honour it anyway, and this test pinned that
+      // gap so it could not be closed silently. It is now closed on purpose:
+      // classes are enabled with explicit "prefix:" entries instead.
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: "unattended sessions are disabled" });
+    });
+  });
+
+  it("admits a tenant class via an explicit prefix entry", async () => {
+    // #given the allowlist enables the self-serve account class, not a name
+    await withAllowlist('["prefix:acct-"]', async () => {
+      // #when an acct- tenant asks for an unattended session
+      const res = await createUnattended(
+        CALLER_TOKEN_ACCT,
+        "aaaaaaaa-0000-4000-8000-000000000004",
+      );
+
+      // #then it passes the gate and fails later, on there being no device
       expect(res.status).toBe(503);
       expect(await res.json()).toEqual({ error: "no online compatible device" });
     });
