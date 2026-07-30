@@ -141,10 +141,14 @@
     // extension is protocol-1. @understudy/connector has sent that header
     // unconditionally since 0.5.0, so a consumer on a current connector never
     // gets there — this guards a caller on an older one, or a hand-rolled POST.
-    // Enable it for a tenant (or class) whenever that tenant is enabled above;
-    // for "prefix:acct-" it is also the prompt-injection backstop: writes from
-    // MCP-driven sessions run the safe-write v2 protocol regardless of what a
-    // page told the model.
+    // Enable it for a tenant (or class) whenever that tenant is enabled above.
+    //
+    // Note re MCP: the "prefix:acct-" entry is defence-in-depth only. MCP
+    // always dispatches with contractV2:true (account-agent.ts), so its writes
+    // are protected by dispatchV2's protocol-2 requirement, not by this flag —
+    // and an acct- tenant holds no CALLER_TOKENS entry, so it cannot reach the
+    // legacy branch at all. The entry keeps the two allowlists symmetric and
+    // guards against any future non-MCP acct- caller.
     "SAFE_WRITE_REQUIRED_TENANTS": "[\"metamind\", \"prefix:acct-\"]"
   },
   "analytics_engine_datasets": [

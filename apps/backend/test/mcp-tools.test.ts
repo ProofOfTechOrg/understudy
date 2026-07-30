@@ -243,10 +243,10 @@ describe("MCP cross-tenant isolation", () => {
     const a = await pairedTenant();
     // A stores a secret; a fill_secret from A targets vault://<A>/name.
     await writeVaultSecret(env, a.tenantId, "pw", "sekret");
-    expect(await listVaultSecretNames(env.VAULT, a.tenantId)).toContain("pw");
+    expect(await listVaultSecretNames(env, a.tenantId)).toContain("pw");
     // A different tenant cannot see it.
     const b = await pairedTenant();
-    expect(await listVaultSecretNames(env.VAULT, b.tenantId)).not.toContain("pw");
+    expect(await listVaultSecretNames(env, b.tenantId)).not.toContain("pw");
   });
 });
 

@@ -119,7 +119,7 @@ dashboardApp.get("/dashboard", async (c) => {
   const [directoryDevices, tokens, secretNames, liveDevices, uploadKey] = await Promise.all([
     directory(c.env).listDevices(user.userId),
     directory(c.env).listMcpTokens(user.userId),
-    listVaultSecretNames(c.env.VAULT, user.tenantId),
+    listVaultSecretNames(c.env, user.tenantId),
     listLiveDevices(c.env, { actor: `dashboard:${user.userId}`, tenantId: user.tenantId }),
     uploadPublicJwk(c.env),
   ]);

@@ -9,6 +9,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { sha256Hex, taggedHmacHex } from "../src/auth";
+import { safeNext } from "../src/dashboard/auth";
 import { base64urlEncode } from "../src/base64url";
 import { sendOtpEmail } from "../src/dashboard/email";
 import type { Env } from "../src/types";
@@ -55,6 +56,27 @@ async function signedInUser(): Promise<{
     csrf: await taggedHmacHex(env, "csrf-v1", session.token),
   };
 }
+
+describe("safeNext guard", () => {
+  it("rejects a /oauth/authorize target carrying CR/LF, NUL, or backslash", () => {
+    // These start with the required prefix, so ONLY NEXT_FORBIDDEN can reject
+    // them — deleting the control-char guard would let a CR/LF Location value
+    // through and throw a 500 (or worse) inside c.redirect().
+    expect(safeNext("/oauth/authorize?x=1\r\nSet-Cookie: evil=1")).toBe("/dashboard");
+    expect(safeNext("/oauth/authorize?x=1\nfoo")).toBe("/dashboard");
+    expect(safeNext("/oauth/authorize?x=1\tfoo")).toBe("/dashboard");
+    expect(safeNext("/oauth/authorize?x=a\\b")).toBe("/dashboard");
+  });
+
+  it("preserves a clean /oauth/authorize target and collapses everything else", () => {
+    expect(safeNext("/oauth/authorize?client_id=abc&scope=mcp")).toBe(
+      "/oauth/authorize?client_id=abc&scope=mcp",
+    );
+    expect(safeNext("/evil")).toBe("/dashboard");
+    expect(safeNext("//evil.example")).toBe("/dashboard");
+    expect(safeNext(undefined)).toBe("/dashboard");
+  });
+});
 
 describe("OTP email seam", () => {
   it("sends through the emulated binding on the happy path", async () => {
@@ -340,7 +362,7 @@ describe("dashboard vault upload", () => {
     // #then the standard envelope round-trips through the decrypting vault
     expect(res.status).toBe(303);
     expect(await createVault(env).get(`vault://${user.tenantId}/${name}`)).toBe("hunter2");
-    expect(await listVaultSecretNames(env.VAULT, user.tenantId)).toContain(name);
+    expect(await listVaultSecretNames(env, user.tenantId)).toContain(name);
   });
 
   it("rejects a garbage ciphertext without writing", async () => {
@@ -354,7 +376,7 @@ describe("dashboard vault upload", () => {
     );
     expect(await bad.text()).toContain("could not be read");
     // Nothing was written under this tenant's namespace.
-    expect(await listVaultSecretNames(env.VAULT, user.tenantId)).not.toContain(name);
+    expect(await listVaultSecretNames(env, user.tenantId)).not.toContain(name);
   });
 
   it("rejects a hostile name via the name guard specifically, with a VALID payload", async () => {

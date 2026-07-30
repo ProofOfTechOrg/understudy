@@ -365,6 +365,15 @@ textarea:focus {
   color: var(--red);
 }
 
+/* "Advanced: manual configuration" disclosure inside the profile-host card. */
+details > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 4px 0 8px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .button:hover {
     transform: none;

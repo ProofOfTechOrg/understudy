@@ -38,7 +38,6 @@ pre { background: color-mix(in srgb, CanvasText 6%, Canvas); padding: 10px; bord
 .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); }
 .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 form.inline-form { display: inline; }
-details > summary { cursor: pointer; font-weight: 600; font-size: 13px; margin: 4px 0; color: color-mix(in srgb, CanvasText 70%, Canvas); }
 `;
 
 /** Copy buttons + countdown; loaded on every page, wired by data attributes. */
@@ -216,7 +215,7 @@ export function homePage(data: HomeData): Fragment {
       : data.devices.map(
           (device) => html`<tr>
   <td><code>${device.label ?? device.deviceId.slice(0, 8)}</code></td>
-  <td><span class="pill">${device.status}</span>
+  <td><span class="pill">${device.status.replace(/_/g, " ")}</span>
       ${device.used !== null && device.capacity !== null
         ? html`<span class="muted">${device.used}/${device.capacity} sessions</span>`
         : ""}</td>

@@ -115,15 +115,13 @@ export class EncryptedKvVault implements VaultBinding {
 
 /**
  * Secret names (the tail after `vault://<tenantId>/`) for one tenant,
- * sorted. Values are never read: this walks key names in the ciphertext
- * store only, which is what lets browser_list_secrets exist without ever
+ * sorted. Values are never read: this walks key names through the same
+ * EncryptedKvVault wrapper that owns reads and writes, and listing never
+ * decrypts — which is what lets browser_list_secrets exist without ever
  * being able to leak a value.
  */
-export async function listVaultSecretNames(
-  vault: VaultBinding,
-  tenantId: string,
-): Promise<string[]> {
-  if (vault.list === undefined) return [];
+export async function listVaultSecretNames(env: Env, tenantId: string): Promise<string[]> {
+  const vault = createVault(env);
   const prefix = `vault://${tenantId}/`;
   const names: string[] = [];
   let cursor: string | undefined;

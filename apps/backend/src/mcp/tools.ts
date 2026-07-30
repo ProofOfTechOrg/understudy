@@ -470,7 +470,7 @@ export function registerTools(server: McpServer, host: McpToolHost): void {
     },
     () =>
       withProps(async (props) => {
-        const names = await listVaultSecretNames(host.env.VAULT, props.tenantId);
+        const names = await listVaultSecretNames(host.env, props.tenantId);
         if (names.length === 0) {
           return textResult(
             "No vault secrets are stored for this account. The user can add them in the dashboard.",
