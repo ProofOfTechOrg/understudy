@@ -7,6 +7,7 @@ import {
   safeParseDeviceControlServerFrame,
   type DeviceControlClientFrame,
 } from "@understudy/protocol";
+import type { ProfileBlockReason } from "../messaging";
 import {
   SessionManager,
   StaleProvisionError,
@@ -29,13 +30,7 @@ const TICKET_BACKOFF_BASE_MS = 500;
 const TICKET_BACKOFF_CAP_MS = 30_000;
 
 type ControlPurpose = "hosting" | "cleanup";
-export type ControlBlockReason =
-  | "replaced"
-  | "terminal_close"
-  | "ticket_rejected"
-  | "invalid_ticket";
-
-export type ProfileBlockReason = ControlBlockReason | "credential_revoked";
+type ControlBlockReason = "replaced" | "terminal_close" | "ticket_rejected" | "invalid_ticket";
 
 interface ControlBlock {
   version: 1;

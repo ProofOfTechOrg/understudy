@@ -12,6 +12,7 @@
  */
 
 import type { Event } from "@understudy/protocol";
+import { DASHBOARD_URL } from "../canonical";
 import type {
   CloseBrowserResult,
   DeviceSummary,
@@ -20,6 +21,9 @@ import type {
   RunCommandResult,
   StatusReport,
 } from "../account-agent";
+// DeviceSummary is re-exported from account-agent as the service layer's
+// AccountDeviceView; imported above via the DO module so tool code has one
+// import site for the MCP contract types.
 
 export type ToolContent =
   | { type: "text"; text: string }
@@ -30,8 +34,6 @@ export interface ToolResult {
   isError?: boolean;
   [key: string]: unknown;
 }
-
-export const DASHBOARD_URL = "https://understudy.proofof.tech/dashboard";
 
 const STALE_REFS_TEXT =
   "Stale refs: the page navigated since your last snapshot. " +
@@ -340,7 +342,7 @@ export function mapStatusReport(report: StatusReport): ToolResult {
   return textResult(lines.join("\n"));
 }
 
-export function mapGetResult(outcome: GetResultOutcome, tool: string): ToolResult {
+export function mapGetResult(tool: string, outcome: GetResultOutcome): ToolResult {
   switch (outcome.kind) {
     case "no_session":
       return errorResult("No browser session. Call browser_open first.");

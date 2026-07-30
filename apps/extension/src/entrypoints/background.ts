@@ -826,7 +826,7 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
       fireAndForget("stopAll", () => profileClient.stopAll());
       break;
     case "pair":
-      fireAndForget("pair", () => pairDevice(msg.code, msg.serviceOrigin));
+      fireAndForget("pair", () => pairDevice(msg.code));
       break;
   }
 }
@@ -835,11 +835,11 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
 // SAME profileClient.configure path the manual form uses — a fresh
 // deviceId+credential per redemption means the new profileKey can never
 // match a stored ControlBlock, so pairing again is the universal recovery.
-async function pairDevice(code: string, serviceOrigin?: string): Promise<void> {
+async function pairDevice(code: string): Promise<void> {
   pairingState = { phase: "pairing" };
   broadcastState();
   try {
-    const result = await redeemPairingCode(code, serviceOrigin);
+    const result = await redeemPairingCode(code);
     await profileClient.configure({
       serviceOrigin: result.serviceOrigin,
       unattendedEnabled: result.unattendedEnabled,

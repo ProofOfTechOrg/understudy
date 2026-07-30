@@ -1,17 +1,27 @@
 /**
- * The OTP email seam. A seam (not an inline env.EMAIL.send) because the
- * vitest workers pool does not emulate the send_email binding — tests drive
- * OTP through the directory RPC instead — and because the failure contract
- * matters: a send failure must stay silent (the request-code route answers
- * identically either way) and the code must never reach a log line.
+ * The OTP email seam. A seam (not an inline env.EMAIL.send) so a per-send
+ * failure stays silent — the request-code route answers identically whether
+ * the address exists, is rate-limited, or bounced, and the code must never
+ * reach a log line. The vitest workers pool DOES emulate send_email, so the
+ * happy path is exercised there; only the binding-absent branch is not.
+ *
+ * The two failure modes are treated differently: a PER-SEND throw is silent
+ * (it may carry the address/code and is an anti-enumeration concern), but a
+ * MISSING binding is a global misconfiguration with no address attached, so
+ * it emits a content-free telemetry signal — otherwise a de-onboarded domain
+ * or a dropped binding would silently break every sign-in with no signal.
  */
 
+import { emitTelemetry } from "../telemetry";
 import type { Env } from "../types";
 
 const FROM = { email: "sign-in@proofof.tech", name: "Understudy" };
 
 export async function sendOtpEmail(env: Env, to: string, code: string): Promise<boolean> {
-  if (env.EMAIL === undefined) return false;
+  if (env.EMAIL === undefined) {
+    await emitTelemetry(env, { event: "authentication", outcome: "otp_email_unconfigured" });
+    return false;
+  }
   try {
     await env.EMAIL.send({
       to,

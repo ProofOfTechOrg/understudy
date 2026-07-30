@@ -66,7 +66,9 @@ const IDEMPOTENCY_INPUT = z
   );
 
 function actorRef(props: UnderstudyMcpProps): McpActorRef {
-  return { userId: props.userId, actorId: props.actorId };
+  // Only the pseudonymous actor id crosses into the DO; the tenant is the
+  // DO's own name, so a foreign userId can never widen access.
+  return { actorId: props.actorId };
 }
 
 export function registerTools(server: McpServer, host: McpToolHost): void {
@@ -496,11 +498,11 @@ export function registerTools(server: McpServer, host: McpToolHost): void {
     (args) =>
       withProps(async (props) =>
         mapGetResult(
+          "browser_get_result",
           await host.env.ACCOUNT.getByName(props.tenantId).getResult(
             actorRef(props),
             args.commandId,
           ),
-          "browser_get_result",
         ),
       ),
   );

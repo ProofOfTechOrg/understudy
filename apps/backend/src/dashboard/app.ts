@@ -7,9 +7,16 @@
 
 import { Hono, type Context } from "hono";
 import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
-import { sha256Hex, taggedHmacHex, unauthenticatedRateAllowed } from "../auth";
-import { listDevices as listLiveDevices } from "../api/sessions";
+import { getDirectory } from "../account-directory";
+import {
+  sha256Hex,
+  taggedHmacHex,
+  timingSafeHexEqual,
+  unauthenticatedRateAllowed,
+} from "../auth";
+import { listDevices as listLiveDevices, mergeDeviceViews } from "../api/sessions";
 import { base64urlDecode, base64urlEncode } from "../base64url";
+import { emitTelemetry } from "../telemetry";
 import type { Env } from "../types";
 import { listVaultSecretNames, VAULT_SECRET_NAME_PATTERN, writeVaultSecret } from "../vault";
 import {
@@ -46,7 +53,9 @@ const NOTICES: Record<string, string> = {
   "origins-saved": "Allowed origins saved.",
   "secret-saved": "Vault secret saved.",
   "token-revoked": "API token revoked.",
+  "token-missing": "That API token was already gone.",
   "device-revoked": "Browser revoked. Pair again with a fresh code to reconnect it.",
+  "device-missing": "That browser was already gone.",
 };
 
 dashboardApp.use("*", async (c, next) => {
@@ -62,11 +71,23 @@ dashboardApp.use("*", async (c, next) => {
   );
 });
 
-const directory = (env: Env) => env.ACCOUNT_DIRECTORY.getByName("directory");
+const directory = getDirectory;
+
+// A dashboard form value, bounded BEFORE it crosses into the singleton
+// directory DO — an oversized field from one account must not be buffered and
+// processed inside the object every other account's auth depends on. 16 KB
+// clears the largest legitimate field (a sealed vault ciphertext, ≤ ~11 KB
+// base64; the origins textarea and a serialized auth request are far smaller).
+const MAX_FIELD_BYTES = 16384;
 
 function field(body: Record<string, unknown>, name: string): string {
   const value = body[name];
-  return typeof value === "string" ? value : "";
+  return typeof value === "string" ? value.slice(0, MAX_FIELD_BYTES) : "";
+}
+
+/** HMAC binding a rendered consent form to this exact request AND session. */
+function consentSig(env: Env, authreq: string, cookieToken: string): Promise<string> {
+  return taggedHmacHex(env, "consent-v1", `${authreq}|${cookieToken}`);
 }
 
 type Ctx = Context<DashboardContext>;
@@ -102,18 +123,14 @@ dashboardApp.get("/dashboard", async (c) => {
     listLiveDevices(c.env, { actor: `dashboard:${user.userId}`, tenantId: user.tenantId }),
     uploadPublicJwk(c.env),
   ]);
-  const liveById = new Map(liveDevices.map((device) => [device.deviceId, device]));
-  const devices: HomeDevice[] = directoryDevices.map((device) => {
-    const live = liveById.get(device.deviceId);
-    return {
-      deviceId: device.deviceId,
-      label: device.label,
-      status: live?.status ?? "never connected",
-      used: live?.used ?? null,
-      capacity: live?.capacity ?? null,
-      lastSeenAt: live?.lastSeenAt ?? null,
-    };
-  });
+  const devices: HomeDevice[] = mergeDeviceViews(directoryDevices, liveDevices).map((view) => ({
+    deviceId: view.deviceId,
+    label: view.label,
+    status: view.status,
+    used: view.used,
+    capacity: view.capacity,
+    lastSeenAt: view.lastSeenAt,
+  }));
   const noticeKey = c.req.query("notice");
   return render(
     c,
@@ -170,6 +187,7 @@ dashboardApp.post("/dashboard/auth/verify", async (c) => {
   const next = safeNext(field(body, "next"));
   const verified = await directory(c.env).verifyOtp(challengeId, code);
   if (verified.kind !== "ok") {
+    await emitTelemetry(c.env, { event: "authentication", outcome: "dashboard_otp_failed" });
     return render(
       c,
       "Enter your code — Understudy",
@@ -181,6 +199,12 @@ dashboardApp.post("/dashboard/auth/verify", async (c) => {
       }),
     );
   }
+  await emitTelemetry(c.env, {
+    event: "authentication",
+    outcome: "dashboard_login",
+    tenantId: verified.tenantId,
+    actor: verified.userId,
+  });
   const session = await directory(c.env).createDashboardSession(verified.userId);
   c.header("Set-Cookie", sessionCookie(session.token));
   return c.redirect(next, 303);
@@ -257,16 +281,16 @@ dashboardApp.post("/dashboard/tokens/revoke", async (c) => {
   const body = await c.req.parseBody();
   const user = await authedPost(c, body);
   if (user instanceof Response) return user;
-  await directory(c.env).revokeMcpToken(user.userId, field(body, "tokenId"));
-  return c.redirect("/dashboard?notice=token-revoked", 303);
+  const revoked = await directory(c.env).revokeMcpToken(user.userId, field(body, "tokenId"));
+  return c.redirect(`/dashboard?notice=${revoked ? "token-revoked" : "token-missing"}`, 303);
 });
 
 dashboardApp.post("/dashboard/devices/revoke", async (c) => {
   const body = await c.req.parseBody();
   const user = await authedPost(c, body);
   if (user instanceof Response) return user;
-  await directory(c.env).revokeDevice(user.userId, field(body, "deviceId"));
-  return c.redirect("/dashboard?notice=device-revoked", 303);
+  const revoked = await directory(c.env).revokeDevice(user.userId, field(body, "deviceId"));
+  return c.redirect(`/dashboard?notice=${revoked ? "device-revoked" : "device-missing"}`, 303);
 });
 
 dashboardApp.get("/dashboard/vault/pubkey", async (c) => {
@@ -349,9 +373,10 @@ dashboardApp.get("/oauth/authorize", async (c) => {
       email: user.email,
       csrf: await csrfTokenFor(c.env, user.cookieToken),
       authreq,
-      // Binds the rendered request to the submitted one, so it cannot be
-      // swapped between render and submit.
-      sig: await taggedHmacHex(c.env, "consent-v1", authreq),
+      // Binds the rendered request to the submitted one AND to this session,
+      // so it cannot be swapped between render and submit or replayed under a
+      // different login.
+      sig: await consentSig(c.env, authreq, user.cookieToken),
     }),
   );
 });
@@ -366,7 +391,7 @@ dashboardApp.post("/oauth/authorize", async (c) => {
   const sig = field(body, "sig");
   if (
     authreq.length === 0 ||
-    (await taggedHmacHex(c.env, "consent-v1", authreq)) !== sig
+    !timingSafeHexEqual(await consentSig(c.env, authreq, user.cookieToken), sig)
   ) {
     return c.text("stale consent form", 403);
   }
@@ -402,9 +427,25 @@ dashboardApp.post("/oauth/authorize", async (c) => {
       scopes: ["mcp"],
     },
   });
+  await emitTelemetry(c.env, {
+    event: "authentication",
+    outcome: "oauth_grant",
+    tenantId: user.tenantId,
+    actor: user.userId,
+  });
   return c.redirect(redirectTo, 302);
 });
 
 dashboardApp.all("*", (c) => {
   return c.text("not found", 404);
+});
+
+// Scrubbed error boundary for the whole dashboard/consent plane, mirroring
+// the /v1 app's onError. Without it a throw (a directory RPC fault, a
+// malformed upload key) would surface as an unscrubbed 500 for sign-in,
+// pairing, and revocation alike.
+dashboardApp.onError((_error, c) => {
+  console.error("unhandled dashboard error");
+  c.header("Cache-Control", "no-store");
+  return c.text("internal error", 500);
 });

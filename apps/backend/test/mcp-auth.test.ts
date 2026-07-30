@@ -10,21 +10,17 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { sha256Hex } from "../src/auth";
 import { clearMcpTokenCache, tryStaticMcpAuth } from "../src/mcp/static-auth";
 import type { Env } from "../src/types";
+import { directory, mintUser } from "./helpers";
 
 const MCP_URL = "https://understudy.proofof.tech/mcp";
 
-const directory = () => env.ACCOUNT_DIRECTORY.getByName("directory");
-
 async function mintUserToken(): Promise<{ userId: string; tenantId: string; token: string; tokenId: string }> {
-  const requested = await directory().requestOtp(`${crypto.randomUUID()}@example.com`);
-  if (requested.kind !== "ok") throw new Error("otp request failed");
-  const verified = await directory().verifyOtp(requested.challengeId, requested.code);
-  if (verified.kind !== "ok") throw new Error("otp verify failed");
-  const created = await directory().createMcpToken(verified.userId, "test");
+  const user = await mintUser();
+  const created = await directory().createMcpToken(user.userId, "test");
   if (created === null) throw new Error("token mint failed");
   return {
-    userId: verified.userId,
-    tenantId: verified.tenantId,
+    userId: user.userId,
+    tenantId: user.tenantId,
     token: created.token,
     tokenId: created.tokenId,
   };
@@ -143,6 +139,8 @@ describe("static MCP auth", () => {
     const identity = await directory().verifyMcpToken(digest);
     expect(identity).toMatchObject({ tenantId: minted.tenantId });
     const listed = await directory().listMcpTokens(minted.userId);
-    expect(JSON.stringify(listed)).not.toContain(minted.token.split("_")[3] ?? "!");
+    // The 43-char secret tail must never appear in a listing; a fixed slice
+    // avoids the split("_") flakiness (base64url secrets can contain "_").
+    expect(JSON.stringify(listed)).not.toContain(minted.token.slice(-24));
   });
 });

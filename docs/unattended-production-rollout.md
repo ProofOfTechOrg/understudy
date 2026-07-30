@@ -49,6 +49,7 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Phase 5b: five-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 5c: all-allowlisted 24-hour gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 6: rollout closeout | Not started | Pending | Pending | Pending | Pending | Release operator |
+| Side surface: authed MCP server + account/pairing dashboard | In progress | `dev` branch `mcp-4-dashboard-pairing` (SHA stamped at merge) | **Pending — deploying this resets the Phase 3b soak clock.** Adds migrations `v3` (`AccountDirectory`) and `v4` (`UnderstudyMcp`, `AccountAgent`), bindings `MCP_AGENT`/`ACCOUNT`/`ACCOUNT_DIRECTORY`/`OAUTH_KV`/`EMAIL`, and secret `VAULT_UPLOAD_PRIVATE_KEY` (must be `wrangler secret put` before deploy). Both allowlists become `["metamind", "prefix:acct-"]` | Built and green on branch: backend 305 tests + `wrangler deploy --dry-run`, extension 145 tests + build. Additive only — new routes/DOs/bindings; the per-command path, `/v1` API, and soak-owned device/lease behavior are unchanged (`ws-client.ts` and `tenant-coordinator.ts` byte-identical, `profile-client.ts` additive-only). Quality gate + security review run on the branch. **Not yet deployed** | Pending | Engineering |
 
 ## Unplanned Phase 1b deployment (2026-07-28)
 
@@ -1079,6 +1080,12 @@ Started `2026-07-29T18:10:33Z` on the v2 driver, stopped `19:12:23Z`. Four reads
 It was halted, not failed. It had already passed the 40-minute mark where run 1 died, which supports the network event as run 1's cause rather than anything periodic. Stopped because the diagnosis in `docs/plan-network-blip-resilience.md` deliberately breaks connectivity, which would destroy a running soak and confuse the two results. Evidence archived as `~/.understudy-canary/soak-run2-HALTED-*.jsonl`.
 
 **Phase 3b restarts from zero once the network-blip work concludes.** A soak that passes while that defect is live proves little, and one that fails on a random network transition costs another day.
+
+## The authed MCP surface will also reset the soak clock (2026-07-31)
+
+The self-serve MCP work (branch `mcp-4-dashboard-pairing`) is built and green but **not deployed**. Per the explicit instruction, it was not gated on the soak. It is additive — new routes, DOs (`AccountDirectory`, `UnderstudyMcp`, `AccountAgent`), bindings (`MCP_AGENT`, `ACCOUNT`, `ACCOUNT_DIRECTORY`, `OAUTH_KV`, `EMAIL`), and secret `VAULT_UPLOAD_PRIVATE_KEY` — and touches neither the per-command path nor the soak-owned device/lease code (`apps/extension/src/core/ws-client.ts` and `apps/backend/src/tenant-coordinator.ts` are byte-identical on the branch; `profile-client.ts` gains only a read-only accessor). It is therefore incapable of changing device or session behavior.
+
+It still forces a Worker redeploy carrying migrations `v3`+`v4`, so **deploying it restarts Phase 3b from zero for the same reason the network-blip work does** — a running soak cannot survive a deploy. Sequence it with the network-blip conclusion so the two share one clock reset rather than costing two. Before that deploy: `wrangler secret put VAULT_UPLOAD_PRIVATE_KEY` (a fresh P-256 PKCS#8 key, not the dev placeholder), then verify `/health`, the two well-known metadata documents, and one real MCP handshake, and record the version + reset here.
 
 ## Phase 4: Switch Metamind to unattended and prove governance
 

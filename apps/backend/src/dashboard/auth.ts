@@ -6,7 +6,8 @@
  */
 
 import type { DashboardSessionIdentity } from "../account-directory";
-import { sha256Hex, taggedHmacHex } from "../auth";
+import { getDirectory } from "../account-directory";
+import { sha256Hex, taggedHmacHex, timingSafeHexEqual } from "../auth";
 import type { Env } from "../types";
 
 export const DASH_COOKIE = "__Host-understudy_dash";
@@ -32,9 +33,7 @@ export async function sessionFromRequest(
 ): Promise<DashboardUser | null> {
   const token = cookieValue(request.headers.get("Cookie"), DASH_COOKIE);
   if (token === null || token.length < 16 || token.length > 128) return null;
-  const identity = await env.ACCOUNT_DIRECTORY.getByName("directory").getDashboardSession(
-    await sha256Hex(token),
-  );
+  const identity = await getDirectory(env).getDashboardSession(await sha256Hex(token));
   if (identity === null) return null;
   return { ...identity, cookieToken: token };
 }
@@ -65,7 +64,7 @@ export async function csrfValid(
   submitted: unknown,
 ): Promise<boolean> {
   if (typeof submitted !== "string" || submitted.length === 0) return false;
-  return (await csrfTokenFor(env, cookieToken)) === submitted;
+  return timingSafeHexEqual(await csrfTokenFor(env, cookieToken), submitted);
 }
 
 /** Strict same-origin check for every dashboard/consent POST: absent ⇒ 403. */
@@ -74,6 +73,14 @@ export function originAllowed(request: Request): boolean {
   if (origin === null) return false;
   return origin === new URL(request.url).origin;
 }
+
+// Rejects control characters (U+0000–U+001F, incl. CR/LF) and backslash.
+// `next` is later handed to c.redirect(), and a CR/LF in a Location value
+// throws inside the Headers implementation — an ungraceful 500 from a
+// phishable link. Normal query characters (?, =, &, letters, digits) are all
+// above U+001F and pass.
+// eslint-disable-next-line no-control-regex
+const NEXT_FORBIDDEN = /[\u0000-\u001f\\]/;
 
 /**
  * Open-redirect guard for the post-login `next` target. Its only legitimate
@@ -85,7 +92,7 @@ export function safeNext(raw: unknown): string {
     typeof raw === "string" &&
     raw.startsWith("/oauth/authorize") &&
     !raw.startsWith("//") &&
-    !raw.includes("\\")
+    !NEXT_FORBIDDEN.test(raw)
   ) {
     return raw;
   }

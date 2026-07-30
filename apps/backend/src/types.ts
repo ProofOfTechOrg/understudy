@@ -143,7 +143,11 @@ export interface Env {
    * `secrets.required`.
    */
   VAULT_UPLOAD_PRIVATE_KEY: string;
-  /** Email Sending binding for sign-in OTPs; absent in the test pool (the send seam no-ops). */
+  /**
+   * Email Sending binding for sign-in OTPs. Optional so the send seam can
+   * signal (not throw) when it is unbound; the vitest pool DOES emulate it,
+   * so the happy path runs in tests. See dashboard/email.ts.
+   */
   EMAIL?: SendEmail;
 }
 

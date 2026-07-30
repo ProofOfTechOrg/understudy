@@ -47,8 +47,6 @@ export interface StopAllMsg {
 export interface PairMsg {
   type: "pair";
   code: string;
-  /** Overrides the production service origin (dev/support only). */
-  serviceOrigin?: string;
 }
 
 export type PanelMsg =
@@ -61,6 +59,23 @@ export type PanelMsg =
   | PairMsg;
 
 export type PairingPhase = "pairing" | "paired" | "error";
+
+/**
+ * Why the client is suppressing reconnects: a persisted ControlBlock reason
+ * or a revoked credential. Owned here (the message shape) so the side panel
+ * and profile-client agree on the exact set and every reason gets copy.
+ */
+export type ProfileBlockReason =
+  | "replaced"
+  | "terminal_close"
+  | "ticket_rejected"
+  | "invalid_ticket"
+  | "credential_revoked";
+
+export interface PairingState {
+  phase: PairingPhase;
+  message?: string;
+}
 
 export interface StateMsg {
   type: "state";
@@ -76,12 +91,9 @@ export interface StateMsg {
     originPolicy: string[];
   } | null;
   /** Progress of the most recent side-panel pairing attempt, if any. */
-  pairing?: { phase: PairingPhase; message?: string };
-  /**
-   * Why profileStatus is "error", when the client knows (ControlBlock reason
-   * or a revoked credential) — the panel renders per-reason recovery copy.
-   */
-  profileStatusReason?: string;
+  pairing?: PairingState;
+  /** Why profileStatus is "error", when the client knows the reason. */
+  profileStatusReason?: ProfileBlockReason;
   logs: LogEntry[];
 }
 

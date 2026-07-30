@@ -24,16 +24,24 @@ import {
   type Event,
   type UnattendedSessionLifecycle,
 } from "@understudy/protocol";
+import { getDirectory } from "./account-directory";
 import {
   createSession,
   deleteSession,
   dispatchCommand,
   getSessionStatus,
   listDevices,
+  mergeDeviceViews,
   pollCommand,
+  type AccountDeviceView,
 } from "./api/sessions";
 import type { Actor } from "./auth";
 import { sha256Hex } from "./auth";
+import { CANONICAL_BASE_URL } from "./canonical";
+import {
+  runDispatchLoop,
+  type DispatchStep,
+} from "./mcp/dispatch-loop";
 import type { Env } from "./types";
 import { canonicalizeOrigins, RequestBodyError, stableJson } from "./validation";
 
@@ -42,27 +50,30 @@ import { canonicalizeOrigins, RequestBodyError, stableJson } from "./validation"
  * outcomes. MCP polling happens in-process (never via these URLs), so the
  * canonical host is correct even when the MCP request arrived elsewhere.
  */
-const CANONICAL_URL = "https://understudy.proofof.tech/";
-const DISPATCH_RETRY_LIMIT = 2;
-const BUSY_RETRY_LIMIT = 5;
-const BUSY_RETRY_DELAY_MS = 2_000;
-const PENDING_POLL_INTERVAL_MS = 2_000;
-const PENDING_POLL_BUDGET_MS = 30_000;
+const CANONICAL_URL = CANONICAL_BASE_URL;
 
 const BINDING_KEY = "binding";
 const REFS_VALID_KEY = "refsValid";
 const REFS_EPOCH_KEY = "refsEpoch";
+const REFS_URL_KEY = "refsUrl";
 const PENDING_CREATE_KEY = "pendingCreate";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Who is acting, from UnderstudyMcpProps — tenant comes from this DO's name. */
+/**
+ * Who is acting — the pseudonymous actor id from UnderstudyMcpProps. The
+ * TENANT is this DO's own name, never a parameter, so no caller can pass a
+ * foreign identity: device listing and session scoping both derive from the
+ * name, and a stray userId cannot widen access.
+ */
 export interface McpActorRef {
-  userId: string;
   actorId: string;
 }
+
+/** The device shape MCP tools render, re-exported from the service layer. */
+export type DeviceSummary = AccountDeviceView;
 
 interface BoundSession {
   sessionId: string;
@@ -110,22 +121,6 @@ export type RunCommandResult =
   | { kind: "not_connected" }
   | { kind: "unsupported" }
   | { kind: "terminal_session" };
-
-export interface DeviceSummary {
-  deviceId: string;
-  label: string | null;
-  status:
-    | "online"
-    | "offline"
-    | "recovering"
-    | "disabled"
-    | "incompatible"
-    | "never_connected";
-  used: number | null;
-  capacity: number | null;
-  lastSeenAt: string | null;
-  allowedOrigins: string[];
-}
 
 export type OpenBrowserResult =
   | {
@@ -209,6 +204,15 @@ export class AccountAgent extends DurableObject<Env> {
     return { actor: actor.actorId, tenantId: this.tenantId() };
   }
 
+  /** This tenant's paired devices joined with their live coordinator state. */
+  private async deviceViews(svcActor: Actor): Promise<DeviceSummary[]> {
+    const directoryDevices = await getDirectory(this.env).listDevicesForTenant(
+      this.tenantId(),
+    );
+    if (directoryDevices.length === 0) return [];
+    return mergeDeviceViews(directoryDevices, await listDevices(this.env, svcActor));
+  }
+
   private getBinding(): Promise<BoundSession | undefined> {
     return this.ctx.storage.get<BoundSession>(BINDING_KEY);
   }
@@ -218,18 +222,26 @@ export class AccountAgent extends DurableObject<Env> {
     await this.setRefsValid(false);
   }
 
-  private async setRefsValid(valid: boolean, bumpEpoch = false): Promise<void> {
+  private async setRefsValid(
+    valid: boolean,
+    bumpEpoch = false,
+    url: string | null = null,
+  ): Promise<void> {
     await this.ctx.storage.put(REFS_VALID_KEY, valid);
+    // The URL the current refs were observed at, so a later click that
+    // navigates can be detected by URL change and invalidate them.
+    await this.ctx.storage.put(REFS_URL_KEY, url);
     if (bumpEpoch) {
       const epoch = (await this.ctx.storage.get<number>(REFS_EPOCH_KEY)) ?? 0;
       await this.ctx.storage.put(REFS_EPOCH_KEY, epoch + 1);
     }
   }
 
-  private async refsState(): Promise<{ valid: boolean; epoch: number }> {
+  private async refsState(): Promise<{ valid: boolean; epoch: number; url: string | null }> {
     return {
       valid: (await this.ctx.storage.get<boolean>(REFS_VALID_KEY)) ?? false,
       epoch: (await this.ctx.storage.get<number>(REFS_EPOCH_KEY)) ?? 0,
+      url: (await this.ctx.storage.get<string | null>(REFS_URL_KEY)) ?? null,
     };
   }
 
@@ -278,24 +290,8 @@ export class AccountAgent extends DurableObject<Env> {
       await this.clearBinding();
     }
 
-    const directoryDevices = await this.env.ACCOUNT_DIRECTORY.getByName("directory").listDevices(
-      actor.userId,
-    );
-    if (directoryDevices.length === 0) return { kind: "no_paired_devices" };
-    const live = await listDevices(this.env, svcActor);
-    const liveById = new Map(live.map((device) => [device.deviceId, device]));
-    const summaries: DeviceSummary[] = directoryDevices.map((device) => {
-      const liveDevice = liveById.get(device.deviceId);
-      return {
-        deviceId: device.deviceId,
-        label: device.label,
-        status: liveDevice?.status ?? "never_connected",
-        used: liveDevice?.used ?? null,
-        capacity: liveDevice?.capacity ?? null,
-        lastSeenAt: liveDevice?.lastSeenAt ?? null,
-        allowedOrigins: device.allowedOrigins,
-      };
-    });
+    const summaries = await this.deviceViews(svcActor);
+    if (summaries.length === 0) return { kind: "no_paired_devices" };
 
     const online = summaries.filter(
       (device) =>
@@ -310,7 +306,12 @@ export class AccountAgent extends DurableObject<Env> {
         : { kind: "devices_offline", devices: summaries };
     }
     const chosen = online[0];
-    if (chosen === undefined) return { kind: "devices_offline", devices: summaries };
+    // Unreachable (online.length > 0), but noUncheckedIndexedAccess forces
+    // the guard. Reaching it means a device we just proved online vanished,
+    // which is a create failure, not "everything is offline".
+    if (chosen === undefined) {
+      return { kind: "create_failed", reason: "device state changed mid-open" };
+    }
 
     let allowedOrigins = chosen.allowedOrigins;
     if (input.origins !== undefined) {
@@ -365,37 +366,38 @@ export class AccountAgent extends DurableObject<Env> {
       requestUrl: CANONICAL_URL,
     });
 
+    if (created.kind === "connected" || created.kind === "pending") {
+      const binding: BoundSession = {
+        sessionId: created.sessionId,
+        profile,
+        createKey,
+        deviceId,
+        allowedOrigins,
+        createdAt: new Date().toISOString(),
+      };
+      await this.ctx.storage.put(BINDING_KEY, binding);
+      await this.ctx.storage.delete(PENDING_CREATE_KEY);
+      // The owned tab starts at about:blank — the model must snapshot first.
+      await this.setRefsValid(false);
+      return created.kind === "connected"
+        ? { kind: "ready", adopted: false, profile, url: null, allowedOrigins, recovering: false }
+        : { kind: "connecting", profile };
+    }
+
+    // Every non-success create clears the stored key: leaving it behind makes
+    // the next browser_open replay the SAME idempotency key against a lease
+    // the coordinator already failed, wedging the model on a dead session. A
+    // genuine re-entrant retry mints a fresh key via the success path above,
+    // so nothing legitimate is lost.
+    await this.ctx.storage.delete(PENDING_CREATE_KEY);
     switch (created.kind) {
-      case "connected":
-      case "pending": {
-        const binding: BoundSession = {
-          sessionId: created.sessionId,
-          profile,
-          createKey,
-          deviceId,
-          allowedOrigins,
-          createdAt: new Date().toISOString(),
-        };
-        await this.ctx.storage.put(BINDING_KEY, binding);
-        await this.ctx.storage.delete(PENDING_CREATE_KEY);
-        // The owned tab starts at about:blank — the model must snapshot first.
-        await this.setRefsValid(false);
-        return created.kind === "connected"
-          ? { kind: "ready", adopted: false, profile, url: null, allowedOrigins, recovering: false }
-          : { kind: "connecting", profile };
-      }
-      case "idempotency_conflict": {
+      case "idempotency_conflict":
         // The stored key was used with a different fingerprint (e.g. the
-        // origin set changed since the aborted attempt). Mint a fresh key
-        // and retry once.
-        await this.ctx.storage.delete(PENDING_CREATE_KEY);
-        if (retryOnKeyConflict) {
-          return this.createForDevice(actor, profile, deviceId, allowedOrigins, false);
-        }
-        return { kind: "create_failed", reason: "idempotency key conflict" };
-      }
+        // origin set changed since the aborted attempt). Retry once fresh.
+        return retryOnKeyConflict
+          ? this.createForDevice(actor, profile, deviceId, allowedOrigins, false)
+          : { kind: "create_failed", reason: "idempotency key conflict" };
       case "terminal":
-        await this.ctx.storage.delete(PENDING_CREATE_KEY);
         return { kind: "session_terminal", status: created.status };
       case "disabled":
         return { kind: "disabled" };
@@ -435,23 +437,7 @@ export class AccountAgent extends DurableObject<Env> {
 
   async status(actor: McpActorRef): Promise<StatusReport> {
     const svcActor = this.serviceActor(actor);
-    const directoryDevices = await this.env.ACCOUNT_DIRECTORY.getByName("directory").listDevices(
-      actor.userId,
-    );
-    const live = directoryDevices.length > 0 ? await listDevices(this.env, svcActor) : [];
-    const liveById = new Map(live.map((device) => [device.deviceId, device]));
-    const devices: DeviceSummary[] = directoryDevices.map((device) => {
-      const liveDevice = liveById.get(device.deviceId);
-      return {
-        deviceId: device.deviceId,
-        label: device.label,
-        status: liveDevice?.status ?? "never_connected",
-        used: liveDevice?.used ?? null,
-        capacity: liveDevice?.capacity ?? null,
-        lastSeenAt: liveDevice?.lastSeenAt ?? null,
-        allowedOrigins: device.allowedOrigins,
-      };
-    });
+    const devices = await this.deviceViews(svcActor);
 
     const binding = await this.getBinding();
     if (binding === undefined) return { devices, session: { state: "none" } };
@@ -494,7 +480,7 @@ export class AccountAgent extends DurableObject<Env> {
   async runCommand(actor: McpActorRef, input: RunCommandInput): Promise<RunCommandEnvelope> {
     return this.serialize(async () => {
       const binding = await this.getBinding();
-      const outcome = await this.runCommandLocked(actor, input);
+      const outcome = await this.runCommandLocked(actor, input, binding);
       return { outcome, allowedOrigins: binding?.allowedOrigins ?? null };
     });
   }
@@ -502,14 +488,16 @@ export class AccountAgent extends DurableObject<Env> {
   private async runCommandLocked(
     actor: McpActorRef,
     input: RunCommandInput,
+    binding: BoundSession | undefined,
   ): Promise<RunCommandResult> {
-    const binding = await this.getBinding();
     if (binding === undefined) return { kind: "no_session" };
 
+    let lastUrl: string | null = null;
     if (input.usesRef) {
       const refs = await this.refsState();
       // Zero-latency hard guard: never send a doomed ref to the device.
       if (!refs.valid) return { kind: "stale_refs" };
+      lastUrl = refs.url;
     }
 
     const svcActor = this.serviceActor(actor);
@@ -524,19 +512,47 @@ export class AccountAgent extends DurableObject<Env> {
       };
     }
 
-    let result = await this.runDispatchLoop(svcActor, binding.sessionId, parsed.data);
+    const deps = this.dispatchDeps(svcActor, binding.sessionId);
+    let result: RunCommandResult = await runDispatchLoop(parsed.data, deps);
     if (result.kind === "id_conflict" && input.idempotencyKey !== undefined) {
       // The caller-chosen idempotency key collided with a different command
       // body. Retry exactly once under a fresh random identity.
       const fresh = await this.buildCommand(binding.sessionId, input, crypto.randomUUID());
       const reparsed = CommandSchema.safeParse(fresh);
       if (reparsed.success) {
-        result = await this.runDispatchLoop(svcActor, binding.sessionId, reparsed.data);
+        result = await runDispatchLoop(reparsed.data, deps);
       }
     }
 
-    await this.applyRefBookkeeping(input, result);
+    await this.applyRefBookkeeping(input, result, lastUrl);
     return result;
+  }
+
+  /** The three injected side effects the dispatch loop drives. */
+  private dispatchDeps(svcActor: Actor, sessionId: string) {
+    return {
+      dispatch: async (command: Command): Promise<DispatchStep> => {
+        const result = await dispatchCommand(this.env, svcActor, sessionId, {
+          command,
+          dryRun: false,
+          contractV2: true,
+          requestUrl: CANONICAL_URL,
+        });
+        if (result.kind === "not_found" || result.kind === "terminal_session") {
+          return { kind: "gone" };
+        }
+        if (result.kind !== "v2") {
+          // contractV2:true makes the legacy branch unreachable in the service.
+          throw new Error(`unreachable dispatch result: ${result.kind}`);
+        }
+        return result.outcome;
+      },
+      poll: async (commandId: string) => {
+        const polled = await pollCommand(this.env, svcActor, sessionId, commandId);
+        return polled.kind === "ok" ? polled.record : null;
+      },
+      sleep,
+    };
   }
 
   private async buildCommand(
@@ -552,106 +568,10 @@ export class AccountAgent extends DurableObject<Env> {
     return { ...input.draft, commandId } as Command;
   }
 
-  private async runDispatchLoop(
-    svcActor: Actor,
-    sessionId: string,
-    command: Command,
-  ): Promise<RunCommandResult> {
-    let busyAttempts = 0;
-    let dispatchAttempts = 0;
-    // Each iteration re-POSTs the SAME commandId: 504-class outcomes carry
-    // safeToRetry:true because the journal proves the write never started,
-    // and busy re-admissions must share one identity with the original.
-    while (true) {
-      const result = await dispatchCommand(this.env, svcActor, sessionId, {
-        command,
-        dryRun: false,
-        contractV2: true,
-        requestUrl: CANONICAL_URL,
-      });
-      if (result.kind === "not_found" || result.kind === "terminal_session") {
-        return { kind: "terminal_session" };
-      }
-      if (result.kind !== "v2") {
-        // contractV2:true makes the legacy branch unreachable in the service.
-        throw new Error(`unreachable dispatch result: ${result.kind}`);
-      }
-      const outcome = result.outcome;
-      switch (outcome.kind) {
-        case "terminal":
-          return { kind: "terminal", event: outcome.event };
-        case "pending": {
-          const polled = await this.pollUntilSettled(svcActor, sessionId, command.commandId);
-          if (polled === "retry") {
-            dispatchAttempts += 1;
-            if (dispatchAttempts > DISPATCH_RETRY_LIMIT) {
-              return { kind: "retries_exhausted", commandId: command.commandId };
-            }
-            continue;
-          }
-          return polled;
-        }
-        case "not_started":
-        case "timed_out":
-          dispatchAttempts += 1;
-          if (dispatchAttempts > DISPATCH_RETRY_LIMIT) {
-            return { kind: "retries_exhausted", commandId: command.commandId };
-          }
-          continue;
-        case "unknown":
-          return { kind: "unknown_outcome", commandId: command.commandId };
-        case "id_conflict":
-          return { kind: "id_conflict", commandId: command.commandId };
-        case "busy":
-          busyAttempts += 1;
-          if (busyAttempts >= BUSY_RETRY_LIMIT) return { kind: "busy_exhausted" };
-          await sleep(BUSY_RETRY_DELAY_MS);
-          continue;
-        case "not_connected":
-          return { kind: "not_connected" };
-        case "unsupported":
-          return { kind: "unsupported" };
-        case "terminal_session":
-          return { kind: "terminal_session" };
-      }
-    }
-  }
-
-  /**
-   * Polls a pending command past the server's ~20s synchronous window for
-   * another ~30s. Returns "retry" when the journal proves the command never
-   * started (safe to re-POST the same id); otherwise a final result.
-   */
-  private async pollUntilSettled(
-    svcActor: Actor,
-    sessionId: string,
-    commandId: string,
-  ): Promise<RunCommandResult | "retry"> {
-    const deadline = Date.now() + PENDING_POLL_BUDGET_MS;
-    while (Date.now() < deadline) {
-      await sleep(PENDING_POLL_INTERVAL_MS);
-      const polled = await pollCommand(this.env, svcActor, sessionId, commandId);
-      if (polled.kind !== "ok") continue;
-      switch (polled.record.status) {
-        case "completed":
-          return polled.record.event !== undefined
-            ? { kind: "terminal", event: polled.record.event }
-            : { kind: "pending_exhausted", commandId };
-        case "not_started":
-        case "timed_out":
-          return "retry";
-        case "unknown":
-          return { kind: "unknown_outcome", commandId };
-        default:
-          continue;
-      }
-    }
-    return { kind: "pending_exhausted", commandId };
-  }
-
   private async applyRefBookkeeping(
     input: RunCommandInput,
     result: RunCommandResult,
+    lastUrl: string | null = null,
   ): Promise<void> {
     if (result.kind === "unknown_outcome") {
       // OUTCOME UNKNOWN: the page may have changed under us. Forcing a
@@ -667,12 +587,18 @@ export class AccountAgent extends DurableObject<Env> {
     if (result.kind !== "terminal") return;
     const event = result.event;
     if (input.draft.type === "snapshot" && event.type === "snapshot_result") {
-      await this.setRefsValid(true, true);
+      await this.setRefsValid(true, true, event.url);
       return;
     }
-    if (input.draft.type === "navigate" && event.type === "action_result" && event.ok) {
-      await this.setRefsValid(false);
-    }
+    if (event.type !== "action_result" || !event.ok) return;
+    // Any successful action that CHANGED the URL invalidates every ref — not
+    // just an explicit navigate. A click that navigates is the most common
+    // way an LLM moves pages, so the guard must catch it too (D11). The
+    // extension echoes the post-action URL on action_result.
+    const navigated =
+      input.draft.type === "navigate" ||
+      (event.url !== undefined && lastUrl !== null && event.url !== lastUrl);
+    if (navigated) await this.setRefsValid(false);
   }
 
   /** Collects a command previously reported pending — read-only, no mutex. */

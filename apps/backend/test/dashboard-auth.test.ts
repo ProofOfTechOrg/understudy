@@ -8,21 +8,12 @@
 
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import mainModule from "../src/index";
 import { sha256Hex, taggedHmacHex } from "../src/auth";
 import { base64urlEncode } from "../src/base64url";
+import { sendOtpEmail } from "../src/dashboard/email";
+import type { Env } from "../src/types";
 import { createVault, listVaultSecretNames } from "../src/vault";
-
-const CANONICAL = "https://understudy.proofof.tech";
-const directory = () => env.ACCOUNT_DIRECTORY.getByName("directory");
-
-function fetchApp(request: Request): Promise<Response> {
-  return mainModule.fetch(
-    request,
-    env as never,
-    { waitUntil() {}, passThroughOnException() {} } as never,
-  );
-}
+import { CANONICAL, directory, fetchApp, mintUser } from "./helpers";
 
 interface FormRequestOptions {
   cookie?: string;
@@ -49,15 +40,6 @@ function pageGet(path: string, cookie?: string): Request {
   return new Request(`${CANONICAL}${path}`, { headers });
 }
 
-async function mintUser(): Promise<{ userId: string; tenantId: string; email: string }> {
-  const email = `${crypto.randomUUID()}@example.com`;
-  const requested = await directory().requestOtp(email);
-  if (requested.kind !== "ok") throw new Error("otp request failed");
-  const verified = await directory().verifyOtp(requested.challengeId, requested.code);
-  if (verified.kind !== "ok") throw new Error("otp verify failed");
-  return { userId: verified.userId, tenantId: verified.tenantId, email };
-}
-
 async function signedInUser(): Promise<{
   userId: string;
   tenantId: string;
@@ -73,6 +55,20 @@ async function signedInUser(): Promise<{
     csrf: await taggedHmacHex(env, "csrf-v1", session.token),
   };
 }
+
+describe("OTP email seam", () => {
+  it("sends through the emulated binding on the happy path", async () => {
+    // The vitest pool emulates send_email, so the real send path runs.
+    expect(await sendOtpEmail(env, "someone@example.com", "123456")).toBe(true);
+  });
+
+  it("signals (does not throw) when the EMAIL binding is unbound", async () => {
+    // A global misconfiguration (de-onboarded domain, dropped binding) must
+    // not silently break sign-in with no server-side signal.
+    const noEmail = { ...env, EMAIL: undefined } as unknown as Env;
+    expect(await sendOtpEmail(noEmail, "someone@example.com", "123456")).toBe(false);
+  });
+});
 
 describe("dashboard sign-in", () => {
   it("serves the login page with no-store and a nonce-locked CSP", async () => {
@@ -347,22 +343,40 @@ describe("dashboard vault upload", () => {
     expect(await listVaultSecretNames(env.VAULT, user.tenantId)).toContain(name);
   });
 
-  it("rejects garbage payloads and hostile names without writing", async () => {
+  it("rejects a garbage ciphertext without writing", async () => {
     const user = await signedInUser();
+    const name = `secret-${crypto.randomUUID()}`;
     const bad = await fetchApp(
       formPost("/dashboard/vault/put", {
         cookie: user.cookie,
-        form: { csrf: user.csrf, name: "ok-name", epk: "AAAA", iv: "AAAA", ct: "AAAA" },
+        form: { csrf: user.csrf, name, epk: "AAAA", iv: "AAAA", ct: "AAAA" },
       }),
     );
     expect(await bad.text()).toContain("could not be read");
-    const traversal = await fetchApp(
+    // Nothing was written under this tenant's namespace.
+    expect(await listVaultSecretNames(env.VAULT, user.tenantId)).not.toContain(name);
+  });
+
+  it("rejects a hostile name via the name guard specifically, with a VALID payload", async () => {
+    // A validly-sealed payload isolates the name guard: only
+    // VAULT_SECRET_NAME_PATTERN can reject this, so the test fails if that
+    // guard is removed (the previous version passed on the unseal failure).
+    const user = await signedInUser();
+    const keyRes = await fetchApp(pageGet("/dashboard/vault/pubkey", user.cookie));
+    const jwk = (await keyRes.json()) as JsonWebKey;
+    const sealed = await seal(jwk, "value");
+    const res = await fetchApp(
       formPost("/dashboard/vault/put", {
         cookie: user.cookie,
-        form: { csrf: user.csrf, name: "../other/key", epk: "A", iv: "A", ct: "A" },
+        form: { csrf: user.csrf, name: "../other-tenant/key", ...sealed },
       }),
     );
-    expect(await traversal.text()).toContain("Secret not saved");
+    expect(await res.text()).toContain("Names use letters");
+    // The traversal-shaped name never became a KV key in any namespace.
+    const list = env.VAULT.list;
+    if (list === undefined) throw new Error("VAULT.list unavailable");
+    const listed = await list.call(env.VAULT, { prefix: "vault://" });
+    expect(listed.keys.map((k) => k.name).join("\n")).not.toContain("other-tenant/key");
   });
 });
 

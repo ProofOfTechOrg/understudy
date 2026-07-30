@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactElement } from "react";
 import type { Browser } from "wxt/browser";
-import type { AttachedTab, LogEntry, PanelMsg, SwMsg } from "../../messaging";
+import type {
+  AttachedTab,
+  LogEntry,
+  PairingState,
+  PanelMsg,
+  ProfileBlockReason,
+  SwMsg,
+} from "../../messaging";
 
 const DEFAULT_WS_URL = "ws://localhost:8787";
 const WS_URL_STORAGE_KEY = "session:wsUrl";
@@ -288,14 +295,13 @@ export function App(): ReactElement {
   );
 }
 
-const BLOCK_REASON_COPY: Record<string, string> = {
-  ticket_rejected:
-    "The service rejected this browser's credential. Pair again with a fresh code.",
-  invalid_ticket:
-    "The service rejected this browser's credential. Pair again with a fresh code.",
+const REJECTED_CREDENTIAL =
+  "The service rejected this browser's credential. Pair again with a fresh code.";
+const BLOCK_REASON_COPY: Record<ProfileBlockReason, string> = {
+  ticket_rejected: REJECTED_CREDENTIAL,
+  invalid_ticket: REJECTED_CREDENTIAL,
   replaced: "Another browser took over this pairing. Pair again with a fresh code.",
-  terminal_close:
-    "The service ended this browser's enrollment. Pair again with a fresh code.",
+  terminal_close: "The service ended this browser's enrollment. Pair again with a fresh code.",
   credential_revoked:
     "This browser's pairing was revoked in the dashboard. Pair again with a fresh code.",
 };
@@ -304,18 +310,21 @@ function PairingStatus({
   pairing,
   statusReason,
 }: {
-  pairing: { phase: string; message?: string } | null;
-  statusReason: string | undefined;
+  pairing: PairingState | null;
+  statusReason: ProfileBlockReason | undefined;
 }): ReactElement | null {
+  // A live block reason supersedes a stale "paired" success: the dominant
+  // path to a block is pair → later revoke, and pairingState stays "paired"
+  // for the service-worker's life, so without this precedence the revoke copy
+  // would never render.
+  if (statusReason !== undefined) {
+    return <p className="warning">{BLOCK_REASON_COPY[statusReason]}</p>;
+  }
   if (pairing?.phase === "error") {
     return <p className="warning">{pairing.message ?? "Pairing failed. Try a fresh code."}</p>;
   }
   if (pairing?.phase === "paired") {
     return <p className="privacy-note">Paired. Unattended hosting is enabled on this browser.</p>;
-  }
-  if (statusReason !== undefined) {
-    const copy = BLOCK_REASON_COPY[statusReason];
-    if (copy !== undefined) return <p className="warning">{copy}</p>;
   }
   return null;
 }

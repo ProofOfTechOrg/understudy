@@ -18,7 +18,9 @@ import {
   verifyExtensionToken,
   verifyWsTicket,
 } from "./auth";
-import { normalizePairingCode } from "./account-directory";
+import { getDirectory, normalizePairingCode } from "./account-directory";
+import { CANONICAL_HOST, CANONICAL_ORIGIN } from "./canonical";
+import { dashboardApp } from "./dashboard/app";
 import {
   createAttendedSession,
   createSession,
@@ -322,7 +324,7 @@ app.post("/v1/pairing/claim", async (c) => {
   if (!/^[0-9A-Z]{8}$/.test(normalized)) {
     return c.json({ error: "invalid_or_expired_code" }, 404);
   }
-  const claimed = await c.env.ACCOUNT_DIRECTORY.getByName("directory").claimPairingCode(
+  const claimed = await getDirectory(c.env).claimPairingCode(
     await taggedHmacHex(c.env, "pair-v1", normalized),
   );
   if (claimed.kind !== "ok") {
@@ -622,24 +624,46 @@ app.onError((_error, c) => {
   return c.json({ error: "internal error" }, 500);
 });
 
-const CANONICAL_HOST = "understudy.proofof.tech";
+/** The dashboard/account plane — served directly, NOT through the provider. */
+function isDashboardPath(pathname: string): boolean {
+  return pathname === "/dashboard" || pathname.startsWith("/dashboard/");
+}
 
 /**
- * The closed prefix list delegated to the OAuthProvider. None of these
- * prefixes existed before the MCP surface, so for every previously-valid
- * request this branch is a failed string comparison — the non-regression
- * argument for keeping the existing fetch as the default export (D1).
+ * Paths handled by the OAuthProvider (or delegated by it): the MCP endpoint,
+ * the OAuth token/register/authorize surface, and the RFC 8414/9728
+ * well-knowns. Kept separate from the dashboard plane so a provider or
+ * OAUTH_KV fault cannot reach sign-in, pairing, or token/device revocation.
  */
-function isOAuthDelegatedPath(pathname: string): boolean {
+function isOAuthProviderPath(pathname: string): boolean {
   return (
     pathname === "/mcp" ||
     pathname.startsWith("/mcp/") ||
     pathname.startsWith("/oauth/") ||
     pathname.startsWith("/.well-known/oauth-authorization-server") ||
-    pathname.startsWith("/.well-known/oauth-protected-resource") ||
-    pathname === "/dashboard" ||
-    pathname.startsWith("/dashboard/")
+    pathname.startsWith("/.well-known/oauth-protected-resource")
   );
+}
+
+/**
+ * The complete new surface. None of these prefixes existed before the MCP
+ * work, so for every previously-valid request this predicate is a failed
+ * string comparison — the non-regression argument for keeping the existing
+ * fetch as the default export (D1).
+ */
+function isNewSurfacePath(pathname: string): boolean {
+  return isDashboardPath(pathname) || isOAuthProviderPath(pathname);
+}
+
+/** Scrubbed 500 for the new surface — the /v1 app has its own app.onError. */
+function scrubbedError(pathname: string): Response {
+  console.error("unhandled error on the authed surface");
+  return isOAuthProviderPath(pathname) && !pathname.startsWith("/oauth/authorize")
+    ? Response.json({ error: "internal_error" }, { status: 500 })
+    : new Response("internal error", {
+        status: 500,
+        headers: { "content-type": "text/plain", "cache-control": "no-store" },
+      });
 }
 
 export default {
@@ -651,34 +675,44 @@ export default {
       return Response.json({ error: "request body too large" }, { status: 413 });
     }
     const url = new URL(request.url);
-    if (isOAuthDelegatedPath(url.pathname)) {
-      // Single OAuth issuer: the new surface exists only on the custom
-      // domain. workers.dev stays live for existing consumers but must not
-      // mint tokens. Loopback hosts are exempt so wrangler dev + the MCP
-      // inspector keep working.
+    if (isNewSurfacePath(url.pathname)) {
+      // Single OAuth issuer / one cookie host: the new surface exists only on
+      // the custom domain. workers.dev stays live for existing consumers but
+      // must not mint tokens or set __Host- cookies. Loopback is exempt so
+      // wrangler dev + the MCP inspector work; on the real edge url.host is
+      // the routed hostname, not a client-supplied Host header, so this is
+      // not a bypass.
       if (url.host !== CANONICAL_HOST && !isLoopback(url.hostname)) {
-        return Response.redirect(
-          `https://${CANONICAL_HOST}${url.pathname}${url.search}`,
-          308,
-        );
+        return Response.redirect(`${CANONICAL_ORIGIN}${url.pathname}${url.search}`, 308);
       }
-      if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
-        // usk_ bearers take the fast path; null means "not a usk_ bearer",
-        // so a MISSING token still reaches the provider for its
-        // discovery-grade 401.
-        const staticResult = await tryStaticMcpAuth(request, env, ctx);
-        if (staticResult !== null) return staticResult;
+      // No error boundary reaches this surface otherwise: the provider (0.8.2)
+      // has no top-level catch and dashboard page loads can throw (e.g. a
+      // malformed VAULT_UPLOAD_PRIVATE_KEY), so one fault would return an
+      // unscrubbed 500 for the whole account plane.
+      try {
+        if (isDashboardPath(url.pathname)) {
+          return await dashboardApp.fetch(request, env, ctx);
+        }
+        if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+          // usk_ bearers take the fast path; null means "not a usk_ bearer",
+          // so a MISSING token still reaches the provider for its
+          // discovery-grade 401.
+          const staticResult = await tryStaticMcpAuth(request, env, ctx);
+          if (staticResult !== null) return staticResult;
+        }
+        // Open DCR (RFC 7591) is unauthenticated by spec; per-IP limiting is
+        // the abuse backstop. Registration grants nothing — consent is always
+        // human-in-the-loop on /oauth/authorize.
+        if (
+          url.pathname === "/oauth/register" &&
+          !(await unauthenticatedRateAllowed(request, env, "dcr"))
+        ) {
+          return Response.json({ error: "rate_limited" }, { status: 429 });
+        }
+        return await oauthProvider.fetch(request, env, ctx);
+      } catch {
+        return scrubbedError(url.pathname);
       }
-      // Open DCR (RFC 7591) is unauthenticated by spec; per-IP limiting is
-      // the abuse backstop. Registration grants nothing — consent is always
-      // human-in-the-loop on /oauth/authorize.
-      if (
-        url.pathname === "/oauth/register" &&
-        !(await unauthenticatedRateAllowed(request, env, "dcr"))
-      ) {
-        return Response.json({ error: "rate_limited" }, { status: 429 });
-      }
-      return oauthProvider.fetch(request, env, ctx);
     }
     const agentGate = await gateAgentPathBeforeResolution(request, env);
     if (agentGate instanceof Response) return agentGate;

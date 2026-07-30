@@ -9,6 +9,7 @@
 import { html, raw } from "hono/html";
 import type { HtmlEscapedString } from "hono/utils/html";
 import type { McpTokenRecord } from "../account-directory";
+import { MCP_URL } from "../canonical";
 
 type Fragment = HtmlEscapedString | Promise<HtmlEscapedString>;
 
@@ -37,6 +38,7 @@ pre { background: color-mix(in srgb, CanvasText 6%, Canvas); padding: 10px; bord
 .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); }
 .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 form.inline-form { display: inline; }
+details > summary { cursor: pointer; font-weight: 600; font-size: 13px; margin: 4px 0; color: color-mix(in srgb, CanvasText 70%, Canvas); }
 `;
 
 /** Copy buttons + countdown; loaded on every page, wired by data attributes. */
@@ -71,7 +73,7 @@ if (countdown) {
  * Derivation mirrors vault-upload.ts exactly (ECDH P-256 → HKDF-SHA256,
  * empty salt, info "understudy-vault-upload-v1" → AES-256-GCM).
  */
-const VAULT_JS = `
+export const VAULT_UPLOAD_JS = `
 const vaultForm = document.getElementById("vault-form");
 if (vaultForm) {
   const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
@@ -127,11 +129,10 @@ export function layout(
 </html>`;
 }
 
-export function loginPage(next: string, notice?: string): Fragment {
+export function loginPage(next: string): Fragment {
   return html`<h1>Understudy</h1>
 <div class="card">
   <h2>Sign in</h2>
-  ${notice === undefined ? "" : html`<p class="muted">${notice}</p>`}
   <form method="post" action="/dashboard/auth/request-code">
     <label for="email">Email</label>
     <input id="email" name="email" type="email" required autocomplete="email" />
@@ -184,8 +185,6 @@ export interface HomeData {
   uploadKeyJson: string;
   notice?: string;
 }
-
-const MCP_URL = "https://understudy.proofof.tech/mcp";
 
 function connectCard(): Fragment {
   const cli = `claude mcp add --transport http understudy ${MCP_URL} \\
@@ -295,7 +294,7 @@ ${connectCard()}
   <form method="post" action="/dashboard/tokens/create">
     <input type="hidden" name="csrf" value="${data.csrf}" />
     <label for="token-label">Label</label>
-    <input id="token-label" name="label" maxlength="64" placeholder="laptop" />
+    <input id="token-label" name="label" maxlength="128" placeholder="laptop" />
     <button class="primary" type="submit">Create token</button>
   </form>
   <p class="muted">Tokens are shown once at creation and stored only as digests.</p>
@@ -390,4 +389,3 @@ export function consentPage(options: {
 </div>`;
 }
 
-export const VAULT_UPLOAD_JS = VAULT_JS;

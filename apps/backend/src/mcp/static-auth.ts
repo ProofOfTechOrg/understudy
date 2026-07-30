@@ -9,7 +9,9 @@
  * A present-but-invalid usk_ token gets the mirrored 401 from props.ts.
  */
 
+import { getDirectory } from "../account-directory";
 import { sha256Hex } from "../auth";
+import { createPositiveCache } from "../cache";
 import type { Env } from "../types";
 import type { McpTokenIdentity } from "../account-directory";
 import { guardedMcpHandler } from "./handler";
@@ -23,27 +25,7 @@ const USK_PATTERN = /^usk_v1_[0-9A-Za-z]{16}_[A-Za-z0-9_-]{43}$/;
  * token created in the dashboard must work on the very next request.
  * Revocation therefore takes up to 60s beyond the directory row flip.
  */
-const TOKEN_CACHE_TTL_MS = 60_000;
-const TOKEN_CACHE_MAX_ENTRIES = 1024;
-const tokenCache = new Map<string, { identity: McpTokenIdentity; expiresAt: number }>();
-
-function tokenCacheGet(digest: string): McpTokenIdentity | undefined {
-  const entry = tokenCache.get(digest);
-  if (entry === undefined) return undefined;
-  if (entry.expiresAt <= Date.now()) {
-    tokenCache.delete(digest);
-    return undefined;
-  }
-  return entry.identity;
-}
-
-function tokenCachePut(digest: string, identity: McpTokenIdentity): void {
-  if (tokenCache.size >= TOKEN_CACHE_MAX_ENTRIES) {
-    const oldest = tokenCache.keys().next().value;
-    if (oldest !== undefined) tokenCache.delete(oldest);
-  }
-  tokenCache.set(digest, { identity, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS });
-}
+const tokenCache = createPositiveCache<McpTokenIdentity>(60_000, 1024);
 
 /** Test seam: the cache is module state, shared across a pool-worker run. */
 export function clearMcpTokenCache(): void {
@@ -65,11 +47,11 @@ export async function tryStaticMcpAuth(
   if (!USK_PATTERN.test(token)) return mcpUnauthorized(origin);
 
   const digest = await sha256Hex(token);
-  let identity = tokenCacheGet(digest);
+  let identity = tokenCache.get(digest);
   if (identity === undefined) {
-    const verified = await env.ACCOUNT_DIRECTORY.getByName("directory").verifyMcpToken(digest);
+    const verified = await getDirectory(env).verifyMcpToken(digest);
     if (verified === null) return mcpUnauthorized(origin);
-    tokenCachePut(digest, verified);
+    tokenCache.put(digest, verified);
     identity = verified;
   }
 
@@ -80,12 +62,10 @@ export async function tryStaticMcpAuth(
     authMethod: "static",
     scopes: ["mcp"],
   };
-  // The provider sets ctx.props for OAuth requests; mirror that contract so
-  // both branches are indistinguishable to the handler.
-  const propsCtx = {
-    waitUntil: ctx.waitUntil.bind(ctx),
-    passThroughOnException: ctx.passThroughOnException.bind(ctx),
-    props,
-  } as ExecutionContext;
-  return guardedMcpHandler.fetch(request, env, propsCtx);
+  // The provider sets props by MUTATING the live ExecutionContext
+  // (oauth-provider.js does `ctx.props = …`); mirror that exactly rather than
+  // forging a literal, so every other ctx member the runtime added survives
+  // and both auth branches are truly indistinguishable to the handler.
+  (ctx as ExecutionContext & { props?: unknown }).props = props;
+  return guardedMcpHandler.fetch(request, env, ctx);
 }

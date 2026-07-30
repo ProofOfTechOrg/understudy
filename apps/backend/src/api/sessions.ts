@@ -23,6 +23,7 @@ import type {
   UnattendedSessionRequest,
 } from "@understudy/protocol";
 import { isWriteCommand } from "@understudy/protocol";
+import type { DirectoryDeviceRecord } from "../account-directory";
 import type { Actor } from "../auth";
 import { mintSessionId, scopeSession, telemetryPseudonym } from "../auth";
 import type { DeviceAgent } from "../device";
@@ -241,6 +242,47 @@ export async function createSession(
 
 export function listDevices(env: Env, actor: Actor): Promise<DeviceStatusPayload> {
   return getTenantStub(env, actor.tenantId).listDevices();
+}
+
+/**
+ * A paired device joined with its live coordinator state. The one place the
+ * directory record (identity, label, allowed origins) meets the runtime
+ * status (online/offline, capacity) — MCP browser_open, MCP browser_status,
+ * and the dashboard home all render from this instead of re-deriving the join.
+ */
+export interface AccountDeviceView {
+  deviceId: string;
+  label: string | null;
+  status:
+    | "online"
+    | "offline"
+    | "recovering"
+    | "disabled"
+    | "incompatible"
+    | "never_connected";
+  used: number | null;
+  capacity: number | null;
+  lastSeenAt: string | null;
+  allowedOrigins: string[];
+}
+
+export function mergeDeviceViews(
+  directoryDevices: DirectoryDeviceRecord[],
+  liveDevices: DeviceStatusPayload,
+): AccountDeviceView[] {
+  const liveById = new Map(liveDevices.map((device) => [device.deviceId, device]));
+  return directoryDevices.map((device) => {
+    const live = liveById.get(device.deviceId);
+    return {
+      deviceId: device.deviceId,
+      label: device.label,
+      status: live?.status ?? ("never_connected" as const),
+      used: live?.used ?? null,
+      capacity: live?.capacity ?? null,
+      lastSeenAt: live?.lastSeenAt ?? null,
+      allowedOrigins: device.allowedOrigins,
+    };
+  });
 }
 
 export type GetSessionStatusResult =

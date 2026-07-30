@@ -96,6 +96,14 @@ export class EncryptedKvVault implements VaultBinding {
     return decryptSecret(this.masterKey, envelope);
   }
 
+  /** Seals plaintext into the versioned envelope, then stores ciphertext. */
+  async put(secretRef: string, plaintext: string): Promise<void> {
+    if (this.store.put === undefined) {
+      throw new Error("vault store is not writable");
+    }
+    await this.store.put(secretRef, await encryptSecret(this.masterKey, plaintext));
+  }
+
   /** Names only — listing never touches ciphertext, so it never decrypts. */
   list(options: { prefix: string; cursor?: string }): ReturnType<NonNullable<VaultBinding["list"]>> {
     if (this.store.list === undefined) {
@@ -129,25 +137,25 @@ export async function listVaultSecretNames(
   return names.sort();
 }
 
-/** The one production wiring: Env.VAULT ciphertext + VAULT_MASTER_KEY. */
-export function createVault(env: Env): VaultBinding {
+/**
+ * The one production wiring: Env.VAULT ciphertext + VAULT_MASTER_KEY. Reads
+ * decrypt and writes seal through this same wrapper, so the envelope format
+ * has a single owner.
+ */
+export function createVault(env: Env): EncryptedKvVault {
   return new EncryptedKvVault(env.VAULT, env.VAULT_MASTER_KEY);
 }
 
 /**
- * Seals one plaintext into the standard envelope and writes it under the
- * tenant's namespace. The only server-side vault write path (the dashboard
- * upload); scripts/vault-put.mjs remains the operator CLI equivalent.
+ * Seals one plaintext and writes it under the tenant's namespace. The only
+ * server-side vault write path (the dashboard upload); scripts/vault-put.mjs
+ * remains the operator CLI equivalent, mirroring the same envelope format.
  */
-export async function writeVaultSecret(
+export function writeVaultSecret(
   env: Env,
   tenantId: string,
   name: string,
   plaintext: string,
 ): Promise<void> {
-  if (env.VAULT.put === undefined) {
-    throw new Error("vault store is not writable");
-  }
-  const envelope = await encryptSecret(env.VAULT_MASTER_KEY, plaintext);
-  await env.VAULT.put(`vault://${tenantId}/${name}`, envelope);
+  return createVault(env).put(`vault://${tenantId}/${name}`, plaintext);
 }

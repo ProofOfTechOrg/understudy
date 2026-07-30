@@ -24,10 +24,13 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `src/account-directory.ts` | `AccountDirectory` — singleton SQLite DO: users (acct- tenants), email OTP, dashboard cookie sessions, paired devices, pairing codes, `usk_` MCP tokens; daily sweep alarm | Changing accounts, OTP/pairing semantics, credential formats, or display-once rules |
 | `src/account-agent.ts` | `AccountAgent` — per-tenant DO for MCP: session binding, refsValid/refsEpoch staleness guard, one-command mutex, dispatch retry/poll loops over the service layer | Changing MCP session lifecycle, ref guard, or retry semantics |
 | `src/oauth.ts` | The `OAuthProvider` instance (apiRoute `/mcp`, DCR, S256-only PKCE, RFC 8414/9728 metadata); delegated to by `src/index.ts` for a closed path list | Changing OAuth endpoints, scopes, or token TTLs |
-| `src/mcp/` | MCP surface: `props` (shared auth shape + 401), `static-auth` (usk_ fast path + 60s cache), `handler` (rate limit + serve), `mcp-agent` (`UnderstudyMcp` DO), `tools` (14-tool catalog), `outcomes` (single result mapper) | Adding/changing tools, auth branches, or result texts |
+| `src/mcp/` | MCP surface: `props` (shared auth shape + 401), `static-auth` (usk_ fast path + 60s cache), `handler` (rate limit + serve), `mcp-agent` (`UnderstudyMcp` DO), `tools` (14-tool catalog), `outcomes` (single result mapper), `dispatch-loop` (testable retry/poll/busy loop) | Adding/changing tools, auth branches, result texts, or retry thresholds |
 | `src/dashboard/` | The provider's defaultHandler: `app` (routes), `pages` (hono/html + CSP-nonced client JS), `auth` (cookie/CSRF/next guards), `email` (OTP send seam), `vault-upload` (ECDH unseal → re-seal) | Changing dashboard routes, consent, sign-in, or the vault upload |
+| `src/oauth.ts` | The `OAuthProvider` instance | Changing OAuth endpoints/scopes/TTLs |
+| `src/canonical.ts` | Canonical host/origin + derived MCP/dashboard URLs — one edit to change the domain | Changing the service domain |
+| `src/cache.ts` | `createPositiveCache` — the shared positive-only TTL cache (device creds, usk_ tokens) | Changing cache eviction/TTL semantics |
 | `src/secrets.ts` | `resolveSecret` — vault lookup only, no dispatch | Changing the vault backend, debugging secret resolution failures |
-| `src/vault.ts` | AES-256-GCM envelope codec + `EncryptedKvVault`/`createVault` — KV holds ciphertext only | Changing the envelope format/key handling (mirror `scripts/vault-put.mjs`) |
+| `src/vault.ts` | AES-256-GCM envelope codec + `EncryptedKvVault` (get/put/list) + `createVault`/`writeVaultSecret`/`listVaultSecretNames` — KV holds ciphertext only; reads and writes both go through the wrapper | Changing the envelope format/key handling (mirror `scripts/vault-put.mjs`) |
 | `src/base64url.ts` | base64url codec shared by auth.ts and vault.ts | Rarely — codec changes |
 | `src/types.ts` | Shared `Env`, `SessionState` (incl. `completedWrites`), `SessionStatus`, `VaultBinding`, `DispatchOutcome` | Adding a binding, changing DO state shape, changing the RPC outcome union |
 | `scripts/stub-consumer.mjs` | Throwaway Node runbook harness (not a workspace member) driving the API against a real extension | Running the attended M3 end-to-end verification |
@@ -38,7 +41,14 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `test/coordinator.test.ts` | Coordinator unit tests (timeout, duplicate guard, abandon, no-leak logging) | Verifying/extending coordinator-cf.ts |
 | `test/secrets.test.ts` | Vault resolution unit tests | Verifying/extending secrets.ts |
 | `test/vault.test.ts` | Envelope round-trip/tamper/wrong-key + `EncryptedKvVault` fail-closed tests | Verifying/extending vault.ts |
-| `test/helpers.ts` | Workers-runtime test helpers (session stub, WS extraction) | Writing a new Workers-pool test |
+| `test/account-directory.test.ts` | OTP/pairing/token/device consume-once + tenant-class + composite/heartbeat device auth | Verifying/extending account-directory.ts or the acct- class |
+| `test/agent-gate.test.ts` | Deny-by-default `/agents/*` gate + OAuth delegated-path routing/redirect/metadata | Verifying the delegation seam or agent gate |
+| `test/mcp-auth.test.ts` | Static usk_ auth, positive cache, discovery-grade 401 fall-through | Verifying/extending MCP auth branches |
+| `test/mcp-tools.test.ts` | Live streamable-HTTP handshake, 14-tool catalog, ref guard, cross-tenant isolation, outcome mapping | Verifying/extending the tool surface |
+| `test/dispatch-loop.test.ts` | Unit tests for the retry/poll/busy loop thresholds (injected deps) | Changing retry/poll counts or the loop |
+| `test/dashboard-auth.test.ts` | Sign-in/CSRF/vault-upload + full DCR→consent→PKCE→MCP flow; OTP email seam | Verifying/extending the dashboard or consent |
+| `test/pairing.test.ts` | `/v1/pairing/claim` config contract + connect-ticket + heartbeat liveness | Verifying/extending pairing |
+| `test/helpers.ts` | Workers-runtime test helpers: session stub, WS extraction, `directory()`, `fetchApp()`, `mintUser()`, `CANONICAL` | Writing a new Workers-pool test |
 | `test/tokens.ts` | Shared test-only token constants (used by vitest.config.ts and suites) | Adding a test caller/extension identity |
 | `test/tsconfig.json` | Test typecheck project (extends root config, includes `test/**`) | Adjusting test typecheck scope |
 | `test/env.d.ts` | Ambient `cloudflare:test`/`Env` typing for test files | Adding a new Env binding used in tests |

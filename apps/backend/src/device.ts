@@ -8,7 +8,7 @@ import {
   type ProtocolCapability,
 } from "@understudy/protocol";
 import {
-  deviceCredentialExists,
+  deviceCredentialLive,
   mintWsTicket,
   verifyWsTicket,
   type DeviceIdentity,
@@ -289,7 +289,7 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
         if (
           frame.deviceId !== this.name ||
           frame.browserEpoch !== fence.browserEpoch ||
-          !(await deviceCredentialExists(
+          !(await deviceCredentialLive(
             fence.credentialDigest,
             {
               tenantId: fence.tenantId,

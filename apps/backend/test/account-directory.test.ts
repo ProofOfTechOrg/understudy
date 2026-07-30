@@ -21,20 +21,10 @@ import {
 } from "../src/auth";
 import { enabledForTenant } from "../src/api/sessions";
 import type { Env } from "../src/types";
-
-const directory = () => env.ACCOUNT_DIRECTORY.getByName("directory");
+import { directory, mintUser } from "./helpers";
 
 function freshEmail(): string {
   return `${crypto.randomUUID()}@example.com`;
-}
-
-async function mintUser(): Promise<{ userId: string; tenantId: string; email: string }> {
-  const email = freshEmail();
-  const requested = await directory().requestOtp(email);
-  if (requested.kind !== "ok") throw new Error(`otp request failed: ${requested.kind}`);
-  const verified = await directory().verifyOtp(requested.challengeId, requested.code);
-  if (verified.kind !== "ok") throw new Error("otp verify failed");
-  return { userId: verified.userId, tenantId: verified.tenantId, email };
 }
 
 function bearerRequest(credential: string): Request {

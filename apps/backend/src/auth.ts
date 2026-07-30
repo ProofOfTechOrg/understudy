@@ -12,6 +12,8 @@
  * sent to (or trusted from) the browser extension.
  */
 import { base64urlDecode, base64urlEncode } from "./base64url";
+import { createPositiveCache } from "./cache";
+import { getDirectory } from "./account-directory";
 import type { Env } from "./types";
 
 export interface Actor {
@@ -205,42 +207,32 @@ export async function verifyExtensionToken(
 
 /**
  * Positive-only cache for directory device credentials, keyed by sha256
- * digest. Bounds AccountDirectory RPCs on the connect-ticket path to one per
- * device per minute; never caches misses, so a credential minted by a pairing
- * claim works on the very next request. Revocation therefore takes up to
- * DEVICE_CACHE_TTL_MS beyond the directory row flip.
+ * digest. Bounds AccountDirectory RPCs to one per device per minute; never
+ * caches misses, so a credential minted by a pairing claim works on the very
+ * next request. Revocation therefore takes up to 60 s beyond the row flip —
+ * the same window the connect-ticket and heartbeat paths already accept.
  */
-const DEVICE_CACHE_TTL_MS = 60_000;
-const DEVICE_CACHE_MAX_ENTRIES = 1024;
-const deviceCredentialCache = new Map<
-  string,
-  { identity: DeviceIdentity; expiresAt: number }
->();
-
-function deviceCacheGet(digest: string): DeviceIdentity | undefined {
-  const entry = deviceCredentialCache.get(digest);
-  if (entry === undefined) return undefined;
-  if (entry.expiresAt <= Date.now()) {
-    deviceCredentialCache.delete(digest);
-    return undefined;
-  }
-  return entry.identity;
-}
-
-function deviceCachePut(digest: string, identity: DeviceIdentity): void {
-  if (deviceCredentialCache.size >= DEVICE_CACHE_MAX_ENTRIES) {
-    const oldest = deviceCredentialCache.keys().next().value;
-    if (oldest !== undefined) deviceCredentialCache.delete(oldest);
-  }
-  deviceCredentialCache.set(digest, {
-    identity,
-    expiresAt: Date.now() + DEVICE_CACHE_TTL_MS,
-  });
-}
+const deviceCredentialCache = createPositiveCache<DeviceIdentity>(60_000, 1024);
 
 /** Test seam: the cache is module state, shared across a pool-worker run. */
 export function clearDeviceCredentialCache(): void {
   deviceCredentialCache.clear();
+}
+
+/**
+ * Resolves a `udt_` directory credential to its identity, cache-first. Shared
+ * by connect-ticket auth and the heartbeat revocation check so both classes
+ * see one consistent view (and one cache) of a paired device's liveness.
+ */
+async function resolveDirectoryDevice(
+  digest: string,
+  env: Env,
+): Promise<DeviceIdentity | null> {
+  const cached = deviceCredentialCache.get(digest);
+  if (cached !== undefined) return cached;
+  const identity = await getDirectory(env).verifyDeviceCredential(digest);
+  if (identity !== null) deviceCredentialCache.put(digest, identity);
+  return identity;
 }
 
 /**
@@ -259,14 +251,31 @@ export async function authenticateDeviceComposite(
   if (!header?.startsWith(BEARER_PREFIX)) return null;
   const credential = header.slice(BEARER_PREFIX.length).trim();
   if (!credential.startsWith("udt_")) return null;
-  const digest = await sha256Hex(credential);
-  const cached = deviceCacheGet(digest);
-  if (cached !== undefined) return cached;
-  const identity = await env.ACCOUNT_DIRECTORY.getByName("directory").verifyDeviceCredential(
-    digest,
+  return resolveDirectoryDevice(await sha256Hex(credential), env);
+}
+
+/**
+ * Continuous-liveness check for a still-connected device's heartbeat, across
+ * BOTH device classes. The blob path (deviceCredentialExists) reads
+ * DEVICE_TOKENS live, so a revoked canary drops instantly; a `udt_` device
+ * (never in the blob) is resolved through the directory, matching tenant +
+ * deviceId + credentialVersion. Without this second class the heartbeat
+ * revokes every paired browser on its first beat — a `udt_` credential is
+ * never in DEVICE_TOKENS.
+ */
+export async function deviceCredentialLive(
+  digest: string,
+  identity: Pick<DeviceIdentity, "tenantId" | "deviceId" | "credentialVersion">,
+  env: Env,
+): Promise<boolean> {
+  if (await deviceCredentialExists(digest, identity, env)) return true;
+  const directory = await resolveDirectoryDevice(digest, env);
+  return (
+    directory !== null &&
+    directory.tenantId === identity.tenantId &&
+    directory.deviceId.toLowerCase() === identity.deviceId.toLowerCase() &&
+    directory.credentialVersion === identity.credentialVersion
   );
-  if (identity !== null) deviceCachePut(digest, identity);
-  return identity;
 }
 
 export async function authenticateDevice(
@@ -558,6 +567,20 @@ async function importNamedHmacKey(secret: string): Promise<CryptoKey> {
 export async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return toHex(new Uint8Array(digest));
+}
+
+/**
+ * Constant-time equality for two hex digests of equal length. The one place
+ * every HMAC/digest comparison in this service should route through, so
+ * OTP verification, CSRF, and consent-signature checks share one primitive
+ * instead of a mix of `===` and hand-rolled loops.
+ */
+export function timingSafeHexEqual(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const left = encoder.encode(a);
+  const right = encoder.encode(b);
+  if (left.byteLength !== right.byteLength) return false;
+  return crypto.subtle.timingSafeEqual(left, right);
 }
 
 function isUuid(value: string): boolean {

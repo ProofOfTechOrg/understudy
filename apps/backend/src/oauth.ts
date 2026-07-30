@@ -12,6 +12,7 @@
  */
 
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
+import { CANONICAL_ORIGIN, MCP_URL } from "./canonical";
 import { dashboardApp } from "./dashboard/app";
 import { guardedMcpHandler } from "./mcp/handler";
 import type { Env } from "./types";
@@ -31,7 +32,8 @@ export const oauthProvider = new OAuthProvider<Env>({
   // compatibility with older deployments; a new MCP server has none.
   allowPlainPKCE: false,
   resourceMetadata: {
-    resource: "https://understudy.proofof.tech/mcp",
+    resource: MCP_URL,
+    authorization_servers: [CANONICAL_ORIGIN],
     resource_name: "understudy browser",
   },
 });

@@ -14,18 +14,18 @@ import {
   mapOpenResult,
   mapRunResult,
 } from "../src/mcp/outcomes";
+import { normalizePairingCode } from "../src/account-directory";
+import { taggedHmacHex } from "../src/auth";
+import { listVaultSecretNames, writeVaultSecret } from "../src/vault";
+import { directory, mintUser } from "./helpers";
 
 const MCP_URL = "https://understudy.proofof.tech/mcp";
-const directory = () => env.ACCOUNT_DIRECTORY.getByName("directory");
 
 async function mintUserToken(): Promise<{ token: string; tenantId: string; userId: string }> {
-  const requested = await directory().requestOtp(`${crypto.randomUUID()}@example.com`);
-  if (requested.kind !== "ok") throw new Error("otp request failed");
-  const verified = await directory().verifyOtp(requested.challengeId, requested.code);
-  if (verified.kind !== "ok") throw new Error("otp verify failed");
-  const created = await directory().createMcpToken(verified.userId, null);
+  const user = await mintUser();
+  const created = await directory().createMcpToken(user.userId, null);
   if (created === null) throw new Error("token mint failed");
-  return { token: created.token, tenantId: verified.tenantId, userId: verified.userId };
+  return { token: created.token, tenantId: user.tenantId, userId: user.userId };
 }
 
 interface JsonRpcResponse {
@@ -127,6 +127,7 @@ describe("MCP tool catalog over streamable HTTP", () => {
     expect(res.status).toBe(200);
     const parsed = await parseMcp(res);
     const tools = (parsed.result as { tools: { name: string }[] }).tools;
+    expect(tools).toHaveLength(14);
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       "browser_click",
       "browser_close",
@@ -136,12 +137,13 @@ describe("MCP tool catalog over streamable HTTP", () => {
       "browser_navigate",
       "browser_open",
       "browser_press_key",
+      "browser_screenshot",
       "browser_scroll",
       "browser_snapshot",
       "browser_status",
       "browser_type",
       "browser_wait",
-    ].concat(["browser_screenshot"]).sort());
+    ]);
   });
 
   it("guides a command tool called before browser_open", async () => {
@@ -201,6 +203,53 @@ describe("MCP tool catalog over streamable HTTP", () => {
   });
 });
 
+describe("MCP cross-tenant isolation", () => {
+  async function pairedTenant(): Promise<{ tenantId: string; token: string; deviceId: string }> {
+    const user = await mintUser();
+    await directory().setAllowedOrigins(user.userId, ["https://example.com"]);
+    const code = await directory().createPairingCode(user.userId);
+    if (code.kind !== "ok") throw new Error("pairing code failed");
+    const claimed = await directory().claimPairingCode(
+      await taggedHmacHex(env, "pair-v1", normalizePairingCode(code.code)),
+    );
+    if (claimed.kind !== "ok") throw new Error("claim failed");
+    const created = await directory().createMcpToken(user.userId, null);
+    if (created === null) throw new Error("token failed");
+    return { tenantId: user.tenantId, token: created.token, deviceId: claimed.deviceId };
+  }
+
+  it("scopes browser_status to the caller's own tenant — B's device never shows for A", async () => {
+    // #given two paired accounts, each with one device and one MCP token
+    const a = await pairedTenant();
+    const b = await pairedTenant();
+
+    // #when A calls browser_status with A's token
+    const sessionId = await mcpHandshake(a.token);
+    const status = await callTool(a.token, sessionId, 20, "browser_status", {});
+
+    // #then only A's device id appears; B's is absent
+    const text = status.content[0]?.text ?? "";
+    expect(text).not.toContain(b.deviceId.slice(0, 8));
+    // And A's AccountAgent lists exactly one device (its own), by tenant.
+    const devices = await runInDurableObject(
+      env.ACCOUNT.getByName(a.tenantId),
+      (instance: AccountAgent) => instance.status({ actorId: "usk:a" }),
+    );
+    expect(devices.devices).toHaveLength(1);
+    expect(devices.devices[0]?.deviceId).toBe(a.deviceId);
+  });
+
+  it("builds fill_secret refs under the caller's own tenant namespace only", async () => {
+    const a = await pairedTenant();
+    // A stores a secret; a fill_secret from A targets vault://<A>/name.
+    await writeVaultSecret(env, a.tenantId, "pw", "sekret");
+    expect(await listVaultSecretNames(env.VAULT, a.tenantId)).toContain("pw");
+    // A different tenant cannot see it.
+    const b = await pairedTenant();
+    expect(await listVaultSecretNames(env.VAULT, b.tenantId)).not.toContain("pw");
+  });
+});
+
 describe("AccountAgent ref-staleness guard", () => {
   async function seedBinding(
     stub: DurableObjectStub<AccountAgent>,
@@ -229,7 +278,7 @@ describe("AccountAgent ref-staleness guard", () => {
 
     // #when a click arrives
     const envelope = await stub.runCommand(
-      { userId: "user", actorId: "usk:test" },
+      { actorId: "usk:test" },
       {
         tool: "browser_click",
         draft: { type: "click", ref: "a1:s0e0" },
@@ -246,7 +295,7 @@ describe("AccountAgent ref-staleness guard", () => {
     const stub = env.ACCOUNT.getByName(`acct-${crypto.randomUUID()}`);
     await seedBinding(stub, false);
     const envelope = await stub.runCommand(
-      { userId: "user", actorId: "usk:test" },
+      { actorId: "usk:test" },
       {
         tool: "browser_navigate",
         draft: { type: "navigate", url: "https://example.com/" },
@@ -463,7 +512,7 @@ describe("outcome mapping", () => {
     ).toContain("browser_snapshot");
     expect(textOf(mapCloseResult({ kind: "closed" }))).toContain("closed");
     expect(
-      textOf(mapGetResult({ kind: "in_progress", status: "granted" }, "browser_get_result")),
+      textOf(mapGetResult("browser_get_result", { kind: "in_progress", status: "granted" })),
     ).toContain("Do NOT resubmit");
   });
 });

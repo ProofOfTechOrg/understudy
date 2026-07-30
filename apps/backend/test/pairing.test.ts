@@ -7,19 +7,12 @@
 
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import mainModule from "../src/index";
-import { clearDeviceCredentialCache } from "../src/auth";
-
-const CANONICAL = "https://understudy.proofof.tech";
-const directory = () => env.ACCOUNT_DIRECTORY.getByName("directory");
-
-function fetchApp(request: Request): Promise<Response> {
-  return mainModule.fetch(
-    request,
-    env as never,
-    { waitUntil() {}, passThroughOnException() {} } as never,
-  );
-}
+import {
+  clearDeviceCredentialCache,
+  deviceCredentialLive,
+  sha256Hex,
+} from "../src/auth";
+import { CANONICAL, directory, fetchApp, mintUser } from "./helpers";
 
 function claimRequest(code: string): Request {
   return new Request(`${CANONICAL}/v1/pairing/claim`, {
@@ -30,14 +23,11 @@ function claimRequest(code: string): Request {
 }
 
 async function pairableUser(): Promise<{ userId: string; tenantId: string; code: string }> {
-  const requested = await directory().requestOtp(`${crypto.randomUUID()}@example.com`);
-  if (requested.kind !== "ok") throw new Error("otp request failed");
-  const verified = await directory().verifyOtp(requested.challengeId, requested.code);
-  if (verified.kind !== "ok") throw new Error("otp verify failed");
-  await directory().setAllowedOrigins(verified.userId, ["https://example.com"]);
-  const created = await directory().createPairingCode(verified.userId);
+  const user = await mintUser();
+  await directory().setAllowedOrigins(user.userId, ["https://example.com"]);
+  const created = await directory().createPairingCode(user.userId);
   if (created.kind !== "ok") throw new Error("pairing code failed");
-  return { userId: verified.userId, tenantId: verified.tenantId, code: created.code };
+  return { userId: user.userId, tenantId: user.tenantId, code: created.code };
 }
 
 interface ClaimBody {
@@ -132,5 +122,40 @@ describe("POST /v1/pairing/claim", () => {
       }),
     );
     expect(ticketRes.status).toBe(401);
+  });
+});
+
+describe("directory device heartbeat liveness", () => {
+  // Regression for the showstopper: the heartbeat revocation check read only
+  // DEVICE_TOKENS, so a udt_ credential (never in the blob) was treated as
+  // revoked and every paired browser was dropped on its first heartbeat.
+  it("keeps a paired udt_ device live, and drops it once revoked", async () => {
+    clearDeviceCredentialCache();
+    const user = await pairableUser();
+    const claim = (await (await fetchApp(claimRequest(user.code))).json()) as ClaimBody;
+    const digest = await sha256Hex(claim.deviceCredential);
+    const identity = { tenantId: user.tenantId, deviceId: claim.deviceId, credentialVersion: 1 };
+
+    // Live before revocation (this is the check the heartbeat runs).
+    expect(await deviceCredentialLive(digest, identity, env)).toBe(true);
+
+    await directory().revokeDevice(user.userId, claim.deviceId);
+    clearDeviceCredentialCache();
+    expect(await deviceCredentialLive(digest, identity, env)).toBe(false);
+  });
+
+  it("does not confuse a udt_ device from another tenant", async () => {
+    clearDeviceCredentialCache();
+    const user = await pairableUser();
+    const claim = (await (await fetchApp(claimRequest(user.code))).json()) as ClaimBody;
+    const digest = await sha256Hex(claim.deviceCredential);
+    // The digest is real, but the claimed identity names a different tenant.
+    expect(
+      await deviceCredentialLive(
+        digest,
+        { tenantId: "acct-otheracct", deviceId: claim.deviceId, credentialVersion: 1 },
+        env,
+      ),
+    ).toBe(false);
   });
 });

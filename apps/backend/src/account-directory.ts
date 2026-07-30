@@ -8,8 +8,9 @@
  *
  * Hot-path invariant: the per-command path never calls this object. Directory
  * RPCs happen only at OTP request/verify, dashboard page loads, pairing
- * claim, connect-ticket auth for directory devices, and usk_ verification
- * behind the Worker-side 60-second positive-only cache.
+ * claim, connect-ticket auth + heartbeat liveness for directory devices,
+ * usk_ verification (behind the Worker-side 60-second positive-only cache),
+ * and browser_open/browser_status device listing in AccountAgent.
  *
  * Display-once: only digests exist at rest — sha256 for device credentials,
  * MCP tokens, and cookie tokens (the Worker recomputes those digests without
@@ -20,9 +21,19 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { DeviceIdentity } from "./auth";
-import { isValidTenantId, sha256Hex, taggedHmacHex } from "./auth";
+import { isValidTenantId, sha256Hex, taggedHmacHex, timingSafeHexEqual } from "./auth";
+import { base64urlEncode } from "./base64url";
 import type { Env } from "./types";
 import { canonicalizeOrigins, RequestBodyError } from "./validation";
+
+/**
+ * The account store is a singleton addressed by one fixed name; routing every
+ * caller through this accessor keeps that load-bearing invariant in one place
+ * instead of a `getByName("directory")` string literal at seven call sites.
+ */
+export function getDirectory(env: Env): DurableObjectStub<AccountDirectory> {
+  return env.ACCOUNT_DIRECTORY.getByName("directory");
+}
 
 const OTP_TTL_MS = 10 * 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
@@ -44,7 +55,7 @@ const TOKEN_ID_ALPHABET =
 const OTP_ALPHABET = "0123456789";
 
 export const TENANT_ID_PATTERN = /^acct-[a-z2-7]{10}$/;
-export const PAIRING_CODE_LENGTH = 8;
+const PAIRING_CODE_LENGTH = 8;
 
 /**
  * Uppercases and strips separators, then maps the Crockford confusables
@@ -76,10 +87,7 @@ function randomChars(alphabet: string, length: number): string {
 }
 
 function randomBase64urlSecret(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return base64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
 }
 
 export type RequestOtpResult =
@@ -569,6 +577,20 @@ export class AccountDirectory extends DurableObject<Env> {
   }
 
   async listDevices(userId: string): Promise<DirectoryDeviceRecord[]> {
+    return this.deviceRows(`user_id = ?`, userId);
+  }
+
+  /**
+   * Devices by TENANT rather than user. AccountAgent's authority is the
+   * tenant (its DO name / the session-scoping key), never a userId it was
+   * handed, so it lists by tenant — a caller cannot enumerate another
+   * account's devices by passing a foreign userId.
+   */
+  async listDevicesForTenant(tenantId: string): Promise<DirectoryDeviceRecord[]> {
+    return this.deviceRows(`tenant_id = ?`, tenantId);
+  }
+
+  private deviceRows(where: string, binding: string): DirectoryDeviceRecord[] {
     return this.rows<{
       device_id: string;
       label: string | null;
@@ -577,9 +599,9 @@ export class AccountDirectory extends DurableObject<Env> {
       last_seen_at: number | null;
     }>(
       `SELECT device_id, label, allowed_origins, created_at, last_seen_at
-       FROM devices WHERE user_id = ? AND revoked_at IS NULL
+       FROM devices WHERE ${where} AND revoked_at IS NULL
        ORDER BY created_at DESC`,
-      userId,
+      binding,
     ).map((record) => ({
       deviceId: record.device_id,
       label: record.label,
@@ -684,6 +706,16 @@ export class AccountDirectory extends DurableObject<Env> {
       `DELETE FROM pairing_codes WHERE created_at < ?`,
       now - DAY_MS,
     );
+    // Revoked tokens/devices are dead weight once nothing can present them;
+    // a day's grace keeps them briefly visible for support before removal.
+    this.ctx.storage.sql.exec(
+      `DELETE FROM mcp_tokens WHERE revoked_at IS NOT NULL AND revoked_at < ?`,
+      now - DAY_MS,
+    );
+    this.ctx.storage.sql.exec(
+      `DELETE FROM devices WHERE revoked_at IS NOT NULL AND revoked_at < ?`,
+      now - DAY_MS,
+    );
     await this.ctx.storage.setAlarm(now + SWEEP_INTERVAL_MS);
   }
 }
@@ -695,12 +727,4 @@ function parseOrigins(raw: string): string[] {
   } catch {
     return [];
   }
-}
-
-function timingSafeHexEqual(a: string, b: string): boolean {
-  const encoder = new TextEncoder();
-  const left = encoder.encode(a);
-  const right = encoder.encode(b);
-  if (left.byteLength !== right.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(left, right);
 }

@@ -45,6 +45,22 @@ describe("agent path gate", () => {
     expect(await res.text()).toBe("not found");
   });
 
+  it("closes new bindings specifically at the PRE-resolution gate", async () => {
+    // Pin the pre-resolution gate itself, not just the end result: the
+    // post-resolution onBeforeConnect hook only fires on a WS upgrade, so a
+    // plain GET that 404s here proves gateAgentPathBeforeResolution ran (a
+    // wrong-shape path the post-resolution hook would never even see).
+    for (const path of [
+      "/agents/mcp-agent/x",
+      "/agents/account/x",
+      "/agents/account-directory/x",
+    ]) {
+      const res = await get(`${CANONICAL}${path}`);
+      expect(res.status).toBe(404);
+      expect(await res.text()).toBe("not found");
+    }
+  });
+
   it("still 401s a session path without a valid credential (branch unchanged)", async () => {
     const res = await get(`${CANONICAL}/agents/session/${crypto.randomUUID()}?token=nope`);
     expect(res.status).toBe(401);
@@ -73,9 +89,12 @@ describe("OAuth path delegation", () => {
     expect(res.headers.get("Location")).toBe(`${CANONICAL}/oauth/authorize?client_id=abc`);
   });
 
-  it("does not redirect loopback hosts (wrangler dev + inspector)", async () => {
+  it("does not redirect loopback hosts — it reaches the provider's 401", async () => {
+    // Assert the actual expected outcome (the discovery-grade 401), not just
+    // "not 308", so a broken loopback exemption can't pass by returning 500.
     const res = await directGet("http://localhost:8787/mcp");
-    expect(res.status).not.toBe(308);
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toContain("resource_metadata");
   });
 
   it("serves the RFC 8414 authorization-server metadata", async () => {
