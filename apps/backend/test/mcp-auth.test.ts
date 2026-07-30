@@ -1,0 +1,148 @@
+/**
+ * MCP auth branches (PR 3): the static usk_ fast path, its positive-only
+ * cache, and the discovery-grade 401 contract that keeps OAuth clients able
+ * to bootstrap. Shared-storage caveat applies: every test mints fresh
+ * users/tokens and clears the module-level token cache it exercises.
+ */
+
+import { env, exports } from "cloudflare:workers";
+import { beforeEach, describe, expect, it } from "vitest";
+import { sha256Hex } from "../src/auth";
+import { clearMcpTokenCache, tryStaticMcpAuth } from "../src/mcp/static-auth";
+import type { Env } from "../src/types";
+
+const MCP_URL = "https://understudy.proofof.tech/mcp";
+
+const directory = () => env.ACCOUNT_DIRECTORY.getByName("directory");
+
+async function mintUserToken(): Promise<{ userId: string; tenantId: string; token: string; tokenId: string }> {
+  const requested = await directory().requestOtp(`${crypto.randomUUID()}@example.com`);
+  if (requested.kind !== "ok") throw new Error("otp request failed");
+  const verified = await directory().verifyOtp(requested.challengeId, requested.code);
+  if (verified.kind !== "ok") throw new Error("otp verify failed");
+  const created = await directory().createMcpToken(verified.userId, "test");
+  if (created === null) throw new Error("token mint failed");
+  return {
+    userId: verified.userId,
+    tenantId: verified.tenantId,
+    token: created.token,
+    tokenId: created.tokenId,
+  };
+}
+
+function mcpFetch(headers: Record<string, string>): Promise<Response> {
+  return exports.default.fetch(
+    new Request(MCP_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...headers,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "test-client", version: "0.0.0" },
+        },
+      }),
+    }),
+  );
+}
+
+function stubCtx(): ExecutionContext {
+  return {
+    waitUntil() {},
+    passThroughOnException() {},
+  } as unknown as ExecutionContext;
+}
+
+/** Env whose directory binding throws if touched. */
+function noDirectoryEnv(): Env {
+  return {
+    ...env,
+    ACCOUNT_DIRECTORY: {
+      getByName() {
+        throw new Error("directory RPC on a path that must not touch it");
+      },
+    } as unknown as Env["ACCOUNT_DIRECTORY"],
+  };
+}
+
+beforeEach(() => {
+  clearMcpTokenCache();
+});
+
+describe("static MCP auth", () => {
+  it("admits a valid usk_ token to the MCP endpoint", async () => {
+    const minted = await mintUserToken();
+    const res = await mcpFetch({ authorization: `Bearer ${minted.token}` });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('"serverInfo"');
+    expect(body).toContain("understudy");
+  });
+
+  it("refuses a revoked token once the cache no longer holds it", async () => {
+    const minted = await mintUserToken();
+    // Prime the cache with a successful call.
+    expect((await mcpFetch({ authorization: `Bearer ${minted.token}` })).status).toBe(200);
+    await directory().revokeMcpToken(minted.userId, minted.tokenId);
+    // The positive cache may still admit it inside the 60s TTL...
+    expect((await mcpFetch({ authorization: `Bearer ${minted.token}` })).status).toBe(200);
+    // ...and the directory is authoritative once the entry is gone.
+    clearMcpTokenCache();
+    const res = await mcpFetch({ authorization: `Bearer ${minted.token}` });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toContain("resource_metadata");
+  });
+
+  it("refuses a well-formed token whose secret is wrong", async () => {
+    const minted = await mintUserToken();
+    const forged = `${minted.token.slice(0, -1)}${minted.token.endsWith("A") ? "B" : "A"}`;
+    const res = await mcpFetch({ authorization: `Bearer ${forged}` });
+    expect(res.status).toBe(401);
+  });
+
+  it("refuses a malformed usk_ token without paying a directory RPC", async () => {
+    const res = await tryStaticMcpAuth(
+      new Request(MCP_URL, { headers: { authorization: "Bearer usk_bogus" } }),
+      noDirectoryEnv(),
+      stubCtx(),
+    );
+    expect(res).not.toBeNull();
+    expect(res?.status).toBe(401);
+    expect(res?.headers.get("www-authenticate")).toContain("resource_metadata");
+  });
+
+  it("returns null (falls through to the provider) for non-usk_ bearers and missing auth", async () => {
+    expect(
+      await tryStaticMcpAuth(
+        new Request(MCP_URL, { headers: { authorization: "Bearer something-else" } }),
+        noDirectoryEnv(),
+        stubCtx(),
+      ),
+    ).toBeNull();
+    expect(await tryStaticMcpAuth(new Request(MCP_URL), noDirectoryEnv(), stubCtx())).toBeNull();
+  });
+
+  it("emits the provider's discovery-grade 401 when no token is presented", async () => {
+    const res = await mcpFetch({});
+    expect(res.status).toBe(401);
+    const challenge = res.headers.get("www-authenticate") ?? "";
+    expect(challenge).toContain("Bearer");
+    expect(challenge).toContain("resource_metadata");
+  });
+
+  it("never stores a verifiable token at rest (digest only)", async () => {
+    const minted = await mintUserToken();
+    const digest = await sha256Hex(minted.token);
+    const identity = await directory().verifyMcpToken(digest);
+    expect(identity).toMatchObject({ tenantId: minted.tenantId });
+    const listed = await directory().listMcpTokens(minted.userId);
+    expect(JSON.stringify(listed)).not.toContain(minted.token.split("_")[3] ?? "!");
+  });
+});

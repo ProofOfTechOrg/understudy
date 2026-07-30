@@ -44,7 +44,12 @@
       // Singleton account store (users/devices/tokens/OTP/pairing). All
       // /agents/* exposure of this binding is closed by the deny-by-default
       // agent-path gate in src/index.ts.
-      { "name": "ACCOUNT_DIRECTORY", "class_name": "AccountDirectory" }
+      { "name": "ACCOUNT_DIRECTORY", "class_name": "AccountDirectory" },
+      // One MCP transport DO per MCP connection (McpAgent.serve names them).
+      { "name": "MCP_AGENT", "class_name": "UnderstudyMcp" },
+      // One AccountAgent per tenant: MCP session binding + ref guard + the
+      // one-command-at-a-time mutex. Also closed at /agents/* by the gate.
+      { "name": "ACCOUNT", "class_name": "AccountAgent" }
     ]
   },
   "migrations": [
@@ -54,7 +59,8 @@
       "tag": "v2",
       "new_sqlite_classes": ["DeviceAgent", "TenantDeviceCoordinator"]
     },
-    { "tag": "v3", "new_sqlite_classes": ["AccountDirectory"] }
+    { "tag": "v3", "new_sqlite_classes": ["AccountDirectory"] },
+    { "tag": "v4", "new_sqlite_classes": ["UnderstudyMcp", "AccountAgent"] }
   ],
   "kv_namespaces": [
     {
@@ -73,6 +79,14 @@
       // production account (see README "Deploy"). Namespace ids are not
       // secrets; the values inside are ciphertext envelopes regardless.
       "id": "b6168345442644e3ac24ef4c43dd7f1e"
+    },
+    {
+      // @cloudflare/workers-oauth-provider's grant/token/client store (the
+      // binding name is fixed by the library). Holds only hashed tokens and
+      // encrypted props by the library's own design. Created 2026-07-30 via
+      // `wrangler kv namespace create OAUTH_KV`.
+      "binding": "OAUTH_KV",
+      "id": "920a2498651c4cb498a2089184b96c78"
     }
   ],
   "secrets": {

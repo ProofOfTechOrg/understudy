@@ -39,6 +39,9 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
         throw new Error("directory RPC in an auth unit test");
       },
     } as unknown as Env["ACCOUNT_DIRECTORY"],
+    MCP_AGENT: {} as unknown as Env["MCP_AGENT"],
+    ACCOUNT: {} as unknown as Env["ACCOUNT"],
+    OAUTH_KV: {} as unknown as Env["OAUTH_KV"],
     VAULT: {} as unknown as Env["VAULT"],
     AUTH_HMAC_SECRET: "test-hmac-secret-do-not-use-in-prod",
     CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),

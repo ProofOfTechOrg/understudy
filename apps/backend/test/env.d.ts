@@ -24,7 +24,9 @@ declare namespace Cloudflare {
       | "SessionAgent"
       | "DeviceAgent"
       | "TenantDeviceCoordinator"
-      | "AccountDirectory";
+      | "AccountDirectory"
+      | "UnderstudyMcp"
+      | "AccountAgent";
   }
 }
 

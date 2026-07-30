@@ -19,10 +19,13 @@ import type {
   TabInfo,
   UnattendedSessionLifecycle,
 } from "@understudy/protocol";
+import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import type { SessionAgent } from "./session";
 import type { DeviceAgent } from "./device";
 import type { TenantDeviceCoordinator } from "./tenant-coordinator";
 import type { AccountDirectory } from "./account-directory";
+import type { AccountAgent } from "./account-agent";
+import type { UnderstudyMcp } from "./mcp/mcp-agent";
 
 /**
  * The non-tabs fields of the extension's hello event: what it reports about
@@ -55,6 +58,18 @@ export type { DialogRecord };
  */
 export interface VaultBinding {
   get(secretRef: string): Promise<string | null>;
+  /**
+   * KV-namespace-shaped key listing (names only, never values, never
+   * decrypted) for the MCP `browser_list_secrets` tool. Optional because
+   * narrow test fakes implement only `get`; the production binding is a real
+   * KV namespace, which always has it. vault.ts's listVaultSecretNames is
+   * the one consumer and treats absence as an empty vault.
+   */
+  list?(options: { prefix: string; cursor?: string }): Promise<{
+    keys: { name: string }[];
+    list_complete: boolean;
+    cursor?: string;
+  }>;
 }
 
 /** Worker bindings and environment configuration, wired in wrangler.jsonc. */
@@ -69,6 +84,23 @@ export interface Env {
    * per-command hot path — see account-directory.ts.
    */
   ACCOUNT_DIRECTORY: DurableObjectNamespace<AccountDirectory>;
+  /** One UnderstudyMcp DO per MCP connection (named by the transport). */
+  MCP_AGENT: DurableObjectNamespace<UnderstudyMcp>;
+  /**
+   * One AccountAgent DO per tenant (idFromName(tenantId)): holds the
+   * current session binding, the ref-staleness guard, and the one-command-
+   * at-a-time mutex for MCP callers. Deliberately not per-MCP-connection —
+   * the binding must survive client reconnects.
+   */
+  ACCOUNT: DurableObjectNamespace<AccountAgent>;
+  /** Grant/token store for @cloudflare/workers-oauth-provider (name fixed by the library). */
+  OAUTH_KV: KVNamespace;
+  /**
+   * OAuth helper methods the provider injects into env for requests that
+   * flow through it (the dashboard defaultHandler uses them for consent).
+   * Absent on requests that bypass the provider.
+   */
+  OAUTH_PROVIDER?: OAuthHelpers;
   VAULT: VaultBinding;
   /** Signs/verifies server-minted sessionIds so scopeSession can verify tenant ownership statelessly (M-006, DL-008). */
   AUTH_HMAC_SECRET: string;

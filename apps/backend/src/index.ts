@@ -27,15 +27,25 @@ import {
   pollCommand,
 } from "./api/sessions";
 import type { DeviceAgent } from "./device";
+import { oauthProvider } from "./oauth";
+import { tryStaticMcpAuth } from "./mcp/static-auth";
 import type { Env, V2DispatchOutcome } from "./types";
-import { parseBoundedStrictJson, readBoundedBodyText, parseStrictJsonText, RequestBodyError } from "./validation";
+import {
+  isLoopback,
+  parseBoundedStrictJson,
+  parseStrictJsonText,
+  readBoundedBodyText,
+  RequestBodyError,
+} from "./validation";
 import { emitTelemetry } from "./telemetry";
 import type { Actor, DeviceIdentity } from "./auth";
 
+export { AccountAgent } from "./account-agent";
 export { AccountDirectory } from "./account-directory";
 export { DeviceAgent } from "./device";
 export { SessionAgent } from "./session";
 export { TenantDeviceCoordinator } from "./tenant-coordinator";
+export { UnderstudyMcp } from "./mcp/mcp-agent";
 
 const app = new Hono<{ Bindings: Env }>();
 const DeviceTicketRequestSchema = z
@@ -430,6 +440,15 @@ function compatibilityV2Outcome(
   return v2Outcome(c, outcome, sessionId);
 }
 
+/**
+ * The only agent types the /agents/* surface may resolve. routeAgentRequest
+ * auto-exposes EVERY DO binding at /agents/<kebab-binding>/<name>, so each
+ * new binding (account directory, MCP transport, account agent) would
+ * otherwise become a public path. Deny-by-default closes the class, not the
+ * instance: anything outside this set 404s before DO resolution.
+ */
+const PUBLIC_AGENT_TYPES = new Set(["session", "device"]);
+
 async function gateAgentRequest(
   req: Request,
   lobby: { name: string },
@@ -437,7 +456,12 @@ async function gateAgentRequest(
 ): Promise<Response | undefined> {
   const url = new URL(req.url);
   const path = url.pathname.split("/").filter(Boolean);
-  const agentType = path.at(-2);
+  // Mirrors gateAgentPathBeforeResolution's allowlist (defense in depth —
+  // this hook only runs for requests that already resolved an agent).
+  if (path.length !== 3 || path[0] !== "agents" || !PUBLIC_AGENT_TYPES.has(path[1] ?? "")) {
+    return new Response("not found", { status: 404 });
+  }
+  const agentType = path[1];
   const ticket = url.searchParams.get("ticket");
   if (agentType === "device") {
     if (
@@ -481,7 +505,14 @@ async function gateAgentPathBeforeResolution(
 ): Promise<Response | null | undefined> {
   const url = new URL(req.url);
   const path = url.pathname.split("/").filter(Boolean);
-  if (path.length !== 3 || path[0] !== "agents") return undefined;
+  if (path[0] !== "agents") return undefined;
+  // Deny-by-default, before DO resolution: only 3-segment session/device
+  // paths exist. This also closes the previously-reachable
+  // /agents/tenant-control/* and the 4+-segment shapes that used to slip
+  // into gateAgentRequest's at(-2) heuristic.
+  if (path.length !== 3 || !PUBLIC_AGENT_TYPES.has(path[1] ?? "")) {
+    return new Response("not found", { status: 404 });
+  }
   const agentType = path[1];
   let agentName: string;
   try {
@@ -507,7 +538,6 @@ async function gateAgentPathBeforeResolution(
       ? null
       : new Response("invalid device ticket", { status: 401 });
   }
-  if (agentType !== "session") return undefined;
   if (ticket !== null) {
     const claims = await verifyWsTicket(
       ticket,
@@ -542,6 +572,26 @@ app.onError((_error, c) => {
   return c.json({ error: "internal error" }, 500);
 });
 
+const CANONICAL_HOST = "understudy.proofof.tech";
+
+/**
+ * The closed prefix list delegated to the OAuthProvider. None of these
+ * prefixes existed before the MCP surface, so for every previously-valid
+ * request this branch is a failed string comparison — the non-regression
+ * argument for keeping the existing fetch as the default export (D1).
+ */
+function isOAuthDelegatedPath(pathname: string): boolean {
+  return (
+    pathname === "/mcp" ||
+    pathname.startsWith("/mcp/") ||
+    pathname.startsWith("/oauth/") ||
+    pathname.startsWith("/.well-known/oauth-authorization-server") ||
+    pathname.startsWith("/.well-known/oauth-protected-resource") ||
+    pathname === "/dashboard" ||
+    pathname.startsWith("/dashboard/")
+  );
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (
@@ -549,6 +599,27 @@ export default {
       Number(request.headers.get("content-length")) > SESSION_RESULT_FRAME_MAX_BYTES
     ) {
       return Response.json({ error: "request body too large" }, { status: 413 });
+    }
+    const url = new URL(request.url);
+    if (isOAuthDelegatedPath(url.pathname)) {
+      // Single OAuth issuer: the new surface exists only on the custom
+      // domain. workers.dev stays live for existing consumers but must not
+      // mint tokens. Loopback hosts are exempt so wrangler dev + the MCP
+      // inspector keep working.
+      if (url.host !== CANONICAL_HOST && !isLoopback(url.hostname)) {
+        return Response.redirect(
+          `https://${CANONICAL_HOST}${url.pathname}${url.search}`,
+          308,
+        );
+      }
+      if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+        // usk_ bearers take the fast path; null means "not a usk_ bearer",
+        // so a MISSING token still reaches the provider for its
+        // discovery-grade 401.
+        const staticResult = await tryStaticMcpAuth(request, env, ctx);
+        if (staticResult !== null) return staticResult;
+      }
+      return oauthProvider.fetch(request, env, ctx);
     }
     const agentGate = await gateAgentPathBeforeResolution(request, env);
     if (agentGate instanceof Response) return agentGate;

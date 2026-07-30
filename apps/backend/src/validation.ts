@@ -143,7 +143,7 @@ export async function parseBoundedStrictJson<T extends z.ZodType>(
   return parsed.data;
 }
 
-function isLoopback(hostname: string): boolean {
+export function isLoopback(hostname: string): boolean {
   const normalized = hostname.toLowerCase();
   return (
     normalized === "localhost" ||
@@ -223,7 +223,7 @@ export async function requestFingerprint(command: unknown, dryRun: boolean): Pro
   return sha256Hex(stableJson({ command, dryRun }));
 }
 
-function stableJson(value: unknown): string {
+export function stableJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   const record = value as Record<string, unknown>;

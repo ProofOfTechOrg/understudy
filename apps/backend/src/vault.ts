@@ -88,6 +88,38 @@ export class EncryptedKvVault implements VaultBinding {
     if (envelope === null) return null;
     return decryptSecret(this.masterKey, envelope);
   }
+
+  /** Names only — listing never touches ciphertext, so it never decrypts. */
+  list(options: { prefix: string; cursor?: string }): ReturnType<NonNullable<VaultBinding["list"]>> {
+    if (this.store.list === undefined) {
+      return Promise.resolve({ keys: [], list_complete: true });
+    }
+    return this.store.list(options);
+  }
+}
+
+/**
+ * Secret names (the tail after `vault://<tenantId>/`) for one tenant,
+ * sorted. Values are never read: this walks key names in the ciphertext
+ * store only, which is what lets browser_list_secrets exist without ever
+ * being able to leak a value.
+ */
+export async function listVaultSecretNames(
+  vault: VaultBinding,
+  tenantId: string,
+): Promise<string[]> {
+  if (vault.list === undefined) return [];
+  const prefix = `vault://${tenantId}/`;
+  const names: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await vault.list(cursor === undefined ? { prefix } : { prefix, cursor });
+    for (const key of page.keys) {
+      if (key.name.startsWith(prefix)) names.push(key.name.slice(prefix.length));
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor !== undefined);
+  return names.sort();
 }
 
 /** The one production wiring: Env.VAULT ciphertext + VAULT_MASTER_KEY. */
