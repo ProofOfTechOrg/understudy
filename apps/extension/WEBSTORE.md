@@ -29,21 +29,34 @@ Upload `apps/extension/.output/understudyextension-0.1.2-chrome-store.zip`. Conf
 
 ## Enter distribution settings
 
+- **Payments**: Free
+- **Contains in-app purchases**: No
 - **Visibility**: Unlisted
 - **Regions**: All regions
 
-An unlisted item does not appear in Chrome Web Store search, but anyone with its listing URL can install it. Unlisted items receive the same policy review as public items.
+These payment declarations describe the current beta, which has no billing flow. An unlisted item does not appear in Chrome Web Store search, but anyone with its listing URL can install it. Unlisted items receive the same policy review as public items.
+
+To introduce paid hosted-service plans later:
+
+1. Keep the extension installation free. Charge for a separate Understudy hosted-service subscription, not for extension copies that users installed during the free beta.
+2. Change **Contains in-app purchases** to **Yes** before enabling paid access.
+3. Update the listing with the subscription requirement, price, trial terms, and cancellation path.
+4. Add the required business or physical address to the developer account.
+5. Update the privacy declarations if the billing flow handles new data, then submit the changes for review.
 
 ## Enter store listing details
 
 - **Language**: English
-- **Category**: Productivity
+- **Category**: Productivity → Tools
 - **Title**: Understudy Beta
 - **Short description**: BETA: Pair Chrome with Understudy so your authorized AI client can operate tabs on sites you allow.
+- **Official URL**: Select the verified `https://proofoftech.org/` entry. Leave this optional field blank if the dashboard does not offer it.
 - **Homepage URL**: `https://understudy.proofof.tech/dashboard`
 - **Support URL**: `https://github.com/ProofOfTechOrg/understudy/issues`
 - **Privacy policy URL**: `https://understudy.proofof.tech/privacy`
 - **Mature content**: No
+- **Promotional video**: Leave blank
+- **Marquee promo tile**: Leave blank
 
 Use this detailed description:
 
@@ -51,6 +64,8 @@ Use this detailed description:
 THIS EXTENSION IS FOR BETA TESTING.
 
 Understudy Beta pairs a dedicated Chrome profile with the hosted Understudy service. After you approve a one-time pairing code, an AI client you authorize can open and operate controlled tabs on the website origins you allow.
+
+Understudy Beta is currently available at no charge for testing. Hosted-service plans and pricing may be introduced after the beta.
 
 The side panel shows pairing and connection status, controlled-tab capacity, an emergency Stop hosting control, and a local troubleshooting log. The Chrome Web Store build connects only to https://understudy.proofof.tech.
 
