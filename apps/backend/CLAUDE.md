@@ -47,9 +47,9 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `test/mcp-auth.test.ts` | Static usk_ auth, positive cache, discovery-grade 401 fall-through | Verifying/extending MCP auth branches |
 | `test/mcp-tools.test.ts` | Live streamable-HTTP handshake, 14-tool catalog, ref guard, cross-tenant isolation, outcome mapping | Verifying/extending the tool surface |
 | `test/dispatch-loop.test.ts` | Unit tests for the retry/poll/busy loop thresholds (injected deps) | Changing retry/poll counts or the loop |
-| `test/dashboard-auth.test.ts` | Sign-in/CSRF/vault-upload + full DCR→consent→PKCE→MCP flow; OTP email seam; the `sameOriginRequest` branch table (Sec-Fetch-Site/Origin) and the `Referrer-Policy` pin | Verifying/extending the dashboard, consent, or the same-origin gate |
+| `test/dashboard-auth.test.ts` | Sign-in/CSRF/vault-upload + full DCR→consent→PKCE→MCP flow; OTP email seam; the `sameOriginRequest` branch table (Sec-Fetch-Site/Origin) and the `Referrer-Policy` pin; the device-revoke kill switch (marker beats the warm credential cache, ownership gate, push telemetry) | Verifying/extending the dashboard, consent, the same-origin gate, or device revocation |
 | `test/pairing.test.ts` | `/v1/pairing/claim` config contract + connect-ticket + heartbeat liveness | Verifying/extending pairing |
-| `test/helpers.ts` | Workers-runtime test helpers: session stub, WS extraction, `directory()`, `fetchApp()`, `mintUser()`, `CANONICAL` | Writing a new Workers-pool test |
+| `test/helpers.ts` | Workers-runtime test helpers: session stub, WS extraction, `directory()`, `fetchApp()`, `mintUser()`, `pairDevice()`, `claimRequest()`, `connectTicketRequest()`, `CANONICAL` | Writing a new Workers-pool test |
 | `test/tokens.ts` | Shared test-only token constants (used by vitest.config.ts and suites) | Adding a test caller/extension identity |
 | `test/tsconfig.json` | Test typecheck project (extends root config, includes `test/**`) | Adjusting test typecheck scope |
 | `test/env.d.ts` | Ambient `cloudflare:test`/`Env` typing for test files | Adding a new Env binding used in tests |

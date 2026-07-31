@@ -57,3 +57,48 @@ export async function mintUser(): Promise<{
   if (verified.kind !== "ok") throw new Error("otp verify failed");
   return { userId: verified.userId, tenantId: verified.tenantId, email };
 }
+
+/** The claim body the pairing endpoint hands the extension. */
+export interface PairedDevice {
+  serviceOrigin: string;
+  deviceId: string;
+  deviceCredential: string;
+  originPolicy: string[];
+  unattendedEnabled: boolean;
+}
+
+/** The code-for-credential exchange the extension's side panel drives. */
+export function claimRequest(code: string): Request {
+  return new Request(`${CANONICAL}/v1/pairing/claim`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+}
+
+/**
+ * Pairs a device to an existing user through the real claim exchange, so
+ * callers get a credential that traverses composite auth exactly as a
+ * browser's would. Suites that exercise the claim endpoint itself (mangled
+ * codes, reuse, expiry) drive claimRequest directly instead.
+ */
+export async function pairDevice(userId: string): Promise<PairedDevice> {
+  await directory().setAllowedOrigins(userId, ["https://example.com"]);
+  const created = await directory().createPairingCode(userId);
+  if (created.kind !== "ok") throw new Error(`pairing code failed: ${created.kind}`);
+  const res = await fetchApp(claimRequest(created.code));
+  if (!res.ok) throw new Error(`pairing claim failed: ${res.status}`);
+  return (await res.json()) as PairedDevice;
+}
+
+/** A connect-ticket request for a paired device's credential. */
+export function connectTicketRequest(credential: string): Request {
+  return new Request(`${CANONICAL}/v1/device/connect-ticket`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credential}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ browserEpoch: crypto.randomUUID() }),
+  });
+}

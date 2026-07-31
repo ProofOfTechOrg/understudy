@@ -262,3 +262,215 @@ describe("DeviceAgent authority fencing", () => {
     }
   });
 });
+
+describe("DeviceAgent credential revocation kill switch", () => {
+  it("closes every authorized connection, frame before close", async () => {
+    // #given an authoritative connection plus a superseded one still idling open
+    const deviceId = crypto.randomUUID();
+    const stub = await getAgentByName(env.DEVICE, deviceId);
+    const stale = fakeConnection("stale");
+    const active = fakeConnection("active");
+    const staleTicket = await ticket(deviceId, 1, "browser-1");
+    const activeTicket = await ticket(deviceId, 1, "browser-1");
+    let open: Connection[] = [stale.connection];
+
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => open });
+      await instance.authorizeCredential(identity(deviceId, 1, "a"));
+      await instance.onConnect(stale.connection, context(deviceId, staleTicket));
+      // Only `active` is visible during its own connect, so the replace-loop
+      // never reaches `stale` — it stays authorized but not authoritative,
+      // exactly the socket onMessage's isAuthoritative check would ignore.
+      open = [active.connection];
+      await instance.onConnect(active.connection, context(deviceId, activeTicket));
+      open = [stale.connection, active.connection];
+
+      // #when the dashboard kill switch fires
+      await expect(instance.revokeCredential(TENANT_ID)).resolves.toBe("closed");
+
+      // #then the DO no longer considers any connection authoritative
+      expect(instance.state.activeConnectionId).toBeNull();
+    });
+
+    // #then both sockets got the frame, then the close — in that order
+    for (const target of [stale, active]) {
+      expect(target.send).toHaveBeenLastCalledWith(
+        JSON.stringify({ type: "credential_revoked" }),
+      );
+      expect(target.close).toHaveBeenLastCalledWith(
+        1008,
+        "device credential revoked",
+      );
+      expect(target.send.mock.invocationCallOrder.at(-1)).toBeLessThan(
+        target.close.mock.invocationCallOrder.at(-1) as number,
+      );
+    }
+  });
+
+  it("persists the marker so a warm credential can no longer be authorized", async () => {
+    // #given a paired device with no live socket
+    const deviceId = crypto.randomUUID();
+    const stub = await getAgentByName(env.DEVICE, deviceId);
+
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => [] });
+      await expect(
+        instance.authorizeCredential(identity(deviceId, 1, "a")),
+      ).resolves.toBe(true);
+
+      // #when revoked while offline
+      await expect(instance.revokeCredential(TENANT_ID)).resolves.toBe("no_socket");
+    });
+
+    // #then the still-valid credential is refused — this is what defeats the
+    // Worker's 60 s positive cache, which would otherwise re-mint a ticket
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      expect(instance.state.credentialRevoked).toBe(true);
+      await expect(
+        instance.authorizeCredential(identity(deviceId, 1, "a")),
+      ).resolves.toBe(false);
+    });
+  });
+
+  it("refuses to revoke a device belonging to another tenant", async () => {
+    // #given a device whose authority row belongs to TENANT_ID. The DEVICE
+    // namespace is global — getByName(deviceId) reaches any tenant's agent —
+    // so this fence, not the caller, is what stops a foreign id bricking it.
+    const deviceId = crypto.randomUUID();
+    const stub = await getAgentByName(env.DEVICE, deviceId);
+    const live = fakeConnection("cross-tenant");
+    const deviceTicket = await ticket(deviceId, 1, "browser-1");
+
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => [live.connection] });
+      await instance.authorizeCredential(identity(deviceId, 1, "a"));
+      await instance.onConnect(live.connection, context(deviceId, deviceTicket));
+
+      // #when another tenant tries to kill it
+      await expect(instance.revokeCredential("tenantB")).resolves.toBe("wrong_tenant");
+
+      // #then nothing is marked, nothing is torn down
+      expect(instance.state.credentialRevoked).toBe(false);
+      expect(instance.state.activeConnectionId).toBe(live.connection.id);
+      await expect(
+        instance.authorizeCredential(identity(deviceId, 1, "a")),
+      ).resolves.toBe(true);
+    });
+
+    expect(live.close).not.toHaveBeenCalled();
+  });
+
+  it("pre-arms the marker on a device that has never connected", async () => {
+    // #given a paired device with no authority row yet — revoking before its
+    // first connect must still stick, so the fence allows an absent row
+    const deviceId = crypto.randomUUID();
+    const stub = await getAgentByName(env.DEVICE, deviceId);
+
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => [] });
+      // #when
+      await expect(instance.revokeCredential(TENANT_ID)).resolves.toBe("no_socket");
+      // #then its first credential authorization is already refused
+      await expect(
+        instance.authorizeCredential(identity(deviceId, 1, "a")),
+      ).resolves.toBe(false);
+    });
+  });
+
+  it("refuses a pre-minted ticket instead of accepting the connection", async () => {
+    // #given a ticket minted before the revoke landed
+    const deviceId = crypto.randomUUID();
+    const stub = await getAgentByName(env.DEVICE, deviceId);
+    const candidate = fakeConnection("post-revoke");
+    const preMinted = await ticket(deviceId, 1, "browser-1");
+
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => [] });
+      await instance.authorizeCredential(identity(deviceId, 1, "a"));
+      await instance.revokeCredential(TENANT_ID);
+
+      // #when the extension reconnects with it
+      await instance.onConnect(candidate.connection, context(deviceId, preMinted));
+
+      // #then it is never promoted
+      expect(instance.state.activeConnectionId).toBeNull();
+    });
+
+    expect(candidate.send).toHaveBeenCalledWith(
+      JSON.stringify({ type: "credential_revoked" }),
+    );
+    expect(candidate.close).toHaveBeenCalledWith(
+      1008,
+      "device credential revoked",
+    );
+  });
+
+  it("does not re-promote a connection when a revoke lands mid-ticket-verify", async () => {
+    // #given a connect that passes the entry guard and then has the revoke land
+    // during its ticket-verify awaits. Racing two real calls cannot produce this
+    // ordering: the Agents SDK awaits its own prologue before onConnect's body,
+    // while revokeCredential has no awaits at all — so a concurrent revoke
+    // always wins and trips the ENTRY guard, leaving this one unexercised (a
+    // deleted guard stayed green that way). Driving the flag per call is what
+    // actually reaches it: false on entry, true by the post-verify re-read.
+    const deviceId = crypto.randomUUID();
+    const stub = await getAgentByName(env.DEVICE, deviceId);
+    const racer = fakeConnection("mid-verify");
+    const inFlight = await ticket(deviceId, 1, "browser-1");
+
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => [racer.connection] });
+      await instance.authorizeCredential(identity(deviceId, 1, "a"));
+      let reads = 0;
+      Object.assign(instance, {
+        isCredentialRevoked: () => {
+          reads += 1;
+          return reads > 1;
+        },
+      });
+
+      // #when
+      await instance.onConnect(racer.connection, context(deviceId, inFlight));
+
+      // #then the entry guard was passed and the second one caught it, so the
+      // promotion never happens — the invariant that lets onMessage's guard
+      // skip resetting activeConnectionId
+      expect(reads).toBeGreaterThan(1);
+      expect(instance.state.activeConnectionId).toBeNull();
+    });
+
+    expect(racer.close).toHaveBeenLastCalledWith(1008, "device credential revoked");
+  });
+
+  it("kills a hibernation-residue socket on its next frame", async () => {
+    // #given a socket the close-all loop never saw (it outlived the DO instance)
+    const deviceId = crypto.randomUUID();
+    const browserEpoch = "browser-residue";
+    const stub = await getAgentByName(env.DEVICE, deviceId);
+    const residue = fakeConnection("residue");
+    const deviceTicket = await ticket(deviceId, 1, browserEpoch);
+
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => [residue.connection] });
+      await instance.authorizeCredential(identity(deviceId, 1, "a"));
+      await instance.onConnect(residue.connection, context(deviceId, deviceTicket));
+      Object.assign(instance, { getConnections: () => [] });
+      await expect(instance.revokeCredential(TENANT_ID)).resolves.toBe("no_socket");
+
+      // #when it wakes and heartbeats (≤22 s later)
+      await instance.onMessage(
+        residue.connection,
+        JSON.stringify({ type: "heartbeat", deviceId, browserEpoch, leaseIds: [] }),
+      );
+    });
+
+    // #then it dies on that frame rather than riding out the cache window
+    expect(residue.send).toHaveBeenLastCalledWith(
+      JSON.stringify({ type: "credential_revoked" }),
+    );
+    expect(residue.close).toHaveBeenLastCalledWith(
+      1008,
+      "device credential revoked",
+    );
+  });
+});

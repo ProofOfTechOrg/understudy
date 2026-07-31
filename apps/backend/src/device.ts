@@ -26,6 +26,9 @@ interface DeviceState {
   browser: string | null;
   extVersion: string | null;
   capabilities: ProtocolCapability[];
+  // Absent on states persisted before the dashboard kill switch shipped, so
+  // every read must treat `undefined` as "not revoked" (compare with === true).
+  credentialRevoked?: boolean;
 }
 
 interface AuthorizedConnectionState {
@@ -39,6 +42,13 @@ interface DeviceAuthRow {
   credential_digest: string;
   credential_version: number;
 }
+
+/**
+ * "closed" reports that connections were torn down, not that every close()
+ * succeeded — closeRevoked swallows a refusing socket, and the marker is what
+ * makes the revocation stick regardless.
+ */
+export type RevokeCredentialOutcome = "closed" | "no_socket" | "wrong_tenant";
 
 interface DeviceAuthorityFence {
   connectionId: string;
@@ -56,6 +66,7 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
     browser: null,
     extVersion: null,
     capabilities: [],
+    credentialRevoked: false,
   };
 
   constructor(ctx: AgentContext, env: Env) {
@@ -89,6 +100,7 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
 
   async authorizeCredential(identity: DeviceIdentity): Promise<boolean> {
     if (identity.deviceId !== this.name) return false;
+    if (this.isCredentialRevoked()) return false;
     const existing = this.authority();
     if (
       existing !== undefined &&
@@ -149,6 +161,10 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    if (this.isCredentialRevoked()) {
+      this.closeRevoked(connection);
+      return;
+    }
     const ticket = new URL(ctx.request.url).searchParams.get("ticket") ?? "";
     const claims = await verifyWsTicket(
       ticket,
@@ -177,6 +193,17 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
       connection.close(1008, "stale device ticket");
       return;
     }
+    // Re-read after the ticket-verify awaits. The socket is already accepted
+    // (partyserver accepts before invoking onConnect), so a revoke landing
+    // mid-verify DID close it via revokeCredential's close-all — but this
+    // continuation would then re-point activeConnectionId at that dead socket,
+    // undoing the clear the kill switch just made. Refusing here is what keeps
+    // "marker set ⇒ activeConnectionId null" true, which is in turn why
+    // onMessage's guard needs no reset of its own.
+    if (this.isCredentialRevoked()) {
+      this.closeRevoked(connection);
+      return;
+    }
 
     connection.setState({ authorized: true, claims } satisfies AuthorizedConnectionState);
     this.setState({
@@ -203,6 +230,16 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
   }
 
   async onMessage(connection: Connection, message: WSMessage): Promise<void> {
+    // Ahead of the isAuthoritative early-return: sockets outlive the DO
+    // instance, so a hibernation-woken connection (or one the close-all loop
+    // missed) dies on its next frame — a heartbeat within 22 s. No
+    // activeConnectionId reset needed: revokeCredential clears it in the same
+    // atomic setState as the marker, and onConnect — the only writer that sets
+    // it non-null — refuses to run while the marker is up.
+    if (this.isCredentialRevoked()) {
+      this.closeRevoked(connection);
+      return;
+    }
     if (!this.isAuthoritative(connection)) return;
     if (typeof message !== "string") {
       connection.close(1009, "binary device frames are not supported");
@@ -268,9 +305,9 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
         });
         if (!this.matchesAuthority(connection, fence)) return;
         if (!registration.accepted) {
-          if (this.state.activeConnectionId === connection.id) {
-            this.setState({ ...this.state, activeConnectionId: null });
-          }
+          // Unconditional: matchesAuthority above already proved this is the
+          // active connection (captureAuthority requires the id to match).
+          this.setState({ ...this.state, activeConnectionId: null });
           connection.setState(null);
           connection.close(1008, "stale device registration");
           return;
@@ -315,12 +352,10 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
             deviceId: this.name,
           });
           if (!this.matchesAuthority(connection, fence)) return;
-          this.send(connection, { type: "credential_revoked" });
-          if (this.state.activeConnectionId === connection.id) {
-            this.setState({ ...this.state, activeConnectionId: null });
-          }
-          connection.setState(null);
-          connection.close(1008, "device credential revoked");
+          // Unconditional for the same reason as the registration branch above:
+          // matchesAuthority already established this is the active connection.
+          this.setState({ ...this.state, activeConnectionId: null });
+          this.closeRevoked(connection);
           return;
         }
         if (!this.matchesAuthority(connection, fence)) return;
@@ -477,6 +512,50 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
       browserEpoch: lease.browserEpoch,
     });
     return true;
+  }
+
+  /**
+   * Dashboard kill switch. The persisted marker — not the close — is what
+   * defeats the Worker's 60 s positive credential cache: authorizeCredential
+   * and onConnect refuse marked devices, so a cached-positive credential can
+   * neither re-mint a ticket nor ride a pre-minted one back in.
+   *
+   * Fenced on tenant because the DEVICE namespace is global —
+   * `getByName(deviceId)` reaches any tenant's agent, so a foreign deviceId
+   * must not brick a device. The fence is only total once an authority row
+   * exists: a device paired but never connected has no row yet, and the
+   * allowance is what lets the owner pre-arm it. In that window the caller's
+   * ownership check is the sole gate, which is why revokeDeviceForOwner —
+   * not a route handler — is the only path here.
+   *
+   * The marker is irreversible: nothing clears it, and there is no un-revoke.
+   * Recovery is re-pairing, which mints a fresh deviceId and therefore a fresh
+   * agent — which is also why a marked agent can never shadow a later device.
+   *
+   * Closes every connection, authorized or not — a superseded socket can idle
+   * open, and one that never finished authorizing is no safer to leave up.
+   * No awaits: atomic with respect to every other DO event.
+   *
+   * "wrong_tenant" is distinct from "no_socket" because it is unreachable via
+   * the supported path: if it ever fires, either the ownership check regressed
+   * or someone is probing foreign ids, and that must not look like a no-op.
+   */
+  async revokeCredential(tenantId: string): Promise<RevokeCredentialOutcome> {
+    const authority = this.authority();
+    if (authority !== undefined && authority.tenant_id !== tenantId) {
+      return "wrong_tenant";
+    }
+    this.setState({
+      ...this.state,
+      credentialRevoked: true,
+      activeConnectionId: null,
+    });
+    let hadConnections = false;
+    for (const connection of this.getConnections()) {
+      this.closeRevoked(connection);
+      hadConnections = true;
+    }
+    return hadConnections ? "closed" : "no_socket";
   }
 
   private async sendProvision(
@@ -654,6 +733,40 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
 
   private send(connection: Connection, frame: DeviceControlServerFrame): void {
     connection.send(JSON.stringify(frame));
+  }
+
+  /**
+   * A method, not an inline `this.state.credentialRevoked === true`: the field
+   * is set by a concurrent RPC, so every guard must re-read it. Inline reads let
+   * TypeScript narrow the first check across subsequent awaits and declare the
+   * later guards dead — exactly the mid-verify race they exist to close.
+   */
+  private isCredentialRevoked(): boolean {
+    return this.state.credentialRevoked === true;
+  }
+
+  /**
+   * Frame-before-close is load-bearing: the extension treats 1008 as retryable
+   * and stops reconnecting only on the credential_revoked frame (ReconnectingWs
+   * terminal codes are 4001/4003).
+   *
+   * Teardown only — the caller owns the marker. The heartbeat backstop shares
+   * this helper and deliberately does NOT set it: that path also fires on
+   * credential supersession, where arming an irreversible marker would brick a
+   * device that merely rotated.
+   */
+  private closeRevoked(connection: Connection): void {
+    try {
+      this.send(connection, { type: "credential_revoked" });
+    } catch {
+      // A closing socket may refuse the frame; the marker guards still hold.
+    }
+    connection.setState(null);
+    try {
+      connection.close(1008, "device credential revoked");
+    } catch {
+      // Already closed; the persisted marker keeps the revocation durable.
+    }
   }
 }
 

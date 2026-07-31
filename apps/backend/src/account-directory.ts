@@ -159,6 +159,8 @@ export type SetOriginsResult =
   | { kind: "ok"; origins: string[] }
   | { kind: "invalid"; message: string };
 
+export type RevokeDeviceResult = "revoked" | "already_revoked" | "not_found";
+
 export class AccountDirectory extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -621,18 +623,34 @@ export class AccountDirectory extends DurableObject<Env> {
   }
 
   /**
-   * Marks the credential dead. Takes effect at the device's next
-   * connect-ticket request (tickets live 60 s); the Worker-side positive
-   * cache adds at most another 60 s.
+   * Marks the credential dead. The row flip is authoritative; the dashboard
+   * additionally pushes an immediate DeviceAgent teardown (kill switch), with
+   * connect-ticket auth and heartbeat liveness (≤60 s positive cache) as the
+   * lazy backstop.
+   *
+   * Three-way rather than boolean because the caller must distinguish "the
+   * row is already flipped, so re-push the teardown" from "this id is not
+   * yours, so touch nothing". Both are falsy; conflating them either skips a
+   * needed push or hands an attacker-supplied deviceId to a DO — see
+   * revokeDeviceForOwner, which is what acts on the distinction. Both still
+   * collapse to one notice — "already_revoked" is ownership-checked, so
+   * "not_found" remains a single indistinguishable answer for foreign and
+   * unknown ids alike (DL-008, no existence oracle).
    */
-  async revokeDevice(userId: string, deviceId: string): Promise<boolean> {
+  async revokeDevice(userId: string, deviceId: string): Promise<RevokeDeviceResult> {
     const cursor = this.ctx.storage.sql.exec(
       `UPDATE devices SET revoked_at = ? WHERE user_id = ? AND device_id = ? AND revoked_at IS NULL`,
       Date.now(),
       userId,
       deviceId,
     );
-    return cursor.rowsWritten > 0;
+    if (cursor.rowsWritten > 0) return "revoked";
+    const owned = this.row<{ device_id: string }>(
+      `SELECT device_id FROM devices WHERE user_id = ? AND device_id = ?`,
+      userId,
+      deviceId,
+    );
+    return owned === undefined ? "not_found" : "already_revoked";
   }
 
   async createMcpToken(userId: string, label: string | null): Promise<CreateMcpTokenResult | null> {

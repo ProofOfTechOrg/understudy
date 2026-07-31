@@ -12,30 +12,27 @@ import {
   deviceCredentialLive,
   sha256Hex,
 } from "../src/auth";
-import { CANONICAL, directory, fetchApp, mintUser } from "./helpers";
+import {
+  CANONICAL,
+  claimRequest,
+  connectTicketRequest,
+  directory,
+  fetchApp,
+  mintUser,
+  pairDevice,
+  type PairedDevice,
+} from "./helpers";
 
-function claimRequest(code: string): Request {
-  return new Request(`${CANONICAL}/v1/pairing/claim`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code }),
-  });
-}
-
+/**
+ * A user plus an unclaimed code, for the tests that drive the claim endpoint
+ * itself. Tests that only need a paired device use pairDevice.
+ */
 async function pairableUser(): Promise<{ userId: string; tenantId: string; code: string }> {
   const user = await mintUser();
   await directory().setAllowedOrigins(user.userId, ["https://example.com"]);
   const created = await directory().createPairingCode(user.userId);
   if (created.kind !== "ok") throw new Error("pairing code failed");
   return { userId: user.userId, tenantId: user.tenantId, code: created.code };
-}
-
-interface ClaimBody {
-  serviceOrigin: string;
-  deviceId: string;
-  deviceCredential: string;
-  originPolicy: string[];
-  unattendedEnabled: boolean;
 }
 
 describe("POST /v1/pairing/claim", () => {
@@ -45,7 +42,7 @@ describe("POST /v1/pairing/claim", () => {
     const pasted = `${user.code.slice(0, 4).toLowerCase()}-${user.code.slice(4).toLowerCase()}`;
     const res = await fetchApp(claimRequest(pasted));
     expect(res.status).toBe(200);
-    const body = (await res.json()) as ClaimBody;
+    const body = (await res.json()) as PairedDevice;
 
     // The contract: this body must satisfy the extension's strict
     // normalizeProfileConfig by construction.
@@ -80,20 +77,11 @@ describe("POST /v1/pairing/claim", () => {
 
   it("mints a credential that traverses the existing connect-ticket pipeline", async () => {
     clearDeviceCredentialCache();
-    const user = await pairableUser();
-    const claim = (await (await fetchApp(claimRequest(user.code))).json()) as ClaimBody;
+    const user = await mintUser();
+    const claim = await pairDevice(user.userId);
 
     // #when the freshly minted udt_ credential asks for a connect ticket
-    const ticketRes = await fetchApp(
-      new Request(`${CANONICAL}/v1/device/connect-ticket`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${claim.deviceCredential}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ browserEpoch: crypto.randomUUID() }),
-      }),
-    );
+    const ticketRes = await fetchApp(connectTicketRequest(claim.deviceCredential));
 
     // #then the composite verifier + DeviceAgent bootstrap admit it with
     // zero edits to device.ts / tenant-coordinator.ts
@@ -107,20 +95,11 @@ describe("POST /v1/pairing/claim", () => {
 
   it("stops honoring a revoked device at the next uncached ticket request", async () => {
     clearDeviceCredentialCache();
-    const user = await pairableUser();
-    const claim = (await (await fetchApp(claimRequest(user.code))).json()) as ClaimBody;
+    const user = await mintUser();
+    const claim = await pairDevice(user.userId);
     await directory().revokeDevice(user.userId, claim.deviceId);
     clearDeviceCredentialCache();
-    const ticketRes = await fetchApp(
-      new Request(`${CANONICAL}/v1/device/connect-ticket`, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${claim.deviceCredential}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ browserEpoch: crypto.randomUUID() }),
-      }),
-    );
+    const ticketRes = await fetchApp(connectTicketRequest(claim.deviceCredential));
     expect(ticketRes.status).toBe(401);
   });
 });
@@ -131,8 +110,8 @@ describe("directory device heartbeat liveness", () => {
   // revoked and every paired browser was dropped on its first heartbeat.
   it("keeps a paired udt_ device live, and drops it once revoked", async () => {
     clearDeviceCredentialCache();
-    const user = await pairableUser();
-    const claim = (await (await fetchApp(claimRequest(user.code))).json()) as ClaimBody;
+    const user = await mintUser();
+    const claim = await pairDevice(user.userId);
     const digest = await sha256Hex(claim.deviceCredential);
     const identity = { tenantId: user.tenantId, deviceId: claim.deviceId, credentialVersion: 1 };
 
@@ -146,8 +125,8 @@ describe("directory device heartbeat liveness", () => {
 
   it("does not confuse a udt_ device from another tenant", async () => {
     clearDeviceCredentialCache();
-    const user = await pairableUser();
-    const claim = (await (await fetchApp(claimRequest(user.code))).json()) as ClaimBody;
+    const user = await mintUser();
+    const claim = await pairDevice(user.userId);
     const digest = await sha256Hex(claim.deviceCredential);
     // The digest is real, but the claimed identity names a different tenant.
     expect(

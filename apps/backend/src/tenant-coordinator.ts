@@ -3,7 +3,6 @@ import { getAgentByName } from "agents";
 import type { DeviceStatus, ProtocolCapability, UnattendedSessionLifecycle } from "@understudy/protocol";
 import { parseQuotaPolicy } from "./quota";
 import type { Env } from "./types";
-import type { DeviceAgent } from "./device";
 import { emitTelemetry } from "./telemetry";
 
 const DEVICE_CAPACITY = 2;
@@ -922,7 +921,10 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     );
     for (const lease of cleanup) {
       try {
-        const device = this.env.DEVICE.getByName(lease.device_id) as DurableObjectStub<DeviceAgent>;
+        // Not via api/sessions' getDeviceStub: that accessor is module-private
+        // to the service layer. lease.device_id is coordinator-owned and this
+        // DO is already tenant-scoped, so the global namespace is safe here.
+        const device = this.env.DEVICE.getByName(lease.device_id);
         await device.requestClose(toLeaseResource(lease));
       } catch {
         // The lease stays reserved until a matching close ACK or device-loss release.

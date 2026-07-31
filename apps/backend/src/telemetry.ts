@@ -9,6 +9,10 @@ export type TelemetryEvent =
   | "session_expiry"
   | "device_connect"
   | "device_offline"
+  // Owner-initiated revocation as an operation, distinct from device_offline,
+  // which means "a device stopped serving". A failed or refused revoke leaves
+  // the device online, so counting it as offline would corrupt offline rates.
+  | "device_revoke"
   | "device_epoch_change"
   | "reservation"
   | "release"

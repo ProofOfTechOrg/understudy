@@ -7,14 +7,24 @@
  */
 
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { PROTOCOL_CAPABILITIES } from "@understudy/protocol";
+import { describe, expect, it, vi } from "vitest";
+import { revokeDeviceForOwner } from "../src/api/sessions";
 import { sha256Hex, taggedHmacHex } from "../src/auth";
+import type { RevokeCredentialOutcome } from "../src/device";
 import { safeNext, sameOriginRequest } from "../src/dashboard/auth";
 import { base64urlEncode } from "../src/base64url";
 import { sendOtpEmail } from "../src/dashboard/email";
 import type { Env } from "../src/types";
 import { createVault, listVaultSecretNames } from "../src/vault";
-import { CANONICAL, directory, fetchApp, mintUser } from "./helpers";
+import {
+  CANONICAL,
+  connectTicketRequest,
+  directory,
+  fetchApp,
+  mintUser,
+  pairDevice,
+} from "./helpers";
 
 interface FormRequestOptions {
   cookie?: string;
@@ -386,6 +396,261 @@ describe("dashboard CSRF + account cards", () => {
     );
     expect(revoked.status).toBe(303);
     expect(await directory().verifyMcpToken(await sha256Hex(token))).toBeNull();
+  });
+});
+
+describe("dashboard device revoke kill switch", () => {
+  function revokePost(
+    user: { cookie: string; csrf: string },
+    deviceId: string,
+  ): Request {
+    return formPost("/dashboard/devices/revoke", {
+      cookie: user.cookie,
+      form: { csrf: user.csrf, deviceId },
+    });
+  }
+
+  /**
+   * The revoke-related telemetry emitted while `run` executes, as
+   * "event/outcome" in emission order. Both dimensions matter: the event
+   * decides whether a revoke pollutes device_offline rates.
+   */
+  async function captureRevokeEvents(run: () => Promise<void>): Promise<string[]> {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await run();
+      return log.mock.calls
+        .map(([raw]) => JSON.parse(raw as string) as {
+          telemetry?: { event?: string; outcome?: string };
+        })
+        .filter(
+          (entry) =>
+            entry.telemetry?.event === "device_revoke" ||
+            entry.telemetry?.event === "device_offline",
+        )
+        .map((entry) => `${entry.telemetry?.event}/${entry.telemetry?.outcome}`);
+    } finally {
+      log.mockRestore();
+    }
+  }
+
+  /**
+   * An Env whose DeviceAgent leg yields a chosen outcome. Spreading the real
+   * env keeps every other binding live, so the directory ownership check and
+   * the coordinator leg still run for real.
+   */
+  function deviceEnv(outcome: RevokeCredentialOutcome | "throw"): Env {
+    return {
+      ...env,
+      DEVICE: {
+        getByName: () => ({
+          revokeCredential: () =>
+            outcome === "throw"
+              ? Promise.reject(new Error("agent unreachable"))
+              : Promise.resolve(outcome),
+        }),
+      },
+    } as unknown as Env;
+  }
+
+  it("beats the warm positive credential cache", async () => {
+    // #given a paired device whose credential is cached positive (the first
+    // ticket request warms both the Worker cache and the DeviceAgent authority)
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
+
+    // #when the owner clicks Revoke
+    const revoked = await fetchApp(revokePost(user, device.deviceId));
+    expect(revoked.status).toBe(303);
+    expect(revoked.headers.get("location")).toBe("/dashboard?notice=device-revoked");
+
+    // #then the very next ticket request fails WITHOUT clearing the cache.
+    // 404, not 401: composite auth still resolves from the warm cache, so it
+    // is the DeviceAgent's persisted marker — not credential expiry — that
+    // refuses. Deleting the marker turns this back into a 200.
+    const retry = await fetchApp(connectTicketRequest(device.deviceCredential));
+    expect(retry.status).toBe(404);
+  });
+
+  it("re-pushes on a second click without changing the notice", async () => {
+    // #given a device already revoked once, its credential still cached
+    // positive (so a 404 below can only come from the marker, not from auth)
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
+    expect((await fetchApp(revokePost(user, device.deviceId))).status).toBe(303);
+
+    // #when the owner clicks Revoke again — the only retry available if the
+    // first push failed to reach the DeviceAgent
+    const second = await fetchApp(revokePost(user, device.deviceId));
+
+    // #then already_revoked reports device-missing but still pushes, and the
+    // idempotent teardown leaves the device refused
+    expect(second.status).toBe(303);
+    expect(second.headers.get("location")).toBe("/dashboard?notice=device-missing");
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(404);
+  });
+
+  it("distinguishes an instant kill from an offline revoke in telemetry", async () => {
+    // #given a paired device that has never opened a control socket
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+
+    // #when it is revoked through the real route
+    const events = await captureRevokeEvents(async () => {
+      expect((await fetchApp(revokePost(user, device.deviceId))).status).toBe(303);
+    });
+
+    // #then it is a device_revoke, not a device_offline — nothing went offline.
+    // Reusing the heartbeat path's device_offline/credential_revoked would make
+    // "did the kill switch fire instantly" unanswerable from production data.
+    expect(events).toEqual(["device_revoke/revoked_by_owner_offline"]);
+  });
+
+  it("reports revoked_by_owner when a live socket was torn down", async () => {
+    // #given an agent leg reporting a closed socket — the one outcome that is a
+    // genuine device_offline, and the signal that the instant kill fired
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+
+    // #when
+    const events = await captureRevokeEvents(async () => {
+      await expect(
+        revokeDeviceForOwner(deviceEnv("closed"), user, device.deviceId),
+      ).resolves.toBe("revoked");
+    });
+
+    // #then
+    expect(events).toEqual(["device_offline/revoked_by_owner"]);
+  });
+
+  it("reports a tenant-fence rejection rather than passing it off as a no-op", async () => {
+    // #given an agent that refuses because the device belongs to someone else.
+    // Unreachable through this path, so if it ever fires the ownership check
+    // regressed — it must not be indistinguishable from "nothing to close".
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+
+    // #when
+    const events = await captureRevokeEvents(async () => {
+      await revokeDeviceForOwner(deviceEnv("wrong_tenant"), user, device.deviceId);
+    });
+
+    // #then
+    expect(events).toEqual(["device_revoke/tenant_mismatch"]);
+  });
+
+  it("reports a failed push leg instead of swallowing it", async () => {
+    // #given a push whose DeviceAgent leg throws. The dashboard still reports
+    // success (the row flip did happen), so telemetry is the only signal that
+    // the instant kill degraded to the lazy backstop.
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+
+    // #when
+    const events = await captureRevokeEvents(async () => {
+      await revokeDeviceForOwner(deviceEnv("throw"), user, device.deviceId);
+    });
+
+    // #then exactly one event: the failure, with no cleanup_failed alongside it
+    expect(events).toEqual(["device_revoke/push_failed"]);
+  });
+
+  it("reports a failed coordinator leg without losing the agent teardown", async () => {
+    // #given a push whose coordinator leg throws after the agent leg succeeded,
+    // with the credential cached positive so the 404 below can only be the marker
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
+    const brokenCoordinator = {
+      ...env,
+      TENANT_CONTROL: {
+        getByName: () => ({
+          revokeDevice: () => Promise.reject(new Error("coordinator unreachable")),
+        }),
+      },
+    } as unknown as Env;
+
+    // #when
+    const events = await captureRevokeEvents(async () => {
+      await revokeDeviceForOwner(brokenCoordinator, user, device.deviceId);
+    });
+
+    // #then the cleanup failure is reported alongside the agent outcome, and
+    // the durable leg still landed — that is the one that must survive
+    expect(events).toEqual([
+      "device_revoke/cleanup_failed",
+      "device_revoke/revoked_by_owner_offline",
+    ]);
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(404);
+  });
+
+  it("disables the device in its own tenant's coordinator", async () => {
+    // #given a device registered with its tenant coordinator, so the revoke has
+    // real lease/capacity bookkeeping to clean up
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+    const coordinator = env.TENANT_CONTROL.getByName(user.tenantId);
+    await coordinator.registerDevice({
+      deviceId: device.deviceId,
+      browser: "Chrome/150",
+      extVersion: "0.1.0",
+      browserEpoch: crypto.randomUUID(),
+      credentialDigest: await sha256Hex(device.deviceCredential),
+      credentialVersion: 1,
+      allowedOrigins: ["https://example.com"],
+      capabilities: [...PROTOCOL_CAPABILITIES],
+    });
+    expect(await coordinator.listDevices()).toContainEqual(
+      expect.objectContaining({ deviceId: device.deviceId, status: "online" }),
+    );
+
+    // #when
+    expect((await fetchApp(revokePost(user, device.deviceId))).status).toBe(303);
+
+    // #then the coordinator leg reached THIS tenant's coordinator. Asserting on
+    // real state, not just the absence of a throw: revokeDevice no-ops silently
+    // against a wrong-keyed coordinator, so a swapped tenantId/deviceId would
+    // otherwise leave capacity bookkeeping stale and every test still green.
+    expect(await coordinator.listDevices()).toContainEqual(
+      expect.objectContaining({ deviceId: device.deviceId, status: "disabled" }),
+    );
+  });
+
+  it("never pushes for a device the caller does not own", async () => {
+    // #given user A's device and a signed-in stranger
+    const owner = await signedInUser();
+    const device = await pairDevice(owner.userId);
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
+    const stranger = await signedInUser();
+
+    // #when the stranger POSTs A's deviceId — attacker-controlled form input
+    const res = await fetchApp(revokePost(stranger, device.deviceId));
+
+    // #then no marker is set and A's device keeps working
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/dashboard?notice=device-missing");
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
+  });
+
+  it("blocks a foreign revoke of a device that has never connected", async () => {
+    // #given a paired device with no authority row yet. This is the case the
+    // DeviceAgent tenant fence deliberately lets through (an owner must be able
+    // to pre-arm), so the ownership check in revokeDeviceForOwner is the ONLY
+    // thing standing between an attacker-supplied id and a permanent marker.
+    // With a connected device the fence masks a regression here; this does not.
+    const owner = await signedInUser();
+    const device = await pairDevice(owner.userId);
+    const stranger = await signedInUser();
+
+    // #when
+    const res = await fetchApp(revokePost(stranger, device.deviceId));
+
+    // #then the device is never marked and its FIRST connect still succeeds
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/dashboard?notice=device-missing");
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
   });
 });
 

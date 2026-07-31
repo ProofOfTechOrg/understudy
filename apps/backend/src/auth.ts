@@ -210,7 +210,10 @@ export async function verifyExtensionToken(
  * digest. Bounds AccountDirectory RPCs to one per device per minute; never
  * caches misses, so a credential minted by a pairing claim works on the very
  * next request. Revocation therefore takes up to 60 s beyond the row flip —
- * the same window the connect-ticket and heartbeat paths already accept.
+ * the same window the connect-ticket and heartbeat paths already accept. That
+ * window now bounds only the lazy backstop: a dashboard revoke bypasses this
+ * cache entirely via the DeviceAgent's persisted revoked marker, which refuses
+ * ticket authorization and connections however warm the cached credential is.
  */
 const deviceCredentialCache = createPositiveCache<DeviceIdentity>(60_000, 1024);
 

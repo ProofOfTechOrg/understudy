@@ -361,7 +361,7 @@ describe("authenticateDeviceComposite", () => {
     });
 
     // Cached positive survives revocation until the TTL/clear...
-    expect(await directory().revokeDevice(user.userId, claimed.deviceId)).toBe(true);
+    expect(await directory().revokeDevice(user.userId, claimed.deviceId)).toBe("revoked");
     expect(
       await authenticateDeviceComposite(bearerRequest(claimed.deviceCredential), env),
     ).not.toBeNull();
@@ -383,8 +383,15 @@ describe("authenticateDeviceComposite", () => {
     if (claimed.kind !== "ok") throw new Error("claim failed");
 
     const stranger = await mintUser();
-    expect(await directory().revokeDevice(stranger.userId, claimed.deviceId)).toBe(false);
+    // "not_found", not "already_revoked": a foreign id must be indistinguishable
+    // from an unknown one, and it is the value the dashboard gates the push on.
+    expect(await directory().revokeDevice(stranger.userId, claimed.deviceId)).toBe("not_found");
     expect(await directory().listDevices(stranger.userId)).toEqual([]);
+    // The owner's own second click reports already_revoked, which still pushes.
+    expect(await directory().revokeDevice(owner.userId, claimed.deviceId)).toBe("revoked");
+    expect(await directory().revokeDevice(owner.userId, claimed.deviceId)).toBe(
+      "already_revoked",
+    );
   });
 });
 

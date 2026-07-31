@@ -24,11 +24,12 @@ import type {
 } from "@understudy/protocol";
 import { isWriteCommand } from "@understudy/protocol";
 import type { DirectoryDeviceRecord } from "../account-directory";
+import { getDirectory } from "../account-directory";
 import type { Actor, DeviceIdentity } from "../auth";
 import { mintSessionId, mintWsTicket, scopeSession, telemetryPseudonym } from "../auth";
-import type { DeviceAgent } from "../device";
+import type { DeviceAgent, RevokeCredentialOutcome } from "../device";
 import type { SessionAgent } from "../session";
-import { emitTelemetry } from "../telemetry";
+import { emitTelemetry, type TelemetryEvent } from "../telemetry";
 import type { TenantDeviceCoordinator } from "../tenant-coordinator";
 import type { DispatchOutcome, Env, V2DispatchOutcome } from "../types";
 import { canonicalizeUnattendedRequest, RequestBodyError } from "../validation";
@@ -50,6 +51,13 @@ function getTenantStub(
   tenantId: string,
 ): DurableObjectStub<TenantDeviceCoordinator> {
   return env.TENANT_CONTROL.getByName(tenantId);
+}
+
+// The DeviceAgent half of the same invariant. Note the namespace is global —
+// unlike TENANT_CONTROL, the name carries no tenant — so every caller must
+// pass an already-authorized deviceId AND the agent must re-fence on tenant.
+function getDeviceStub(env: Env, deviceId: string): DurableObjectStub<DeviceAgent> {
+  return env.DEVICE.getByName(deviceId);
 }
 
 /**
@@ -213,9 +221,7 @@ export async function createSession(
       if (allocation.created) {
         try {
           await session.initializeUnattended(actor.tenantId, allocation.lease);
-          const device = env.DEVICE.getByName(
-            allocation.lease.deviceId,
-          ) as DurableObjectStub<DeviceAgent>;
+          const device = getDeviceStub(env, allocation.lease.deviceId);
           if (!(await device.requestProvision(allocation.lease))) {
             throw new Error("device connection unavailable");
           }
@@ -269,7 +275,7 @@ export async function mintDeviceConnectTicket(
   if (!(await coordinator.consumeDeviceTicketQuota(device.deviceId))) {
     return { kind: "quota_exceeded" };
   }
-  const agent = env.DEVICE.getByName(device.deviceId) as DurableObjectStub<DeviceAgent>;
+  const agent = getDeviceStub(env, device.deviceId);
   if (!(await agent.authorizeCredential(device))) {
     return { kind: "device_not_found" };
   }
@@ -291,6 +297,115 @@ export async function mintDeviceConnectTicket(
     expiresIn: 60,
     websocketPath: `/agents/device/${encodeURIComponent(device.deviceId)}`,
   };
+}
+
+/**
+ * A revoke outcome as the caller may observe it. Deliberately narrower than
+ * the directory's three-way result: "already_revoked" and "not_found" must stay
+ * indistinguishable outside this module, or the caller becomes an existence
+ * oracle for another account's device ids (DL-008). The distinction is real and
+ * load-bearing — it gates the push — but it is this module's business.
+ */
+export type OwnerRevokeResult = "revoked" | "not_revoked";
+
+/**
+ * Owner-initiated device revocation: ownership check, authoritative row flip,
+ * and kill-switch push, in that order.
+ *
+ * This is the ONLY path to the push, which is why pushDeviceRevocation below is
+ * module-private. `deviceId` is attacker-controlled form input and the DEVICE
+ * namespace is global, so handing an unverified id to getDeviceStub would let a
+ * caller permanently mark another account's device. The directory flip doubles
+ * as that check: it is scoped by userId, so anything other than "not_found"
+ * proves the row is the caller's. Taking the owner as one object rather than a
+ * (userId, tenantId) pair is deliberate — two same-typed positional strings
+ * that must correspond are a swap waiting to happen.
+ *
+ * `owner.tenantId` is the right tenant to fence the DeviceAgent on because
+ * `devices.tenant_id` has a single writer (claimPairingCode, which copies the
+ * claiming user's tenant) and `users.tenant_id` is never updated after
+ * ensureUser. Should tenants ever become multi-user or renameable, this is the
+ * one site that must start reading the tenant off the device row instead.
+ *
+ * Pushes on "already_revoked" too. The card disappears once the row is flipped
+ * (listDevices filters revoked_at IS NULL), so that outcome is a double submit
+ * or a replayed POST rather than a user re-click — the teardown is idempotent
+ * and covers a first push that never landed.
+ */
+export async function revokeDeviceForOwner(
+  env: Env,
+  owner: { userId: string; tenantId: string },
+  deviceId: string,
+): Promise<OwnerRevokeResult> {
+  const outcome = await getDirectory(env).revokeDevice(owner.userId, deviceId);
+  if (outcome !== "not_found") {
+    await pushDeviceRevocation(env, owner.tenantId, deviceId);
+  }
+  return outcome === "revoked" ? "revoked" : "not_revoked";
+}
+
+const PUSH_TELEMETRY: Record<
+  RevokeCredentialOutcome | "push_failed",
+  { event: TelemetryEvent; outcome: string }
+> = {
+  // Only this one is a device going offline; the rest are operations that left
+  // the device running, so they must not inflate device_offline rates.
+  closed: { event: "device_offline", outcome: "revoked_by_owner" },
+  no_socket: { event: "device_revoke", outcome: "revoked_by_owner_offline" },
+  wrong_tenant: { event: "device_revoke", outcome: "tenant_mismatch" },
+  push_failed: { event: "device_revoke", outcome: "push_failed" },
+};
+
+/**
+ * The teardown half of the kill switch: DeviceAgent marker + socket teardown
+ * FIRST (instant, and durable against the 60 s positive credential cache),
+ * coordinator lease/session cleanup second. Agent-first is deliberate: marker +
+ * dead socket means zero reconnects even if the coordinator leg never runs,
+ * whereas coordinator-first with a crash strands a live socket in a
+ * heartbeat-reject reconnect flap.
+ *
+ * Both legs are best-effort, and only the agent leg is durable. If it throws,
+ * the feature degrades to exactly the lazy path it exists to bypass — up to
+ * the cache window plus one heartbeat (≤60 s + ≤22 s) — and the coordinator
+ * leg does not cover the gap: registerDevice's upsert sets `enabled = 1`, so
+ * the device's own reconnect re-enables the row (this resurrection is why
+ * agent-first wins, not because the flap is unique to coordinator-first). The
+ * directory's revoked_at flip stays authoritative throughout, which is what
+ * the heartbeat's deviceCredentialLive check reads, so the backstop still
+ * fires. A failed leg is invisible to the user — the dashboard reports the row
+ * flip, which did happen — so every outcome emits telemetry.
+ *
+ * Module-private: it performs no ownership check of its own, and the tenant it
+ * fences on is only as good as the caller's. revokeDeviceForOwner is the path.
+ */
+async function pushDeviceRevocation(
+  env: Env,
+  tenantId: string,
+  deviceId: string,
+): Promise<void> {
+  let outcome: RevokeCredentialOutcome | "push_failed" = "push_failed";
+  try {
+    outcome = await getDeviceStub(env, deviceId).revokeCredential(tenantId);
+  } catch {
+    // Left as "push_failed".
+  }
+  try {
+    // Unfenced deliberately: an owner-initiated revoke kills every generation
+    // of the credential, not just the one the caller happens to know about.
+    await getTenantStub(env, tenantId).revokeDevice(deviceId);
+  } catch {
+    await emitTelemetry(env, {
+      event: "device_revoke",
+      outcome: "cleanup_failed",
+      tenantId,
+      deviceId,
+    });
+  }
+  // Never the heartbeat path's "credential_revoked": both mean a browser lost
+  // its credential, but only this one says the kill switch did it instantly.
+  // Sharing an outcome would make the feature's whole value proposition —
+  // instant rather than lazy — unmeasurable in production.
+  await emitTelemetry(env, { ...PUSH_TELEMETRY[outcome], tenantId, deviceId });
 }
 
 /**
@@ -405,9 +520,7 @@ export async function deleteSession(
   }
   if (closing.lease !== undefined) {
     await session.markLifecycle("closing", closing.lease.needsReconciliation);
-    const device = env.DEVICE.getByName(
-      closing.lease.deviceId,
-    ) as DurableObjectStub<DeviceAgent>;
+    const device = getDeviceStub(env, closing.lease.deviceId);
     await device.requestClose(closing.lease);
   }
   await emitTelemetry(env, {

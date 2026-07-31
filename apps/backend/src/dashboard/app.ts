@@ -15,7 +15,11 @@ import {
   timingSafeHexEqual,
   unauthenticatedRateAllowed,
 } from "../auth";
-import { listDevices as listLiveDevices, mergeDeviceViews } from "../api/sessions";
+import {
+  listDevices as listLiveDevices,
+  mergeDeviceViews,
+  revokeDeviceForOwner,
+} from "../api/sessions";
 import { base64urlDecode, base64urlEncode } from "../base64url";
 import { emitTelemetry } from "../telemetry";
 import type { Env } from "../types";
@@ -307,8 +311,14 @@ dashboardApp.post("/dashboard/devices/revoke", async (c) => {
   const body = await c.req.parseBody();
   const user = await authedPost(c, body);
   if (user instanceof Response) return user;
-  const revoked = await directory(c.env).revokeDevice(user.userId, field(body, "deviceId"));
-  return c.redirect(`/dashboard?notice=${revoked ? "device-revoked" : "device-missing"}`, 303);
+  // Ownership check and kill-switch push both live in the service layer, which
+  // also collapses "already revoked" and "never yours" into one outcome so this
+  // route cannot become an existence oracle for another account's device ids.
+  const outcome = await revokeDeviceForOwner(c.env, user, field(body, "deviceId"));
+  return c.redirect(
+    `/dashboard?notice=${outcome === "revoked" ? "device-revoked" : "device-missing"}`,
+    303,
+  );
 });
 
 dashboardApp.get("/dashboard/vault/pubkey", async (c) => {
