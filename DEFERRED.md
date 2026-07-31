@@ -336,11 +336,12 @@ Mitigated for now in copy only (`apps/backend/src/dashboard/pages.ts`, the Allow
 
 ## Pairing and per-browser authorization need to be rebuilt
 
-**Baseline:** branch `dev`, commit `1522cdc`.
+**Baseline:** branch `dev`, commit `d10c4881eab8e1660c512ccd250261dc64759873`.
 **Raised:** 2026-07-31 by the maintainer, after running the first full end-to-end pairing.
+**Expanded:** 2026-07-31 by the maintainer, to include link-based Model Context Protocol (MCP) client connection and sign-in.
 **Type:** requirements for a follow-up design, not a defect report.
 
-The current flow — one account-wide origin list, snapshotted once into a device by a copy-pasted 8-character code, with account-wide API tokens — is the minimum that worked. Three changes are wanted, and they interlock enough to be designed together rather than piecemeal:
+The current flow — one account-wide origin list, snapshotted once into a device by a copy-pasted 8-character code, with account-wide API tokens — is the minimum that worked. Four changes are wanted, and they interlock enough to be designed together rather than piecemeal:
 
 1. **Origins settable per browser, and kept in sync.** Today the list is per *account* and reaches a device only at pairing (see "Allowed origins are a pairing-time seed, not a live authorization policy" above). Two browsers paired to one account cannot be given different reach — a personal profile and a work profile get identical authority. The fix for the sync half is the server-authoritative resolution described in that entry; this adds that the authoritative record should be **per device**, with the account list acting as a default for new pairings rather than the only value.
 
@@ -348,7 +349,9 @@ The current flow — one account-wide origin list, snapshotted once into a devic
 
 3. **API keys scoped per pairing.** `usk_` tokens are account-wide, so one leaked token drives every paired browser and revoking it breaks all of them. A token should be issuable against a single device, so blast radius and revocation both follow the browser. This also gives the MCP surface a natural answer to "which browser should this call drive?" when an account has several — today `browser_open` picks, and with per-device tokens the token itself decides.
 
-**Why deferred:** each of the three changes the pairing wire contract, and (2) changes the extension manifest, so all three carry a version-skew story between an installed extension and a deployed backend. They want one design pass and one coordinated rollout, not three independent commits — and must ship separately from any dashboard copy or layout work.
+4. **Link-based MCP client connection and sign-in.** The dashboard currently offers copyable CLI and JSON configuration, while claude.ai and ChatGPT users must open connector settings and paste `https://understudy.proofof.tech/mcp`. Add client-specific **Connect** actions that open a supported MCP client with the canonical resource URL prefilled and start the existing OAuth 2.1 dynamic-registration, Proof Key for Code Exchange (PKCE), consent, and callback flow. Each action must use a documented client deep-link contract. Never place a `usk_` bearer, OAuth authorization code, dashboard cookie, pairing secret, or other credential in the link, browser history, or referrer. Keep the copyable configuration as the fallback for clients without a stable deep-link contract. Done means a signed-out user can follow one link, authenticate and consent in Understudy, return to the originating client, and use `tools/list`; cancellation, an unsupported client, and an expired OAuth state must produce an actionable recovery path without creating a credential.
+
+**Why deferred:** the first three changes alter the pairing wire contract, and (2) changes the extension manifest, so they carry a version-skew story between an installed extension and a deployed backend. The fourth depends on client-owned deep-link contracts and changes the security-sensitive OAuth entry flow. Design the four changes as one onboarding and authorization model, then roll them out with separate compatibility gates rather than independent dashboard patches.
 
 ---
 
