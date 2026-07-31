@@ -9,7 +9,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { sha256Hex, taggedHmacHex } from "../src/auth";
-import { safeNext } from "../src/dashboard/auth";
+import { safeNext, sameOriginRequest } from "../src/dashboard/auth";
 import { base64urlEncode } from "../src/base64url";
 import { sendOtpEmail } from "../src/dashboard/email";
 import type { Env } from "../src/types";
@@ -20,11 +20,15 @@ interface FormRequestOptions {
   cookie?: string;
   form?: Record<string, string>;
   origin?: string | null;
+  secFetchSite?: string;
 }
 
 function formPost(path: string, options: FormRequestOptions): Request {
   const headers = new Headers();
   if (options.origin !== null) headers.set("Origin", options.origin ?? CANONICAL);
+  if (options.secFetchSite !== undefined) {
+    headers.set("Sec-Fetch-Site", options.secFetchSite);
+  }
   if (options.cookie !== undefined) {
     headers.set("Cookie", `__Host-understudy_dash=${options.cookie}`);
   }
@@ -78,6 +82,43 @@ describe("safeNext guard", () => {
   });
 });
 
+describe("sameOriginRequest guard", () => {
+  const probe = (headers: Record<string, string>): Request =>
+    new Request(`${CANONICAL}/dashboard/origins`, { method: "POST", headers });
+
+  it("admits only same-origin of the four Sec-Fetch-Site values", () => {
+    // `same-site` is the load-bearing rejection: the canonical host sits under
+    // a registrable domain, so a compromised sibling subdomain presents exactly
+    // this. `none` is an address-bar/bookmark/restored POST — no form this app
+    // rendered can produce it.
+    expect(sameOriginRequest(probe({ "Sec-Fetch-Site": "same-origin" }))).toBe(true);
+    expect(sameOriginRequest(probe({ "Sec-Fetch-Site": "same-site" }))).toBe(false);
+    expect(sameOriginRequest(probe({ "Sec-Fetch-Site": "cross-site" }))).toBe(false);
+    expect(sameOriginRequest(probe({ "Sec-Fetch-Site": "none" }))).toBe(false);
+  });
+
+  it("ignores Origin entirely whenever Sec-Fetch-Site is present", () => {
+    // Neither header is forgeable cross-site, but only Sec-Fetch-Site is immune
+    // to this app's own Referrer-Policy — so it must win in BOTH directions,
+    // including admitting a request whose Origin was serialized as "null".
+    expect(
+      sameOriginRequest(probe({ "Sec-Fetch-Site": "same-origin", Origin: "null" })),
+    ).toBe(true);
+    expect(
+      sameOriginRequest(probe({ "Sec-Fetch-Site": "cross-site", Origin: CANONICAL })),
+    ).toBe(false);
+  });
+
+  it("falls back to Origin only when Sec-Fetch-Site is absent", () => {
+    // Pre-Fetch-Metadata browsers. Reachable in a useful state only while the
+    // referrer policy is not `no-referrer` — see the header pin below.
+    expect(sameOriginRequest(probe({ Origin: CANONICAL }))).toBe(true);
+    expect(sameOriginRequest(probe({ Origin: "https://evil.example" }))).toBe(false);
+    expect(sameOriginRequest(probe({ Origin: "null" }))).toBe(false);
+    expect(sameOriginRequest(probe({}))).toBe(false);
+  });
+});
+
 describe("OTP email seam", () => {
   it("sends through the emulated binding on the happy path", async () => {
     // The vitest pool emulates send_email, so the real send path runs.
@@ -93,11 +134,15 @@ describe("OTP email seam", () => {
 });
 
 describe("dashboard sign-in", () => {
-  it("serves the login page with no-store and a nonce-locked CSP", async () => {
+  it("serves the login page with no-store, a nonce-locked CSP, and Referrer-Policy: same-origin", async () => {
     const res = await fetchApp(pageGet("/dashboard"));
     expect(res.status).toBe(200);
     expect(res.headers.get("Cache-Control")).toBe("no-store");
     expect(res.headers.get("Content-Security-Policy")).toContain("script-src 'nonce-");
+    // Pinned, not merely non-empty: `no-referrer` here nulls the Origin on this
+    // app's own form posts, stranding sameOriginRequest's fallback in a permanent
+    // 403 that no modern-browser test would catch.
+    expect(res.headers.get("Referrer-Policy")).toBe("same-origin");
     expect(await res.text()).toContain("Email me a sign-in code");
   });
 
@@ -116,6 +161,24 @@ describe("dashboard sign-in", () => {
       }),
     );
     expect(wrong.status).toBe(403);
+  });
+
+  it("admits a sign-in POST whose Origin was serialized as null", async () => {
+    // #given a referrer policy of `no-referrer` makes a browser send this exact
+    // pair — Origin "null" alongside a truthful Sec-Fetch-Site. The unit block
+    // pins the predicate; this pins the whole route, on the one path where the
+    // same-origin gate is the ONLY CSRF control.
+    // #when
+    const res = await fetchApp(
+      formPost("/dashboard/auth/request-code", {
+        form: { email: "a@example.com" },
+        origin: "null",
+        secFetchSite: "same-origin",
+      }),
+    );
+    // #then it reaches the handler and renders the code-entry page.
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("6-digit code");
   });
 
   it("answers identically for any submitted address", async () => {
@@ -217,6 +280,24 @@ describe("dashboard sign-in", () => {
 });
 
 describe("dashboard CSRF + account cards", () => {
+  it("refuses a cross-site authed write before session or csrf is consulted", async () => {
+    // #given a valid cookie AND a valid csrf token — so only the middleware
+    // gate can reject this. Proves the hoist did not create a route that
+    // relies on the inner layers alone.
+    const user = await signedInUser();
+    // #when
+    const res = await fetchApp(
+      formPost("/dashboard/origins", {
+        cookie: user.cookie,
+        form: { csrf: user.csrf, origins: "https://evil.example" },
+        secFetchSite: "cross-site",
+      }),
+    );
+    // #then
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe("cross-origin request refused");
+  });
+
   it("refuses authed POSTs without the HMAC csrf field", async () => {
     const user = await signedInUser();
     const missing = await fetchApp(

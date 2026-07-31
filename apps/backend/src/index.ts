@@ -18,7 +18,7 @@ import {
   verifyWsTicket,
 } from "./auth";
 import { getDirectory, normalizePairingCode } from "./account-directory";
-import { CANONICAL_HOST, CANONICAL_ORIGIN } from "./canonical";
+import { CANONICAL_ORIGIN } from "./canonical";
 import { dashboardApp } from "./dashboard/app";
 import {
   createAttendedSession,
@@ -665,10 +665,19 @@ export default {
       // Single OAuth issuer / one cookie host: the new surface exists only on
       // the custom domain. workers.dev stays live for existing consumers but
       // must not mint tokens or set __Host- cookies. Loopback is exempt so
-      // wrangler dev + the MCP inspector work; on the real edge url.host is
-      // the routed hostname, not a client-supplied Host header, so this is
-      // not a bypass.
-      if (url.host !== CANONICAL_HOST && !isLoopback(url.hostname)) {
+      // wrangler dev + the MCP inspector work — which holds only because
+      // wrangler.jsonc pins `dev.host` to localhost; the custom_domain route
+      // otherwise makes dev serve this code the canonical host over http, and
+      // every account-plane request 308s to https on a plaintext listener. On
+      // the real edge url.origin is built from the routed hostname, not a
+      // client-supplied Host header, so this is not a bypass.
+      //
+      // Origin, not host, so the scheme is pinned too: browsers send Fetch
+      // Metadata only to trustworthy URLs, so over plain http a request reaches
+      // the dashboard with no Sec-Fetch-* at all and its CSRF gate drops to the
+      // suppressible Origin fallback. Always-Use-HTTPS is an account setting,
+      // not a property of this repo, so the redirect enforces it here.
+      if (url.origin !== CANONICAL_ORIGIN && !isLoopback(url.hostname)) {
         return Response.redirect(`${CANONICAL_ORIGIN}${url.pathname}${url.search}`, 308);
       }
       // No error boundary reaches this surface otherwise: the provider (0.8.2)

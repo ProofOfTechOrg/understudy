@@ -27,6 +27,24 @@
       "custom_domain": true
     }
   ],
+  // Load-bearing for local dev, not cosmetic. With the custom_domain route
+  // above declared, `wrangler dev` rewrites the URL the Worker SEES to
+  // http://understudy.proofof.tech/... whatever the client asked for — so the
+  // account plane's canonical-origin guard (src/index.ts) sees a non-https
+  // canonical host, fails its loopback exemption, and 308s every
+  // /dashboard, /oauth and /mcp request to https on a plaintext listener.
+  // Pinning the dev host restores the hostname the exemption tests for.
+  // Verify by curling the dev server; a vitest run cannot see this, because
+  // in-process `new Request("http://localhost:8787/...")` is precisely the URL
+  // wrangler dev never produces.
+  //
+  // Trade-off, and the next person's trap: this breaks `wrangler dev --remote`,
+  // which resolves a zone from the host and cannot find one for a single-label
+  // "localhost". That is the only documented way to exercise real EMAIL sends
+  // (see `send_email` below), so reach for it as
+  // `wrangler dev --remote --host understudy.proofof.tech` — the CLI arg wins
+  // over this key, and remote mode forces https, so the guard passes.
+  "dev": { "host": "localhost" },
   // Pinned at-or-before the pinned wrangler release date (see package.json)
   // so the bundled workerd is guaranteed to recognize this compatibility date.
   "compatibility_date": "2026-07-01",

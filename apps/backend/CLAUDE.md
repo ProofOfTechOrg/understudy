@@ -25,8 +25,7 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `src/account-agent.ts` | `AccountAgent` — per-tenant DO for MCP: session binding, refsValid/refsEpoch staleness guard, one-command mutex, dispatch retry/poll loops over the service layer | Changing MCP session lifecycle, ref guard, or retry semantics |
 | `src/oauth.ts` | The `OAuthProvider` instance (apiRoute `/mcp`, DCR, S256-only PKCE, RFC 8414/9728 metadata); delegated to by `src/index.ts` for a closed path list | Changing OAuth endpoints, scopes, or token TTLs |
 | `src/mcp/` | MCP surface: `props` (shared auth shape + 401), `static-auth` (usk_ fast path + 60s cache), `handler` (rate limit + serve), `mcp-agent` (`UnderstudyMcp` DO), `tools` (14-tool catalog), `outcomes` (single result mapper), `dispatch-loop` (testable retry/poll/busy loop) | Adding/changing tools, auth branches, result texts, or retry thresholds |
-| `src/dashboard/` | The provider's defaultHandler: `app` (routes), `pages` (hono/html + CSP-nonced client JS), `auth` (cookie/CSRF/next guards), `email` (OTP send seam), `vault-upload` (ECDH unseal → re-seal) | Changing dashboard routes, consent, sign-in, or the vault upload |
-| `src/oauth.ts` | The `OAuthProvider` instance | Changing OAuth endpoints/scopes/TTLs |
+| `src/dashboard/` | The provider's defaultHandler: `app` (routes + the app-wide same-origin gate and response security headers), `pages` (hono/html + CSP-nonced client JS), `auth` (cookie/CSRF/next guards), `email` (OTP send seam), `vault-upload` (ECDH unseal → re-seal) | Changing dashboard routes, consent, sign-in, the vault upload, or the response security headers — `Referrer-Policy` is load-bearing for the CSRF gate in `auth` |
 | `src/canonical.ts` | Canonical host/origin + derived MCP/dashboard URLs — one edit to change the domain | Changing the service domain |
 | `src/cache.ts` | `createPositiveCache` — the shared positive-only TTL cache (device creds, usk_ tokens) | Changing cache eviction/TTL semantics |
 | `src/secrets.ts` | `resolveSecret` — vault lookup only, no dispatch | Changing the vault backend, debugging secret resolution failures |
@@ -46,7 +45,7 @@ Cloudflare Worker (Hono) + one Agents-SDK Durable Object per session (`SessionAg
 | `test/mcp-auth.test.ts` | Static usk_ auth, positive cache, discovery-grade 401 fall-through | Verifying/extending MCP auth branches |
 | `test/mcp-tools.test.ts` | Live streamable-HTTP handshake, 14-tool catalog, ref guard, cross-tenant isolation, outcome mapping | Verifying/extending the tool surface |
 | `test/dispatch-loop.test.ts` | Unit tests for the retry/poll/busy loop thresholds (injected deps) | Changing retry/poll counts or the loop |
-| `test/dashboard-auth.test.ts` | Sign-in/CSRF/vault-upload + full DCR→consent→PKCE→MCP flow; OTP email seam | Verifying/extending the dashboard or consent |
+| `test/dashboard-auth.test.ts` | Sign-in/CSRF/vault-upload + full DCR→consent→PKCE→MCP flow; OTP email seam; the `sameOriginRequest` branch table (Sec-Fetch-Site/Origin) and the `Referrer-Policy` pin | Verifying/extending the dashboard, consent, or the same-origin gate |
 | `test/pairing.test.ts` | `/v1/pairing/claim` config contract + connect-ticket + heartbeat liveness | Verifying/extending pairing |
 | `test/helpers.ts` | Workers-runtime test helpers: session stub, WS extraction, `directory()`, `fetchApp()`, `mintUser()`, `CANONICAL` | Writing a new Workers-pool test |
 | `test/tokens.ts` | Shared test-only token constants (used by vitest.config.ts and suites) | Adding a test caller/extension identity |

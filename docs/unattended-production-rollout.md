@@ -49,7 +49,7 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Phase 5b: five-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 5c: all-allowlisted 24-hour gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 6: rollout closeout | Not started | Pending | Pending | Pending | Pending | Release operator |
-| Side surface: authed MCP server + account/pairing dashboard | Deployed | `mcp-4-dashboard-pairing` HEAD `00a6cf1` (local branch, not yet pushed/merged) | **Deployed `2026-07-31`, version `f334a2c8-c158-458f-a230-26bab95e79ea`** on account `056cbaa6…`. Applied migrations `v3` (`AccountDirectory`) + `v4` (`UnderstudyMcp`, `AccountAgent`); bound `MCP_AGENT`/`ACCOUNT`/`ACCOUNT_DIRECTORY`/`OAUTH_KV` (`920a2498…`)/`EMAIL`; secret `VAULT_UPLOAD_PRIVATE_KEY` set (sha256 prefix `150c0c6a…`). Both allowlists `["metamind", "prefix:acct-"]`. **This deploy reset the Phase 3b soak clock** (see the soak section) | Built green pre-deploy: backend 307 tests + extension 145 + build + `wrangler deploy --dry-run`; all three quality-gate lanes + `/security-review` passed (twice). Post-deploy live smoke against `understudy.proofof.tech`: `/health` → `{"ok":true}`; RFC 8414 + RFC 9728 metadata correct (S256, scopes `["mcp"]`, resource `.../mcp`); `POST /mcp` initialize with no bearer → `401` with the `resource_metadata` WWW-Authenticate pointer (the OAuth handshake's first exchange); DCR `/oauth/register` → `201` client_id; `/dashboard` → `200` sign-in page, `no-store` + nonce CSP. The full **authed** handshake (DCR→consent→PKCE→`tools/list` of 14 tools, and the `usk_` path) is proven in the workers-pool suite against identical code; live it needs a human to complete the emailed OTP, so only the unauthenticated discovery handshake was exercised live. Additive only — per-command path, `/v1` API, and soak-owned device/lease behavior unchanged | `2026-07-31` | Engineering |
+| Side surface: authed MCP server + account/pairing dashboard | Blocked | `mcp-4-dashboard-pairing` HEAD `00a6cf1` (local branch, not yet pushed/merged) | **Deployed `2026-07-31`, version `f334a2c8-c158-458f-a230-26bab95e79ea`** on account `056cbaa6…`. Applied migrations `v3` (`AccountDirectory`) + `v4` (`UnderstudyMcp`, `AccountAgent`); bound `MCP_AGENT`/`ACCOUNT`/`ACCOUNT_DIRECTORY`/`OAUTH_KV` (`920a2498…`)/`EMAIL`; secret `VAULT_UPLOAD_PRIVATE_KEY` set (sha256 prefix `150c0c6a…`). Both allowlists `["metamind", "prefix:acct-"]`. **This deploy reset the Phase 3b soak clock** (see the soak section) | Built green pre-deploy: backend 307 tests + extension 145 + build + `wrangler deploy --dry-run`; all three quality-gate lanes + `/security-review` passed (twice). Post-deploy live smoke against `understudy.proofof.tech`: `/health` → `{"ok":true}`; RFC 8414 + RFC 9728 metadata correct (S256, scopes `["mcp"]`, resource `.../mcp`); `POST /mcp` initialize with no bearer → `401` with the `resource_metadata` WWW-Authenticate pointer (the OAuth handshake's first exchange); DCR `/oauth/register` → `201` client_id; `/dashboard` → `200` sign-in page, `no-store` + nonce CSP. The full **authed** handshake (DCR→consent→PKCE→`tools/list` of 14 tools, and the `usk_` path) is proven in the workers-pool suite against identical code; live it needs a human to complete the emailed OTP, so only the unauthenticated discovery handshake was exercised live. Additive only — per-command path, `/v1` API, and soak-owned device/lease behavior unchanged. **Superseded: this version's dashboard was write-dead — every POST, sign-in included, returned `403 cross-origin request refused`. See "The dashboard refused its own POSTs (2026-07-31)". The smoke recorded here missed it because its only dashboard-plane request was `GET /dashboard`** | `2026-07-31` | Engineering |
 
 ## Unplanned Phase 1b deployment (2026-07-28)
 
@@ -107,6 +107,52 @@ A deployment propagates across the edge over seconds to minutes, and during that
 Poll for at least three minutes and require several CONSECUTIVE matching reads before accepting the gate. Metamind's `scripts/deploy.sh` does this (`8173ddd`); a hand-run check must do the same.
 
 The deployment was only detectable because Phase 1's build-time provenance stamp was already in place. Under the previous `COMMIT=local` placeholder, `/health` would have reported `local` both before and after, and this would have been invisible.
+
+## The dashboard refused its own POSTs (2026-07-31)
+
+Version `f334a2c8-…` shipped a dashboard that returned `403 cross-origin request refused` to **every** state-changing request, sign-in included. The self-serve surface was unusable from the moment it deployed: no account could sign in, so no account could add an origin, pair a browser, or mint an MCP token.
+
+`src/dashboard/app.ts` set `Referrer-Policy: no-referrer` on every response. Fetch's *append a request `Origin` header* serializes a non-CORS non-`GET` request's origin as the literal `null` under that policy, so Chrome posted `Origin: null` to the dashboard's own sign-in form — and `originAllowed` required `Origin` to equal the request URL's origin. The app's privacy header disabled the app's CSRF check.
+
+Captured off the wire in Chrome 150 via CDP (`Network.requestWillBeSentExtraInfo`; the plain `requestWillBeSent` view omits browser-added headers and shows no `Sec-Fetch-*` at all):
+
+```
+origin: null
+sec-fetch-site: same-origin
+sec-fetch-mode: navigate
+sec-fetch-dest: document
+```
+
+Confirmed server-side: `Origin: null` → `403`, `Origin: https://understudy.proofof.tech` → `200`, absent → `403`.
+
+**This is the same failure class as "An empty request body was not treated as attended" above, and that is the finding that matters.** Both shipped green because the suite builds requests in-process with `new Request(...)`, and an in-process `Request` does not carry what the wire carries — a null body there, a browser's computed header shape here. Twice now that gap has reached production. The deploy smoke did not close it either: it checked `GET /dashboard` → `200`, which never exercises a POST.
+
+**Every dashboard deploy smoke must now include a state-changing probe.** A `GET` cannot detect this class, and the two commands below pin both gate branches over the wire. Note the deliberately malformed address: `requestOtp` sends to ANY pattern-valid address whether or not the user exists, so a plausible-looking one would hard-bounce against `sign-in@proofof.tech`'s reputation and leave a junk challenge row on every deploy. Without an `@` it fails validation before the send, while the response — address-independent by design — is byte-identical:
+
+```bash
+# admit: expect 200 containing "6-digit code"
+curl -sS -X POST https://understudy.proofof.tech/dashboard/auth/request-code \
+  -H 'Origin: https://understudy.proofof.tech' \
+  -H 'Sec-Fetch-Site: same-origin' \
+  --data 'email=postdeploy-smoke' | grep -c '6-digit code'
+
+# refuse: expect 403
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  https://understudy.proofof.tech/dashboard/auth/request-code \
+  -H 'Origin: https://understudy.proofof.tech' \
+  -H 'Sec-Fetch-Site: cross-site' \
+  --data 'email=postdeploy-smoke'
+```
+
+The refuse probe doubles as a deployment discriminator: the pre-fix code reads `Origin` only, so it answers `200` to that request (measured against `f334a2c8-…`). A `403` therefore proves the new gate is the one serving traffic, not a cached or partially-rolled version. Not a browser-exploitable hole in the old code — `Origin` is a forbidden header name, so no page could have forged it — but it is exactly the signal that distinguishes the two versions over the wire.
+
+Fixed by making the check independent of any header this app can suppress. `sameOriginRequest` now keys on `Sec-Fetch-Site`, which is computed from the initiator and takes no referrer-policy input, keeping `Origin` only as a fallback for browsers that predate Fetch Metadata; the policy relaxes to `same-origin`, which sends nothing cross-origin (identical privacy) while leaving `Origin` intact for that fallback. The check also moves into the `dashboardApp` middleware, because it is the **only** CSRF control on the two pre-session sign-in routes and a new POST route must not be able to omit it silently.
+
+That scheme pin has a local-dev consequence worth knowing before you touch it. `wrangler.jsonc` declares a `custom_domain` route, and with one present `wrangler dev` serves the Worker the canonical host over `http` no matter what the client asked for — so the guard fires on every dev request and 308s the whole account plane to `https` on a plaintext listener. `wrangler.jsonc` pins `dev.host` to `localhost` to restore the loopback exemption. **Verify local dev by curling it, never by running vitest:** `curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/dashboard` must be `200`, not `308`. An in-process `new Request("http://localhost:8787/...")` is exactly the URL `wrangler dev` does not produce, which is why the suite cannot see this.
+
+One consumer-facing note: a client calling the canonical host over plain `http` on `/mcp` now receives a 308 it must follow. MCP clients use https, so this is low risk.
+
+Also closed while here: `src/index.ts` gated the account plane on host but not scheme, and browsers send Fetch Metadata only to trustworthy URLs — so a plain-`http` request reached the dashboard with no `Sec-Fetch-*` and fell to the suppressible `Origin` fallback. Not exploitable (producing a matching `Origin` over plaintext needs an active MITM, which defeats everything anyway), but it was the one path by which a browser could reach this app without the primary signal.
 
 ## Attended mode was broken (2026-07-28)
 
@@ -1107,7 +1153,9 @@ reset — this one already happened; sequence the network-blip fix on top of
 
 Deploy steps performed: `wrangler secret put VAULT_UPLOAD_PRIVATE_KEY` (fresh
 P-256 PKCS#8, sha256 prefix `150c0c6a…`, not the dev placeholder) → `wrangler
-deploy` → live smoke on `understudy.proofof.tech`: `/health` `{"ok":true}`, both
+deploy` → live smoke on `understudy.proofof.tech` — which did NOT catch that this
+version's dashboard refused every POST, see `## The dashboard refused its own
+POSTs (2026-07-31)`: `/health` `{"ok":true}`, both
 well-known metadata docs correct, `POST /mcp` initialize (no bearer) → `401`
 with the `resource_metadata` pointer, DCR `201`, `/dashboard` `200`. The branch
 is **not yet pushed or merged** — the deployed SHA `00a6cf1` is local; push/merge

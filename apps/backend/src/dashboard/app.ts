@@ -2,7 +2,8 @@
  * The OAuthProvider's defaultHandler: the account dashboard and the
  * /oauth/authorize consent screen. Server-rendered forms over the
  * AccountDirectory; every response is no-store with a nonce-locked CSP, and
- * every POST passes the two-layer CSRF check in ./auth.
+ * every state-changing request passes the same-origin gate in the middleware
+ * below — authed forms additionally carry the HMAC csrf field (see ./auth).
  */
 
 import { Hono, type Context } from "hono";
@@ -23,8 +24,8 @@ import {
   clearedSessionCookie,
   csrfValid,
   csrfTokenFor,
-  originAllowed,
   safeNext,
+  sameOriginRequest,
   sessionCookie,
   sessionFromRequest,
   type DashboardUser,
@@ -61,9 +62,31 @@ const NOTICES: Record<string, string> = {
 dashboardApp.use("*", async (c, next) => {
   const nonce = base64urlEncode(crypto.getRandomValues(new Uint8Array(16)));
   c.set("cspNonce", nonce);
-  await next();
+  // The same-origin gate lives here, not in each handler: it is the ONLY CSRF
+  // control on the two pre-session sign-in routes (see ./auth), so a new route
+  // silently inheriting no protection is the wrong default. It covers every
+  // non-safe method, not only POST.
+  //
+  // Scope: the provider owns /oauth/token, /oauth/register, /mcp* and the two
+  // well-knowns, which never reach this app. Everything else under /oauth/ does
+  // and is therefore gated — including /oauth/register/<clientId> (RFC 7592),
+  // because the provider matches its registration endpoint exactly, not by
+  // prefix. That path is unimplemented here and 403s where it used to 404.
+  if (c.req.method !== "GET" && c.req.method !== "HEAD" && !sameOriginRequest(c.req.raw)) {
+    c.res = c.text("cross-origin request refused", 403);
+  } else {
+    await next();
+  }
   c.header("Cache-Control", "no-store");
-  c.header("Referrer-Policy", "no-referrer");
+  // `same-origin`, not `no-referrer`. The privacy goal — never leak a dashboard
+  // URL to a third party — is met identically by both: neither sends anything
+  // cross-origin, including on the consent redirect that carries the
+  // authorization code. `no-referrer` additionally forces Fetch to serialize a
+  // same-origin form POST's `Origin` as `null`, which would strand the fallback
+  // branch of `sameOriginRequest` in a permanent 403. `same-origin` is the
+  // strictest policy that preserves that header; `strict-origin*` would leak
+  // the bare origin cross-origin for no gain here.
+  c.header("Referrer-Policy", "same-origin");
   c.header(
     "Content-Security-Policy",
     `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; ` +
@@ -96,12 +119,12 @@ function render(c: Ctx, title: string, body: Parameters<typeof layout>[2], extra
   return c.html(layout(title, c.get("cspNonce"), body, extraJs));
 }
 
-/** Origin + session + CSRF for every authed POST; a Response means refusal. */
+/** Session + CSRF for every authed POST; a Response means refusal. The
+ * same-origin gate already ran in the middleware. */
 async function authedPost(
   c: Ctx,
   body: Record<string, unknown>,
 ): Promise<DashboardUser | Response> {
-  if (!originAllowed(c.req.raw)) return c.text("cross-origin request refused", 403);
   const user = await sessionFromRequest(c.req.raw, c.env);
   if (user === null) return c.text("signed out — reload the dashboard", 403);
   if (!(await csrfValid(c.env, user.cookieToken, body.csrf))) {
@@ -153,7 +176,6 @@ dashboardApp.get("/dashboard", async (c) => {
 });
 
 dashboardApp.post("/dashboard/auth/request-code", async (c) => {
-  if (!originAllowed(c.req.raw)) return c.text("cross-origin request refused", 403);
   if (!(await unauthenticatedRateAllowed(c.req.raw, c.env, "otp-request"))) {
     return c.text("rate limited — try again shortly", 429);
   }
@@ -177,7 +199,6 @@ dashboardApp.post("/dashboard/auth/request-code", async (c) => {
 });
 
 dashboardApp.post("/dashboard/auth/verify", async (c) => {
-  if (!originAllowed(c.req.raw)) return c.text("cross-origin request refused", 403);
   if (!(await unauthenticatedRateAllowed(c.req.raw, c.env, "otp-verify"))) {
     return c.text("rate limited — try again shortly", 429);
   }
