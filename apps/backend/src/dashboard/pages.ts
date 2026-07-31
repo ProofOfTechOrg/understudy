@@ -243,6 +243,14 @@ export function homePage(data: HomeData): Fragment {
 </tr>`,
         );
 
+  // Advisory only — it disables the pairing button and shows a hint. The
+  // refusal that matters is createPairingCode's (see account-directory.ts);
+  // curl or a stale tab reaches that directly. Its purpose is to explain the
+  // prerequisite before the click, not to enforce it: a user reported the
+  // disabled button as simply broken when the hint was out of sight.
+  //
+  // Both hints anchor (#origins, #browsers) instead of naming a direction, so
+  // card order carries no correctness weight and the cards may be reordered.
   const canPair = data.origins.length > 0;
 
   return html`<div class="topbar">
@@ -257,10 +265,20 @@ export function homePage(data: HomeData): Fragment {
 </div>
 ${data.notice === undefined ? "" : html`<p class="muted">${data.notice}</p>`}
 
-<div class="card">
+<div class="card" id="browsers">
   <h2>Paired browsers</h2>
   <table><tr><th>Browser</th><th>Status</th><th>Last seen</th><th></th></tr>${deviceRows}</table>
   <p class="muted">Revoking takes effect within about two minutes; the extension shows why it stopped.</p>
+</div>
+
+<div class="card" id="origins">
+  <h2>Allowed origins</h2>
+  <p class="muted">The sites a paired browser may be driven on, one https origin per line (up to 32). A new pairing snapshots this list. Editing it afterwards does NOT change what an already-paired browser may drive — including removals: to withdraw an origin from a paired browser, <a href="#browsers">revoke that browser</a> and pair it again.</p>
+  <form method="post" action="/dashboard/origins">
+    <input type="hidden" name="csrf" value="${data.csrf}" />
+    <textarea name="origins" rows="4" placeholder="https://example.com">${data.origins.join("\n")}</textarea>
+    <button class="primary" type="submit">Save origins</button>
+  </form>
 </div>
 
 <div class="card">
@@ -272,20 +290,10 @@ ${data.notice === undefined ? "" : html`<p class="muted">${data.notice}</p>`}
   </form>
   ${canPair
     ? ""
-    : html`<p class="muted">Add at least one allowed origin below first — a paired browser needs to know which sites it may drive.</p>`}
+    : html`<p class="muted">Add at least one <a href="#origins">allowed origin</a> before pairing a browser — the pairing snapshot tells the extension which sites it may drive.</p>`}
 </div>
 
 ${connectCard()}
-
-<div class="card">
-  <h2>Allowed origins</h2>
-  <p class="muted">The sites a paired browser may be driven on, one https origin per line (up to 32). New pairings snapshot this list; changing it later means pairing again.</p>
-  <form method="post" action="/dashboard/origins">
-    <input type="hidden" name="csrf" value="${data.csrf}" />
-    <textarea name="origins" rows="4" placeholder="https://example.com">${data.origins.join("\n")}</textarea>
-    <button class="primary" type="submit">Save origins</button>
-  </form>
-</div>
 
 <div class="card">
   <h2>API tokens</h2>

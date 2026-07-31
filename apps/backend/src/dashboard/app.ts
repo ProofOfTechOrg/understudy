@@ -57,6 +57,10 @@ const NOTICES: Record<string, string> = {
   "token-missing": "That API token was already gone.",
   "device-revoked": "Browser revoked. Pair again with a fresh code to reconnect it.",
   "device-missing": "That browser was already gone.",
+  // Lands on the dashboard rather than an interstitial precisely because the
+  // remedy — the Allowed origins card — is on the dashboard. The pairing card's
+  // own hint states the prerequisite; this only explains the refused click.
+  "no-origins": "No pairing code: add an allowed origin first.",
 };
 
 dashboardApp.use("*", async (c, next) => {
@@ -265,14 +269,7 @@ dashboardApp.post("/dashboard/pair", async (c) => {
   if (user instanceof Response) return user;
   const created = await directory(c.env).createPairingCode(user.userId);
   if (created.kind === "no_origins") {
-    return render(
-      c,
-      "Pairing — Understudy",
-      messagePage(
-        "No allowed origins yet",
-        "Add at least one allowed origin before pairing a browser — the pairing snapshot tells the extension which sites it may drive.",
-      ),
-    );
+    return c.redirect("/dashboard?notice=no-origins", 303);
   }
   return render(
     c,

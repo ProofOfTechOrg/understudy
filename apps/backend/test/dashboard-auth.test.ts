@@ -318,11 +318,13 @@ describe("dashboard CSRF + account cards", () => {
 
   it("round-trips allowed origins and gates pairing on them", async () => {
     const user = await signedInUser();
-    // Pairing before any origin exists is refused with the inline reason.
+    // Pairing before any origin exists mints no code and returns the user to
+    // the dashboard, where the remedy (the Allowed origins card) lives.
     const early = await fetchApp(
       formPost("/dashboard/pair", { cookie: user.cookie, form: { csrf: user.csrf } }),
     );
-    expect(await early.text()).toContain("No allowed origins yet");
+    expect(early.status).toBe(303);
+    expect(early.headers.get("Location")).toBe("/dashboard?notice=no-origins");
 
     const saved = await fetchApp(
       formPost("/dashboard/origins", {
@@ -341,6 +343,20 @@ describe("dashboard CSRF + account cards", () => {
     const pairHtml = await pair.text();
     expect(pairHtml).toMatch(/[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}/);
     expect(pairHtml).toContain("data-expires");
+  });
+
+  it("resolves both card anchors, so card order carries no correctness weight", async () => {
+    // #given the two cross-references between cards are anchors, not the words
+    // "above"/"below" — which is what lets the cards be reordered. Deleting
+    // either id would dead-link a hint with nothing else failing.
+    const user = await signedInUser();
+    // #when
+    const html = await (await fetchApp(pageGet("/dashboard", user.cookie))).text();
+    // #then each anchor has exactly one target, and no id is duplicated.
+    for (const id of ["origins", "browsers"]) {
+      expect(html.split(`id="${id}"`).length - 1).toBe(1);
+      expect(html.split(`href="#${id}"`).length - 1).toBe(1);
+    }
   });
 
   it("creates a show-once token that verifies by digest, and revokes it", async () => {

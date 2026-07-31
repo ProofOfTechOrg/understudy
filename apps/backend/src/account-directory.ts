@@ -463,6 +463,15 @@ export class AccountDirectory extends DurableObject<Env> {
 
   async createPairingCode(userId: string): Promise<CreatePairingCodeResult> {
     const user = await this.getUser(userId);
+    // The authoritative empty-origins refusal — the dashboard's disabled button
+    // only mirrors it, and curl or a stale tab reaches here directly. Keep it
+    // even if that button state is ever removed, because it is the ONLY layer
+    // that can explain itself: claimPairingCode repeats the check for origins
+    // emptied after minting but collapses to an anti-enumeration 404, and the
+    // extension's normalizeProfileConfig — which pairDevice reaches by feeding
+    // the claim response into configure(), so it is on this path, not just the
+    // manual form — throws a generic pairing failure after the single-use code
+    // has already been consumed.
     if (user === null || user.allowedOrigins.length === 0) {
       return { kind: "no_origins" };
     }

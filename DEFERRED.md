@@ -309,3 +309,117 @@ Attaching `chrome.debugger` shows the "controlled by automated test software" ba
 It also means the banner is **not** a per-tab indicator of whether a given tab is under CDP control, so it cannot be used as a diagnostic. That mistake was made once already during this rollout.
 
 **Proposed fix:** documentation only. State in the extension runbook that the banner is process-wide, that dismissing it anywhere detaches the canary, and that it must not be read as evidence about a particular tab.
+
+---
+
+## The account plane has no HSTS, so a first plaintext request still crosses the wire
+
+**Baseline:** branch `dev`, commit `1522cdc` (deployed version `dc9c378e-6e6b-416b-b7ef-038411bc4ae5`).
+**Found:** 2026-07-31, during the review of the dashboard CSRF fix.
+**Severity:** a first-visit plaintext sign-in POST exposes an email address and a live OTP code to anyone on the path.
+
+`apps/backend/src/index.ts` now redirects the account plane to `https://` when `url.origin !== CANONICAL_ORIGIN` — but a 308 only fires *after* the request has already been received, body included. Nothing tells a browser not to send the plaintext request in the first place, because no response sets `Strict-Transport-Security`. Cloudflare's Always-Use-HTTPS is an account setting, not a property of this repo, and was off when this was written (`http://understudy.proofof.tech/dashboard` returned `200` before the scheme pin landed).
+
+Scope it accurately before acting. The dashboard session cookie is `__Host-`-prefixed and therefore `Secure`, so a session token never traverses plaintext regardless. The real exposure is narrower and still worth closing: the `email` field and the 6-digit `code` field of a sign-in POST, on a first visit, before any redirect has been cached. `usk_` MCP bearers are a second case — a client calling `http://understudy.proofof.tech/mcp` now receives a 308, and 308 preserves the body and headers, so the token has already crossed by then.
+
+**Proposed fix:** add `Strict-Transport-Security: max-age=31536000; includeSubDomains` to the dashboard middleware's header block in `apps/backend/src/dashboard/app.ts` (alongside `Cache-Control`, `Referrer-Policy`, and the CSP), and to the `/mcp` and OAuth responses if they are to be covered too — the header is only honoured when served over https, so it must ride the responses a client actually receives on the canonical origin. Consider `preload` only after confirming no sibling subdomain of `proofof.tech` needs plaintext, since `includeSubDomains` applies to all of them. Enabling Always-Use-HTTPS on the zone is a complementary control, not a substitute, because it lives outside this repo and is invisible to review here.
+
+**Why deferred:** it is an addition beyond what the CSRF fix set out to do, not a defect in it, and the fix was shipping against a live outage.
+
+---
+
+## Allowed origins are a pairing-time seed, not a live authorization policy
+
+**Baseline:** branch `dev`, commit `1522cdc` (deployed version `dc9c378e-6e6b-416b-b7ef-038411bc4ae5`).
+**Found:** 2026-07-31, during architectural review of the dashboard card reorder.
+**Severity:** the dashboard presents a control that reads as an authorization boundary and is not one. Removing an origin does not withdraw it.
+
+`setAllowedOrigins` (`apps/backend/src/account-directory.ts`) writes **only** `users.allowed_origins`. Nothing touches the paired device's row, and there is no push path to a connected extension. The list reaches a device exactly once, at pairing: `claimPairingCode` copies `user.allowedOrigins` into the `devices` row and returns it as `originPolicy`; the extension persists it and re-declares it on every connect; `DeviceAgent.onMessage` canonicalizes it into `registerDevice`, which stores `origin_policy_json`; and `createLease` (`apps/backend/src/tenant-coordinator.ts`) enforces `isSubset(input.allowedOrigins, origin_policy_json)` against **that** snapshot. `createSession` (`apps/backend/src/api/sessions.ts`) never reads the account's live list. After pairing, the account list has zero runtime effect.
+
+The consequence is asymmetric with the UI's implication. Adding an origin does nothing until re-pairing — which the copy said. **Removing one also does nothing**, which it did not: the paired browser keeps driving the withdrawn origin until the device is revoked. Re-pairing does not withdraw it either, because `claimPairingCode` inserts a *new* device row and never revokes the predecessor, which remains `revoked_at IS NULL` carrying the older, broader policy. In practice the extension overwrites its own local config so the orphaned `udt_` credential stops being used, but nothing server-side enforces that.
+
+Mitigated for now in copy only (`apps/backend/src/dashboard/pages.ts`, the Allowed origins card): the card now states that editing does not affect an already-paired browser and that withdrawing an origin requires revoking the browser.
+
+**Proposed fix:** make the origin policy server-authoritative. Resolve a device's allowed origins from `users.allowed_origins` at lease time — or push them on connect/heartbeat — and treat the extension's declared list as an upper bound to intersect with, never as the authority. Dashboard edits then take effect immediately in both directions, the narrowing gap closes, and pairing-time origins become irrelevant, so the empty-list gate on the pairing button could be deleted for free. Separately, have `claimPairingCode` revoke the superseded device row.
+
+**Why deferred:** it is a protocol change with a version-skew story (an older extension must keep working against a newer backend), not a UI change, and it was found while shipping an unrelated one-card reorder. Do not fold it into that commit.
+
+**Note on the gate:** do NOT "simplify" by allowing pairing with an empty origin list before doing the above. Four layers refuse it, and the last one is the trap. (1) The dashboard's disabled button is advisory only. (2) `createPairingCode` (`apps/backend/src/account-directory.ts`) returns `no_origins`, which the route turns into a 303 to `/dashboard?notice=no-origins`. (3) `claimPairingCode` repeats the check for origins emptied between minting and redemption, collapsed to a 404 because every pairing failure mode is deliberately indistinguishable. (4) **`normalizeProfileConfig` (`apps/extension/src/core/profile-client.ts`) is ON the pairing path, not merely a manual-config backstop**: `pairDevice` (`apps/extension/src/entrypoints/background.ts`) feeds the claim response straight into `profileClient.configure()`, whose first statement normalizes and which rejects `originPolicy.length < 1`. `redeemPairingCode` does not check length, so nothing catches it earlier. The wire invariant for the rework is therefore: the claim response must carry at least one canonical origin, or the extension's validator must be relaxed and rolled out FIRST — otherwise every pairing fails with a generic "Pairing failed" after the server has already consumed the single-use code and emitted paired telemetry.
+
+---
+
+## A paired extension dials a hardcoded localhost dev socket forever
+
+**Baseline:** branch `dev`, commit `1522cdc`.
+**Found:** 2026-07-31, on a freshly installed extension paired through the dashboard.
+**Severity:** continuous console errors on every user's browser, and a permanent reconnect loop doing no work.
+
+`DEFAULT_WS_URL = "ws://localhost:8787"` is hardcoded in both `apps/extension/src/entrypoints/background.ts` and `apps/extension/src/entrypoints/sidepanel/App.tsx`. It is the **attended** (legacy) session socket's default, pointing at a local `wrangler dev`. A real user never has one. The backstop alarm calls `ensureConnection()` → `connectWs()` → `ReconnectingWs`, which dials it and retries indefinitely.
+
+Measured on a paired, working browser driving real sessions — not merely at install:
+
+```
+[error] network :: WebSocket connection to 'ws://localhost:8787/' failed:
+        Error in connection establishment: net::ERR_CONNECTION_REFUSED
+        (chrome-extension://<id>/background.js)
+```
+
+Two consecutive 25-second samples of the service-worker console counted **24** then **48** occurrences. `ReconnectingWs` backs off 500 ms doubling to a 30 s cap (`BACKOFF_BASE_MS`/`BACKOFF_CAP_MS` in `apps/extension/src/core/ws-client.ts`), so one instance should settle to ~2/minute. Observing ~1–2/second, and *rising* between samples, means reconnect loops are accumulating rather than backing off — the count should have fallen, not doubled. The accumulation mechanism was not isolated; `ensureConnection` does guard on `ws !== null`, so whoever fixes this should diagnose where additional `ReconnectingWs` instances come from rather than assume the guard is sufficient.
+
+Note this is unattended-path collateral: the browser was paired via the dashboard and never configured for attended mode, yet the attended peer dials regardless.
+
+**Proposed fix:** do not connect at all without a configured attended session. The `DEFAULT_WS_URL` constant should go; `currentWsUrl` should be `null` until the panel supplies one, and `ensureConnection` should return early on a null URL. Then fix the instance accumulation separately, since a single leaked loop against a *reachable* backend would be invisible in the console while still burning a socket.
+
+**Do not fix by catching the error.** The message is emitted by Chrome's network stack, not by application code — there is no promise to catch and no handler that suppresses it. Only not dialing removes it.
+
+---
+
+## Pairing and per-browser authorization need to be rebuilt
+
+**Baseline:** branch `dev`, commit `1522cdc`.
+**Raised:** 2026-07-31 by the maintainer, after running the first full end-to-end pairing.
+**Type:** requirements for a follow-up design, not a defect report.
+
+The current flow — one account-wide origin list, snapshotted once into a device by a copy-pasted 8-character code, with account-wide API tokens — is the minimum that worked. Three changes are wanted, and they interlock enough to be designed together rather than piecemeal:
+
+1. **Origins settable per browser, and kept in sync.** Today the list is per *account* and reaches a device only at pairing (see "Allowed origins are a pairing-time seed, not a live authorization policy" above). Two browsers paired to one account cannot be given different reach — a personal profile and a work profile get identical authority. The fix for the sync half is the server-authoritative resolution described in that entry; this adds that the authoritative record should be **per device**, with the account list acting as a default for new pairings rather than the only value.
+
+2. **Link-based pairing instead of code transcription.** The user reads an 8-character code off the dashboard and types it into the side panel. It should be a click: the dashboard offers a link (or QR) that the extension consumes directly. Note the constraint that makes this non-trivial — the code is redeemed by the *extension*, which has no dashboard session, so a clickable link must carry a one-time secret to a context the browser can route to the extension without the page being able to read it. `chrome.runtime.onMessageExternal` with an `externally_connectable` entry for the canonical origin is the obvious mechanism; it changes the manifest and therefore the install-time permission prompt.
+
+3. **API keys scoped per pairing.** `usk_` tokens are account-wide, so one leaked token drives every paired browser and revoking it breaks all of them. A token should be issuable against a single device, so blast radius and revocation both follow the browser. This also gives the MCP surface a natural answer to "which browser should this call drive?" when an account has several — today `browser_open` picks, and with per-device tokens the token itself decides.
+
+**Why deferred:** each of the three changes the pairing wire contract, and (2) changes the extension manifest, so all three carry a version-skew story between an installed extension and a deployed backend. They want one design pass and one coordinated rollout, not three independent commits — and must ship separately from any dashboard copy or layout work.
+
+---
+
+## Page URLs reach the model outside the UNTRUSTED PAGE CONTENT delimiters
+
+**Baseline:** branch `dev`, commit `1522cdc`.
+**Found:** 2026-07-31, while verifying the `understudy-browser` skill against the tool surface.
+**Severity:** a prompt-injection surface the code's own header comment says is closed.
+
+`apps/backend/src/mcp/outcomes.ts` opens by stating that page-derived text — "a11y trees, **page URLs**, extension error strings that may embed page content" — is wrapped in `UNTRUSTED PAGE CONTENT` delimiters. Page URLs are not. `event.url` is interpolated outside the markers in at least `Page snapshot of ${event.url}`, the screenshot caption, and the post-navigation `Now at: ${event.url}.`
+
+A URL is attacker-influenceable: a redirect, a crafted link, or any page that controls its own query string can put arbitrary text there, and it arrives in the client model's context as trusted server prose. The delimiters are explicitly described in that same comment as the weakest mitigation in the stack, which makes a gap in them cheap to exploit and easy to overlook.
+
+This matters more now that `.claude/skills/understudy-browser/SKILL.md` ships: it instructs an agent that content inside the markers is data and, by implication, that text outside them is the server speaking.
+
+**Proposed fix:** wrap the URL, or strip it to origin + path and escape it, at every interpolation site in `outcomes.ts`. Prefer one helper so the guarantee is enforced in a single place, matching that module's stated reason for existing. Then re-read the header comment and make it true of every site, or narrow the claim.
+
+**Why deferred:** it is a distinct surface from the dashboard CSRF work this was found alongside, and it wants a single-helper fix plus a test that pins delimiter placement rather than a scattered patch.
+
+---
+
+## The MCP surface tells clients refs are single-use; the extension does not consume them
+
+**Baseline:** branch `dev`, commit `1522cdc`.
+**Found:** 2026-07-31, verifying skill guidance against the implementation.
+**Severity:** every MCP client is instructed to take a redundant snapshot per action.
+
+Three places tell clients refs are single-use — `apps/backend/src/mcp/outcomes.ts` ("Refs are fresh for this page state, SINGLE-USE, and die on any navigation") and two descriptions in `apps/backend/src/mcp/tools.ts`. The extension does not implement that: `CdpSession.resolveRef` (`apps/extension/src/driver/cdp.ts`) is `this.refMap.get(ref) ?? null`, a pure lookup with no delete. Refs are scoped to a snapshot generation and remain valid for the whole epoch; `tools.ts` even says elsewhere that scrolling does not invalidate them.
+
+So the stated contract is stricter than the enforced one. A client obeying it round-trips an extra `browser_snapshot` before every action, which on this surface costs a full command through the queue, the device, and back.
+
+**Proposed fix:** decide which is true and make both say it. Either consume the ref in `resolveRef` (making the contract real, at the cost of breaking any client that reuses one) or relax the wording to what is enforced — refs are valid until the page navigates or the generation changes. The second is cheaper and matches observed behavior; the first is defensible if single-use is wanted as a guard against an agent acting on a stale mental model.
+
+**Why deferred:** it is a contract change visible to every connected client, so it wants deciding deliberately rather than as a side effect of a docs pass.
