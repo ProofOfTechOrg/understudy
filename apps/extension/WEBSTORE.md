@@ -131,21 +131,31 @@ Do not select health, financial, payment, or location categories unless the subm
 
 Certify every limited-use statement only after confirming the privacy policy and package behavior still match these disclosures. Understudy does not sell data, use data for advertising, or allow routine human review of user data.
 
-## Give reviewers a complete setup flow
+## Enter reviewer test instructions
 
-Put these steps in the reviewer notes:
+Complete the optional **Test instructions** tab because pairing and external-client setup are not self-evident. The reviewer does not need a shared account.
+
+- **Username**: Leave blank. Enter `Not required` if the field requires a value.
+- **Password**: Leave blank. Enter `Not required` if the field requires a value.
+- **Other instructions**: Paste the following text.
+
+```text
+No pre-provisioned credentials are required. Understudy uses passwordless email sign-in.
 
 1. Install the extension and click its toolbar icon. The Understudy side panel opens.
 2. Leave the extension unpaired. It must remain idle without localhost or other failed connection attempts.
-3. Select **Open dashboard**, sign in with an email address, and enter the one-time password delivered to that address.
-4. Add `https://example.com` under **Allowed origins** and generate a browser pairing code.
-5. Enter the code in the extension. The panel shows **Connecting**, then **Connected**.
-6. Create an API token in the dashboard and configure an MCP client for `https://understudy.proofof.tech/mcp`.
-7. Ask the client to open `https://example.com`. Chrome creates a controlled tab, and the panel shows `1 / 2` controlled tabs.
-8. Select **Stop hosting** and confirm. The controlled session ends, and the panel shows **Paused**.
+3. Select Open dashboard and enter any email address you can access. Enter the 6-digit one-time code delivered to that address.
+4. Add https://example.com under Allowed origins and generate a browser pairing code.
+5. Enter the code in the extension. The panel shows Connecting, then Connected.
+6. Create an API token in the dashboard. Configure a Model Context Protocol (MCP) client for https://understudy.proofof.tech/mcp.
+7. Ask the client to open https://example.com. Chrome creates a controlled tab, and the panel shows 1 / 2 controlled tabs.
+8. Select Stop hosting and confirm. The controlled session ends, and the panel shows Paused.
 9. Generate a fresh pairing code to resume. Pairing codes are single-use.
 
-Also tell reviewers that Chrome’s debugger banner is process-wide. Dismissing it in any Chrome window can detach a controlled tab, and the banner does not identify which tab is controlled.
+Chrome’s debugger banner is process-wide. Dismissing it in any Chrome window can detach a controlled tab. The banner does not identify which tab is controlled.
+```
+
+Do not provide a shared application programming interface (API) token, pairing code, mailbox password, or personal login. Reviewers generate temporary credentials during testing.
 
 ## Complete the manual release checks
 
