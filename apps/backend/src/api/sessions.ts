@@ -24,8 +24,8 @@ import type {
 } from "@understudy/protocol";
 import { isWriteCommand } from "@understudy/protocol";
 import type { DirectoryDeviceRecord } from "../account-directory";
-import type { Actor } from "../auth";
-import { mintSessionId, scopeSession, telemetryPseudonym } from "../auth";
+import type { Actor, DeviceIdentity } from "../auth";
+import { mintSessionId, mintWsTicket, scopeSession, telemetryPseudonym } from "../auth";
 import type { DeviceAgent } from "../device";
 import type { SessionAgent } from "../session";
 import { emitTelemetry } from "../telemetry";
@@ -40,7 +40,12 @@ export function getSessionStub(
   return getAgentByName(env.SESSION, sessionId);
 }
 
-export function getTenantStub(
+// Module-private: the device-control coordinator/agent stubs are reached only
+// through this service layer, never from a route handler. Keeping this
+// unexported is what enforces "no caller reaches the coordinator/device stubs
+// directly" — the device-connect-ticket route now goes through
+// mintDeviceConnectTicket below instead of grabbing the stub itself.
+function getTenantStub(
   env: Env,
   tenantId: string,
 ): DurableObjectStub<TenantDeviceCoordinator> {
@@ -242,6 +247,50 @@ export async function createSession(
 
 export function listDevices(env: Env, actor: Actor): Promise<DeviceStatusPayload> {
   return getTenantStub(env, actor.tenantId).listDevices();
+}
+
+export type MintTicketResult =
+  | { kind: "quota_exceeded" }
+  | { kind: "device_not_found" }
+  | { kind: "ok"; ticket: string; expiresIn: number; websocketPath: string };
+
+/**
+ * Device connect-ticket issuance for an already-authenticated device (either
+ * class — the caller resolves identity via authenticateDeviceComposite). Lives
+ * here so the /v1/device/connect-ticket route is an adapter like the session
+ * routes, and the coordinator/DeviceAgent stubs stay behind the service layer.
+ */
+export async function mintDeviceConnectTicket(
+  env: Env,
+  device: DeviceIdentity,
+  browserEpoch: string,
+): Promise<MintTicketResult> {
+  const coordinator = getTenantStub(env, device.tenantId);
+  if (!(await coordinator.consumeDeviceTicketQuota(device.deviceId))) {
+    return { kind: "quota_exceeded" };
+  }
+  const agent = env.DEVICE.getByName(device.deviceId) as DurableObjectStub<DeviceAgent>;
+  if (!(await agent.authorizeCredential(device))) {
+    return { kind: "device_not_found" };
+  }
+  const ticket = await mintWsTicket(
+    {
+      aud: "device-control",
+      tenantId: device.tenantId,
+      deviceId: device.deviceId,
+      credentialVersion: device.credentialVersion,
+      leaseEpoch: 0,
+      browserEpoch,
+      agentName: device.deviceId,
+    },
+    env,
+  );
+  return {
+    kind: "ok",
+    ticket,
+    expiresIn: 60,
+    websocketPath: `/agents/device/${encodeURIComponent(device.deviceId)}`,
+  };
 }
 
 /**

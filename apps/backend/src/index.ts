@@ -10,7 +10,6 @@ import {
   authenticate,
   authenticatedRateAllowed,
   authenticateDeviceComposite,
-  mintWsTicket,
   scopeSession,
   SESSION_IDEMPOTENCY_KEY_PATTERN,
   taggedHmacHex,
@@ -27,11 +26,10 @@ import {
   deleteSession,
   dispatchCommand,
   getSessionStatus,
-  getTenantStub,
   listDevices,
+  mintDeviceConnectTicket,
   pollCommand,
 } from "./api/sessions";
-import type { DeviceAgent } from "./device";
 import { oauthProvider } from "./oauth";
 import { tryStaticMcpAuth } from "./mcp/static-auth";
 import type { Env, V2DispatchOutcome } from "./types";
@@ -275,31 +273,19 @@ app.post("/v1/device/connect-ticket", async (c) => {
   } catch (error) {
     return bodyError(c, error);
   }
-  const coordinator = getTenantStub(c.env, device.tenantId);
-  if (!(await coordinator.consumeDeviceTicketQuota(device.deviceId))) {
-    return c.json({ error: "device ticket quota exceeded" }, 429);
+  const result = await mintDeviceConnectTicket(c.env, device, body.browserEpoch);
+  switch (result.kind) {
+    case "quota_exceeded":
+      return c.json({ error: "device ticket quota exceeded" }, 429);
+    case "device_not_found":
+      return c.json({ error: "device not found" }, 404);
+    case "ok":
+      return c.json({
+        ticket: result.ticket,
+        expiresIn: result.expiresIn,
+        websocketPath: result.websocketPath,
+      });
   }
-  const agent = c.env.DEVICE.getByName(device.deviceId) as DurableObjectStub<DeviceAgent>;
-  if (!(await agent.authorizeCredential(device))) {
-    return c.json({ error: "device not found" }, 404);
-  }
-  const ticket = await mintWsTicket(
-    {
-      aud: "device-control",
-      tenantId: device.tenantId,
-      deviceId: device.deviceId,
-      credentialVersion: device.credentialVersion,
-      leaseEpoch: 0,
-      browserEpoch: body.browserEpoch,
-      agentName: device.deviceId,
-    },
-    c.env,
-  );
-  return c.json({
-    ticket,
-    expiresIn: 60,
-    websocketPath: `/agents/device/${encodeURIComponent(device.deviceId)}`,
-  });
 });
 
 /**
