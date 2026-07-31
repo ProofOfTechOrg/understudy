@@ -49,7 +49,7 @@ Never mark a gate `Passed` without its approved SHA, deployment disposition, evi
 | Phase 5b: five-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 5c: all-allowlisted 24-hour gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
 | Phase 6: rollout closeout | Not started | Pending | Pending | Pending | Pending | Release operator |
-| Side surface: authed MCP server + account/pairing dashboard | In progress | `dev` branch `mcp-4-dashboard-pairing` (SHA stamped at merge) | **Pending — deploying this resets the Phase 3b soak clock.** Adds migrations `v3` (`AccountDirectory`) and `v4` (`UnderstudyMcp`, `AccountAgent`), bindings `MCP_AGENT`/`ACCOUNT`/`ACCOUNT_DIRECTORY`/`OAUTH_KV`/`EMAIL`, and secret `VAULT_UPLOAD_PRIVATE_KEY` (must be `wrangler secret put` before deploy). Both allowlists become `["metamind", "prefix:acct-"]` | Built and green on branch: backend 305 tests + `wrangler deploy --dry-run`, extension 145 tests + build. Additive only — new routes/DOs/bindings; the per-command path, `/v1` API, and soak-owned device/lease behavior are unchanged (`ws-client.ts` and `tenant-coordinator.ts` byte-identical, `profile-client.ts` additive-only). Quality gate + security review run on the branch. **Not yet deployed** | Pending | Engineering |
+| Side surface: authed MCP server + account/pairing dashboard | Deployed | `mcp-4-dashboard-pairing` HEAD `00a6cf1` (local branch, not yet pushed/merged) | **Deployed `2026-07-31`, version `f334a2c8-c158-458f-a230-26bab95e79ea`** on account `056cbaa6…`. Applied migrations `v3` (`AccountDirectory`) + `v4` (`UnderstudyMcp`, `AccountAgent`); bound `MCP_AGENT`/`ACCOUNT`/`ACCOUNT_DIRECTORY`/`OAUTH_KV` (`920a2498…`)/`EMAIL`; secret `VAULT_UPLOAD_PRIVATE_KEY` set (sha256 prefix `150c0c6a…`). Both allowlists `["metamind", "prefix:acct-"]`. **This deploy reset the Phase 3b soak clock** (see the soak section) | Built green pre-deploy: backend 307 tests + extension 145 + build + `wrangler deploy --dry-run`; all three quality-gate lanes + `/security-review` passed (twice). Post-deploy live smoke against `understudy.proofof.tech`: `/health` → `{"ok":true}`; RFC 8414 + RFC 9728 metadata correct (S256, scopes `["mcp"]`, resource `.../mcp`); `POST /mcp` initialize with no bearer → `401` with the `resource_metadata` WWW-Authenticate pointer (the OAuth handshake's first exchange); DCR `/oauth/register` → `201` client_id; `/dashboard` → `200` sign-in page, `no-store` + nonce CSP. The full **authed** handshake (DCR→consent→PKCE→`tools/list` of 14 tools, and the `usk_` path) is proven in the workers-pool suite against identical code; live it needs a human to complete the emailed OTP, so only the unauthenticated discovery handshake was exercised live. Additive only — per-command path, `/v1` API, and soak-owned device/lease behavior unchanged | `2026-07-31` | Engineering |
 
 ## Unplanned Phase 1b deployment (2026-07-28)
 
@@ -1081,11 +1081,37 @@ It was halted, not failed. It had already passed the 40-minute mark where run 1 
 
 **Phase 3b restarts from zero once the network-blip work concludes.** A soak that passes while that defect is live proves little, and one that fails on a random network transition costs another day.
 
-## The authed MCP surface will also reset the soak clock (2026-07-31)
+## The authed MCP surface was deployed, resetting the soak baseline (2026-07-31)
 
-The self-serve MCP work (branch `mcp-4-dashboard-pairing`) is built and green but **not deployed**. Per the explicit instruction, it was not gated on the soak. It is additive — new routes, DOs (`AccountDirectory`, `UnderstudyMcp`, `AccountAgent`), bindings (`MCP_AGENT`, `ACCOUNT`, `ACCOUNT_DIRECTORY`, `OAUTH_KV`, `EMAIL`), and secret `VAULT_UPLOAD_PRIVATE_KEY` — and touches neither the per-command path nor the soak-owned device/lease code (`apps/extension/src/core/ws-client.ts` and `apps/backend/src/tenant-coordinator.ts` are byte-identical on the branch; `profile-client.ts` gains only a read-only accessor). It is therefore incapable of changing device or session behavior.
+The self-serve MCP work (branch `mcp-4-dashboard-pairing`, HEAD `00a6cf1`) is
+**deployed** — version `f334a2c8-c158-458f-a230-26bab95e79ea`. Per the explicit
+instruction it was not gated on the soak. It is additive — new routes, DOs
+(`AccountDirectory`, `UnderstudyMcp`, `AccountAgent`), bindings (`MCP_AGENT`,
+`ACCOUNT`, `ACCOUNT_DIRECTORY`, `OAUTH_KV`, `EMAIL`), and secret
+`VAULT_UPLOAD_PRIVATE_KEY` — and touches neither the per-command path nor the
+soak-owned device/lease code (`apps/extension/src/core/ws-client.ts` and
+`apps/backend/src/tenant-coordinator.ts` are byte-identical on the branch;
+`profile-client.ts` gained only a read-only accessor). It is therefore
+incapable of changing device or session behavior; the redeploy itself, not any
+logic in it, is what resets the soak.
 
-It still forces a Worker redeploy carrying migrations `v3`+`v4`, so **deploying it restarts Phase 3b from zero for the same reason the network-blip work does** — a running soak cannot survive a deploy. Sequence it with the network-blip conclusion so the two share one clock reset rather than costing two. Before that deploy: `wrangler secret put VAULT_UPLOAD_PRIVATE_KEY` (a fresh P-256 PKCS#8 key, not the dev placeholder), then verify `/health`, the two well-known metadata documents, and one real MCP handshake, and record the version + reset here.
+**Consequence for Phase 3b: the soak baseline is now this version.** The soak
+was already halted (run 2, for the network-blip diagnosis), so no running soak
+was interrupted — but when Phase 3b restarts it must run against
+`f334a2c8-…`, not the pre-MCP version. The migrations `v3`+`v4` are now applied
+to production; the flags-off `v2` rollback target no longer matches the live
+schema, so a rollback below `v3` is no longer clean (DO SQLite migrations are
+one-way). This deploy and the network-blip deploy no longer need to *share* a
+reset — this one already happened; sequence the network-blip fix on top of
+`f334a2c8-…`.
+
+Deploy steps performed: `wrangler secret put VAULT_UPLOAD_PRIVATE_KEY` (fresh
+P-256 PKCS#8, sha256 prefix `150c0c6a…`, not the dev placeholder) → `wrangler
+deploy` → live smoke on `understudy.proofof.tech`: `/health` `{"ok":true}`, both
+well-known metadata docs correct, `POST /mcp` initialize (no bearer) → `401`
+with the `resource_metadata` pointer, DCR `201`, `/dashboard` `200`. The branch
+is **not yet pushed or merged** — the deployed SHA `00a6cf1` is local; push/merge
+to make it canonical.
 
 ## Phase 4: Switch Metamind to unattended and prove governance
 
