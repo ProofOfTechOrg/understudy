@@ -1,7 +1,7 @@
 /**
- * Server-rendered dashboard pages (D7): five pages of forms via hono/html
- * (auto-escaping), one style block, plain POST/redirect, and exactly three
- * client-side behaviors under a per-response CSP nonce — copy buttons, the
+ * Server-rendered account pages (D7): forms via hono/html (auto-escaping), one
+ * style block, plain POST/redirect, and three client-side behaviors under a
+ * per-response CSP nonce — copy buttons, the
  * pairing-code countdown, and the vault-upload sealer (whose derivation must
  * stay in lockstep with vault-upload.ts).
  */
@@ -38,6 +38,9 @@ pre { background: color-mix(in srgb, CanvasText 6%, Canvas); padding: 10px; bord
 .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); }
 .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 form.inline-form { display: inline; }
+footer { max-width: 780px; margin: -44px auto 0; padding: 0 16px 24px; color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: 13px; }
+footer a { color: inherit; }
+.policy-list li { margin: 8px 0; }
 `;
 
 /** Copy buttons + countdown; loaded on every page, wired by data attributes. */
@@ -123,9 +126,61 @@ export function layout(
 </head>
 <body>
 <main>${body}</main>
+<footer><a href="/privacy">Privacy</a> · <a href="https://github.com/ProofOfTechOrg/understudy/issues">Support</a></footer>
 <script nonce="${nonce}">${raw(BASE_JS + extraJs)}</script>
 </body>
 </html>`;
+}
+
+export function privacyPage(): Fragment {
+  return html`<h1>Understudy privacy policy</h1>
+<p class="muted">Effective July 31, 2026. This policy covers the Understudy Beta Chrome extension and the hosted Understudy service.</p>
+
+<div class="card">
+  <h2>Single purpose</h2>
+  <p>Understudy pairs Chrome with the hosted service so an AI client you authorize can operate tabs on sites and origins you allow. Understudy uses browser data only to provide, secure, maintain, and measure that browser-control service.</p>
+</div>
+
+<div class="card">
+  <h2>Data Understudy handles</h2>
+  <p>The extension and service may handle the following data when an authorized client requests browser work:</p>
+  <ul class="policy-list">
+    <li>Page URLs and titles, website content, accessibility trees, screenshots, and dialog text</li>
+    <li>Requested form, input, click, keyboard, scrolling, and navigation actions</li>
+    <li>Browser and extension metadata, allowed origins, device and session identifiers, hosting status, errors, and command results</li>
+    <li>Account email, session and device credentials, API credentials, pairing codes, and encrypted vault values used to authenticate or complete requested actions</li>
+  </ul>
+  <p>Command payloads and results may remain in per-session service state for execution, retry, acknowledgement, and recovery. They are not necessarily transient.</p>
+</div>
+
+<div class="card">
+  <h2>Local extension storage</h2>
+  <p>The extension stores device credentials and profile configuration in extension storage restricted to trusted extension contexts. Browser-session storage may contain lease assignments, tab identifiers, recovery state, write-journal status, and pending dialog records.</p>
+  <p>The extension does not persist command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, or general navigation history in local extension storage. A pending dialog record includes the page URL where the dialog appeared until the service acknowledges that record.</p>
+</div>
+
+<div class="card">
+  <h2>Use and disclosure</h2>
+  <p>Understudy transmits validated control data between your authorized AI client, the hosted service, and your paired browser. The service uses infrastructure providers, including Cloudflare, to operate this functionality. Data may also be disclosed when required by law or necessary to investigate security abuse.</p>
+  <p>Understudy does not sell user data, use it for advertising, or transfer it for personalized, retargeted, or interest-based advertising. Understudy does not load or execute remotely hosted code in the extension. HTTP and WebSocket messages carry data and commands validated by the bundled extension code.</p>
+  <p>Understudy’s use of information received from Chrome APIs complies with the Chrome Web Store User Data Policy, including its Limited Use requirements.</p>
+</div>
+
+<div class="card">
+  <h2>Security and control</h2>
+  <p>The Chrome Web Store build connects to the hosted service over HTTPS and secure WebSockets (WSS). Device credentials are sent only over secure transport. You can stop hosting in the extension, revoke a paired browser in the dashboard, revoke API credentials, or close browser sessions.</p>
+  <p>Understudy limits human access to user data to consented support, security investigation, legal compliance, or aggregated and anonymized internal operations.</p>
+</div>
+
+<div class="card">
+  <h2>Retention during beta</h2>
+  <p>During beta, Understudy retains account, device, security, and per-session records for as long as needed to operate, retry, recover, secure, and evaluate the service. The production retention schedule is not yet fixed. Closing sessions, revoking browsers or credentials, and stopping hosting limit future processing but may not immediately remove records needed for security, recovery, or legal obligations.</p>
+</div>
+
+<div class="card">
+  <h2>Support and privacy requests</h2>
+  <p>Use the <a href="https://github.com/ProofOfTechOrg/understudy/issues">public support tracker</a> for product bugs. Do not post credentials, pairing codes, page content, screenshots, personal data, or other sensitive information in a public GitHub issue.</p>
+</div>`;
 }
 
 export function loginPage(next: string): Fragment {
@@ -395,4 +450,3 @@ export function consentPage(options: {
   </form>
 </div>`;
 }
-

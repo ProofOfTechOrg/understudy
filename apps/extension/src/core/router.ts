@@ -7,6 +7,7 @@ import {
 } from "@understudy/protocol";
 import type { CdpSession } from "../driver/cdp";
 import { actionError, errorMessage } from "../events";
+import { controlledTabInfo } from "../tabs";
 
 async function withSession(
   session: CdpSession | null,
@@ -28,18 +29,10 @@ async function withSession(
 
 async function routeGetTabs(commandId: string, session: CdpSession | null): Promise<Event> {
   if (session === null) return actionError(commandId, "no active CDP session");
-  const tab = await browser.tabs.get(session.tabId);
   return {
     type: "tabs_result",
     commandId,
-    tabs: [
-      {
-        tabId: session.tabId,
-        url: tab.url ?? session.currentUrl,
-        title: tab.title ?? "",
-        active: tab.active,
-      },
-    ],
+    tabs: [await controlledTabInfo(session.tabId, session.currentUrl)],
   };
 }
 

@@ -1,0 +1,19 @@
+<svg viewBox="0 0 440 280" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>Understudy Beta small promotional tile</title>
+  <desc>A dark industrial tile with the Understudy mark and hosted browser-control message.</desc>
+  <rect width="440" height="280" fill="#0d0f0d" />
+  <g opacity=".16" stroke="#c9f64c">
+    <path d="M0 40H440M0 80H440M0 120H440M0 160H440M0 200H440M0 240H440" />
+    <path d="M40 0V280M80 0V280M120 0V280M160 0V280M200 0V280M240 0V280M280 0V280M320 0V280M360 0V280M400 0V280" />
+  </g>
+  <rect x="24" y="24" width="108" height="108" fill="#0d0f0d" stroke="#c9f64c" stroke-width="4" />
+  <path d="M42 44H61V88C61 100 66 106 78 106C90 106 95 100 95 88V44H114V90C114 112 101 123 78 123C55 123 42 112 42 90Z" fill="#c9f64c" />
+  <path d="M70 44H86V85C86 94 83 98 78 98C73 98 70 94 70 85Z" fill="#0d0f0d" />
+  <rect x="153" y="25" width="56" height="20" fill="#c9f64c" />
+  <text x="181" y="39" fill="#172000" font-family="monospace" font-size="11" font-weight="700" text-anchor="middle">BETA</text>
+  <text x="153" y="84" fill="#f2f0e8" font-family="monospace" font-size="31" font-weight="700">UNDERSTUDY</text>
+  <text x="24" y="181" fill="#c9f64c" font-family="monospace" font-size="17" font-weight="700" letter-spacing="1">PAIR. AUTHORIZE. STOP.</text>
+  <text x="24" y="215" fill="#f2f0e8" font-family="monospace" font-size="13">Hosted browser control</text>
+  <text x="24" y="235" fill="#9b9f95" font-family="monospace" font-size="13">for sites you allow.</text>
+  <path d="M24 256H416" stroke="#f2f0e8" stroke-width="3" />
+</svg>

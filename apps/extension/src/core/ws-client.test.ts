@@ -71,17 +71,23 @@ describe("ReconnectingWs", () => {
     },
   );
 
-  it("reconnects an ordinary close with backoff", () => {
+  it("schedules at most one successor socket at every backoff step", () => {
     new ReconnectingWs(() => "ws://example.test/session", {
       onCommand: vi.fn(),
       onOpen: vi.fn(),
     });
 
-    FakeWebSocket.instances[0]?.emit("close", { code: 1006 });
-    vi.advanceTimersByTime(499);
-    expect(FakeWebSocket.instances).toHaveLength(1);
+    const delays = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+    for (const [index, delay] of delays.entries()) {
+      const socket = FakeWebSocket.instances[index];
+      socket?.emit("close", { code: 1006 });
+      socket?.emit("close", { code: 1006 });
 
-    vi.advanceTimersByTime(1);
-    expect(FakeWebSocket.instances).toHaveLength(2);
+      vi.advanceTimersByTime(delay - 1);
+      expect(FakeWebSocket.instances).toHaveLength(index + 1);
+
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.instances).toHaveLength(index + 2);
+    }
   });
 });

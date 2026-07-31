@@ -610,9 +610,13 @@ app.onError((_error, c) => {
   return c.json({ error: "internal error" }, 500);
 });
 
-/** The dashboard/account plane — served directly, NOT through the provider. */
-function isDashboardPath(pathname: string): boolean {
-  return pathname === "/dashboard" || pathname.startsWith("/dashboard/");
+/** Public account pages and dashboard routes served directly, not through the provider. */
+function isAccountPagePath(pathname: string): boolean {
+  return (
+    pathname === "/privacy" ||
+    pathname === "/dashboard" ||
+    pathname.startsWith("/dashboard/")
+  );
 }
 
 /**
@@ -638,7 +642,7 @@ function isOAuthProviderPath(pathname: string): boolean {
  * fetch as the default export (D1).
  */
 function isNewSurfacePath(pathname: string): boolean {
-  return isDashboardPath(pathname) || isOAuthProviderPath(pathname);
+  return isAccountPagePath(pathname) || isOAuthProviderPath(pathname);
 }
 
 /** Scrubbed 500 for the new surface — the /v1 app has its own app.onError. */
@@ -685,7 +689,7 @@ export default {
       // malformed VAULT_UPLOAD_PRIVATE_KEY), so one fault would return an
       // unscrubbed 500 for the whole account plane.
       try {
-        if (isDashboardPath(url.pathname)) {
+        if (isAccountPagePath(url.pathname)) {
           return await dashboardApp.fetch(request, env, ctx);
         }
         if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {

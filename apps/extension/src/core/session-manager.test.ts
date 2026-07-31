@@ -186,7 +186,6 @@ describe("SessionManager cleanup ownership", () => {
         async () => {
           throw new Error("tab not found");
         },
-        [{ tabId: ASSIGNMENT.tabId, attached: true }],
       );
       const manager = new SessionManager(
         () => "https://service.example",
@@ -195,7 +194,6 @@ describe("SessionManager cleanup ownership", () => {
 
       await manager.restoreSameEpoch(intent);
 
-      expect(fixture.getTargets).not.toHaveBeenCalled();
       expect(fixture.sendCommand).not.toHaveBeenCalled();
       expect(fixture.remove).toHaveBeenCalledWith(ASSIGNMENT.tabId);
       expect(manager.assignments()).toEqual([]);
@@ -227,7 +225,6 @@ describe("SessionManager cleanup ownership", () => {
       sessionState,
       async () => {},
       async () => ({ id: ASSIGNMENT.tabId }),
-      [{ tabId: ASSIGNMENT.tabId, attached: true }],
     );
     const manager = new SessionManager(
       () => "https://service.example",
@@ -244,6 +241,44 @@ describe("SessionManager cleanup ownership", () => {
     expect(fixture.remove).not.toHaveBeenCalled();
     expect(manager.assignments()).toHaveLength(1);
     expect(manager.assignments()[0]?.cleanupIntent).toBeUndefined();
+  });
+
+  it("cleans up an assignment when its scoped debugger session is gone", async () => {
+    const sessionState: Record<string, unknown> = {
+      "understudy:assignments": {
+        version: 3,
+        assignments: [ASSIGNMENT],
+        closedOutbox: [],
+        vacatedLeases: [],
+      },
+    };
+    const fixture = installBrowser(
+      sessionState,
+      async () => {},
+      async () => {
+        throw new Error("tab not found");
+      },
+      async () => {
+        throw new Error("debugger is not attached");
+      },
+    );
+    const manager = new SessionManager(
+      () => "https://service.example",
+      () => EPOCH,
+    );
+
+    await manager.restoreSameEpoch("recover");
+
+    expect(fixture.remove).toHaveBeenCalledWith(ASSIGNMENT.tabId);
+    expect(manager.assignments()).toEqual([]);
+    expect(manager.vacatedLeases()).toEqual([
+      {
+        sessionId: ASSIGNMENT.sessionId,
+        leaseId: ASSIGNMENT.leaseId,
+        leaseEpoch: ASSIGNMENT.leaseEpoch,
+        browserEpoch: ASSIGNMENT.browserEpoch,
+      },
+    ]);
   });
 
   it("fences every runtime and stops every session socket before a failed Stop All write", async () => {
@@ -268,10 +303,6 @@ describe("SessionManager cleanup ownership", () => {
       sessionState,
       async () => {},
       async (tabId) => ({ id: tabId }),
-      [
-        { tabId: ASSIGNMENT.tabId, attached: true },
-        { tabId: second.tabId, attached: true },
-      ],
     );
     const manager = new SessionManager(
       () => "https://service.example",
@@ -314,32 +345,31 @@ function installBrowser(
   sessionState: Record<string, unknown>,
   remove: (tabId: number) => Promise<void>,
   get: (tabId: number) => Promise<unknown>,
-  targets: Array<{ tabId: number; attached: boolean }> = [],
+  command: (
+    target: unknown,
+    method: string,
+  ) => Promise<unknown> = async (_target, method) =>
+    method === "Page.getFrameTree"
+      ? {
+          frameTree: {
+            frame: {
+              id: "main-frame",
+              loaderId: "loader-1",
+              url: "about:blank",
+            },
+          },
+        }
+      : {},
 ): {
   remove: ReturnType<typeof vi.fn>;
   sessionSet: ReturnType<typeof vi.fn>;
-  getTargets: ReturnType<typeof vi.fn>;
   sendCommand: ReturnType<typeof vi.fn>;
 } {
   const removeMock = vi.fn(remove);
   const sessionSet = vi.fn(async (values: Record<string, unknown>) => {
     Object.assign(sessionState, values);
   });
-  const getTargets = vi.fn(async () => targets);
-  const sendCommand = vi.fn(
-    async (_target: unknown, method: string) =>
-      method === "Page.getFrameTree"
-        ? {
-            frameTree: {
-              frame: {
-                id: "main-frame",
-                loaderId: "loader-1",
-                url: "about:blank",
-              },
-            },
-          }
-        : {},
-  );
+  const sendCommand = vi.fn(command);
   vi.stubGlobal("browser", {
     storage: {
       session: {
@@ -350,7 +380,6 @@ function installBrowser(
       },
     },
     debugger: {
-      getTargets,
       sendCommand,
     },
     tabs: {
@@ -361,7 +390,6 @@ function installBrowser(
   return {
     remove: removeMock,
     sessionSet,
-    getTargets,
     sendCommand,
   };
 }

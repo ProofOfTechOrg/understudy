@@ -30,11 +30,13 @@ pnpm --filter @understudy/protocol build
 pnpm --filter @understudy/extension typecheck
 pnpm --filter @understudy/extension test
 pnpm --filter @understudy/extension build
+pnpm --filter @understudy/extension build:store
+pnpm --filter @understudy/extension zip:store
 ```
 
-Load `apps/extension/.output/chrome-mv3/` through `chrome://extensions`. Use the production build for real-browser tests. WXT development mode creates a disposable profile and does not prove behavior against the operator’s login state.
+Load `apps/extension/.output/chrome-mv3/` for internal testing or `apps/extension/.output/chrome-mv3-store/` for Web Store acceptance through `chrome://extensions`. WXT development mode creates a disposable profile and does not prove behavior against the operator’s login state.
 
-The manifest requires Chrome 125 or newer and requests debugger, tabs, active tab, storage, alarms, side panel, and host permissions.
+The manifest requires Chrome 125 or newer and requests debugger, storage, alarms, side panel, and host permissions. The store build limits host access to `https://understudy.proofof.tech/*`; the internal build retains broad host access for operator-supplied service origins.
 
 ## Enroll a dedicated profile
 
@@ -64,7 +66,7 @@ The local origin policy is the maximum this profile will host. Each session requ
 
 The extension restricts local-storage access to trusted extension contexts.
 
-`chrome.storage.session` contains browser epoch, versioned lease assignments, cleanup intent, queued closure fences, tab IDs, ref generations, write journal entries, and dialog outbox records. A closure fence remains queued until the backend returns an exact `closed_ack`. The extension resends queued closures after reconnects. It never contains command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, or prior URLs.
+`chrome.storage.session` contains browser epoch, versioned lease assignments, cleanup intent, queued closure fences, tab IDs, ref generations, write journal entries, and dialog outbox records. A closure fence remains queued until the backend returns an exact `closed_ack`. The extension resends queued closures after reconnects. It never contains command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, or general navigation history. A pending dialog record includes the page URL where the dialog appeared until `dialog_ack`.
 
 Browser restart clears execution authority. The extension creates fresh blank tabs for live recovering leases and never restores old URLs.
 

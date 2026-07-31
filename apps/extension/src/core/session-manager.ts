@@ -1,5 +1,6 @@
 import type { TabInfo } from "@understudy/protocol";
 import type { Browser } from "wxt/browser";
+import { controlledTabInfo } from "../tabs";
 import {
   SessionRuntime,
   type CleanupIntent,
@@ -247,15 +248,8 @@ export class SessionManager implements RuntimeHost {
       return;
     }
 
-    const targets = await browser.debugger.getTargets();
     for (const runtime of restored) {
-      const raw = runtime.assignment;
       if (runtime.assignment.cleanupIntent !== undefined) {
-        continue;
-      }
-      const target = targets.find((candidate) => candidate.tabId === raw.tabId);
-      if (target?.attached !== true) {
-        runtime.beginCleanup(unreconciledIntent);
         continue;
       }
       try {
@@ -503,13 +497,7 @@ export class SessionManager implements RuntimeHost {
   }
 
   private async tabInfo(tabId: number): Promise<TabInfo> {
-    const tab = await browser.tabs.get(tabId);
-    return {
-      tabId,
-      url: tab.url ?? "about:blank",
-      title: tab.title ?? "",
-      active: tab.active,
-    };
+    return controlledTabInfo(tabId);
   }
 }
 

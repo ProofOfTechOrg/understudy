@@ -14,6 +14,7 @@ import { WriteJournal } from "./write-journal";
 import { DialogOutbox, handleDialogWithOutbox } from "./dialog-outbox";
 import { CdpSession } from "../driver/cdp";
 import { classifyCdpEvent } from "../driver/cdp-events";
+import { controlledTabInfo } from "../tabs";
 
 export interface RuntimeAssignment {
   sessionId: string;
@@ -450,13 +451,10 @@ export class SessionRuntime {
   }
 
   private async tabInfo(): Promise<TabInfo> {
-    const tab = await browser.tabs.get(this.tabId);
-    return {
-      tabId: this.tabId,
-      url: tab.url ?? "about:blank",
-      title: tab.title ?? "",
-      active: tab.active,
-    };
+    return controlledTabInfo(
+      this.tabId,
+      this.cdp?.currentUrl ?? "about:blank",
+    );
   }
 
   private canAccept(): boolean {

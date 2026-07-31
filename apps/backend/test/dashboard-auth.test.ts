@@ -289,6 +289,27 @@ describe("dashboard sign-in", () => {
   });
 });
 
+describe("public privacy page", () => {
+  it("serves the policy through the canonical no-store account plane", async () => {
+    const res = await fetchApp(pageGet("/privacy"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(res.headers.get("Content-Security-Policy")).toContain(
+      "script-src 'nonce-",
+    );
+    expect(res.headers.get("Referrer-Policy")).toBe("same-origin");
+
+    const body = await res.text();
+    expect(body).toContain("Understudy privacy policy");
+    expect(body).toContain("Command payloads and results may remain");
+    expect(body).toContain("does not load or execute remotely hosted code");
+    expect(body).toContain('href="/privacy"');
+    expect(body).toContain(
+      "https://github.com/ProofOfTechOrg/understudy/issues",
+    );
+  });
+});
+
 describe("dashboard CSRF + account cards", () => {
   it("refuses a cross-site authed write before session or csrf is consulted", async () => {
     // #given a valid cookie AND a valid csrf token — so only the middleware

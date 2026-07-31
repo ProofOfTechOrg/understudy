@@ -1,0 +1,8 @@
+<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>Understudy Beta</title>
+  <desc>An acid-green letter U on a dark, high-contrast field.</desc>
+  <rect width="128" height="128" fill="#0d0f0d" />
+  <path d="M8 8H120V120H8Z" fill="none" stroke="#c9f64c" stroke-width="4" />
+  <path d="M25 22H48V75C48 88 53 95 64 95C75 95 80 88 80 75V22H103V77C103 103 88 116 64 116C40 116 25 103 25 77Z" fill="#c9f64c" />
+  <path d="M55 22H73V72C73 82 70 87 64 87C58 87 55 82 55 72Z" fill="#0d0f0d" />
+</svg>

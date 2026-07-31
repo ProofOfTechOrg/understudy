@@ -1,4 +1,4 @@
-export type WsStatus = "connecting" | "open" | "closed";
+export type WsStatus = "idle" | "connecting" | "open" | "closed";
 
 export type LogLevel = "info" | "warn" | "error";
 
@@ -58,7 +58,7 @@ export type PanelMsg =
   | StopAllMsg
   | PairMsg;
 
-export type PairingPhase = "pairing" | "paired" | "error";
+export type PairingPhase = "pairing" | "success" | "error";
 
 /**
  * Why the client is suppressing reconnects: a persisted ControlBlock reason
@@ -80,7 +80,7 @@ export interface PairingState {
 export interface StateMsg {
   type: "state";
   wsStatus: WsStatus;
-  wsUrl: string;
+  wsUrl: string | null;
   attached: AttachedTab | null;
   profileStatus: "disabled" | "connecting" | "connected" | "error";
   controlledTabs: number;

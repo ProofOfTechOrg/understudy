@@ -1,5 +1,11 @@
 # @understudy/extension
 
+## 0.1.2
+
+### Patch Changes
+
+- Prepare the unlisted hosted-service beta build, panel, permissions, and store assets.
+
 ## 0.1.1
 
 ### Patch Changes

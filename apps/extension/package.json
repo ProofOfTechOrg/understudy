@@ -1,11 +1,13 @@
 {
   "name": "@understudy/extension",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wxt",
     "build": "wxt build",
+    "build:store": "wxt build --mode store",
+    "zip:store": "wxt zip --mode store",
     "typecheck": "wxt prepare && tsc --noEmit",
     "test": "vitest run",
     "stub": "node scripts/stub-server.mjs",

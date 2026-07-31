@@ -1,11 +1,29 @@
 import type { TabInfo } from "@understudy/protocol";
 
-export async function queryTabInfos(): Promise<TabInfo[]> {
-  const openTabs = await browser.tabs.query({});
-  return openTabs.map((t) => ({
-    tabId: t.id ?? -1,
-    url: t.url ?? "",
-    title: t.title ?? "",
-    active: t.active,
-  }));
+interface TargetInfoResult {
+  targetInfo?: {
+    url?: unknown;
+    title?: unknown;
+  };
+}
+
+export async function controlledTabInfo(
+  tabId: number,
+  fallbackUrl = "about:blank",
+): Promise<TabInfo> {
+  const [target, tab] = await Promise.all([
+    browser.debugger.sendCommand(
+      { tabId },
+      "Target.getTargetInfo",
+    ) as Promise<TargetInfoResult>,
+    browser.tabs.get(tabId),
+  ]);
+  const url = target.targetInfo?.url;
+  const title = target.targetInfo?.title;
+  return {
+    tabId,
+    url: typeof url === "string" ? url : fallbackUrl,
+    title: typeof title === "string" ? title : "",
+    active: tab.active,
+  };
 }

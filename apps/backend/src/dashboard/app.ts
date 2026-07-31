@@ -42,6 +42,7 @@ import {
   loginPage,
   messagePage,
   pairingCodePage,
+  privacyPage,
   tokenRevealPage,
   verifyPage,
   VAULT_UPLOAD_JS,
@@ -140,6 +141,10 @@ async function authedPost(
   }
   return user;
 }
+
+dashboardApp.get("/privacy", (c) => {
+  return render(c, "Privacy — Understudy", privacyPage());
+});
 
 dashboardApp.get("/dashboard", async (c) => {
   const user = await sessionFromRequest(c.req.raw, c.env);

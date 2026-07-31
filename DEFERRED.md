@@ -99,9 +99,10 @@ async function onDetach(source: { tabId?: number }, reason: string): Promise<voi
 
 `chrome.debugger.onDetach` fires when the controlled tab is closed, or when the
 user clicks **Cancel** on Chrome's debugger banner. Both leave the session
-reporting `connected`. This is the mechanical reason
-`apps/extension/RUNBOOK.md` instructs operators not to touch that banner — the
-instruction exists, but the reason is not written down anywhere.
+reporting `connected`. The internal side panel and
+`apps/extension/RUNBOOK.md` now explain that the banner is process-wide and
+dismissing it can detach the controlled tab, but that operator warning does not
+correct the backend’s stale status.
 
 For completeness, `detached` today is set only on socket-level events, in
 `apps/backend/src/session.ts` at lines `529`, `1132`, `1164`, `1198` and `1231`:
@@ -297,21 +298,6 @@ Any soak or monitor built on the public API therefore cannot enforce "no capacit
 
 ---
 
-## Chrome's debugger banner appears across profiles
-
-**Baseline:** branch `dev`, commit `76eaf68`. **Chrome behaviour, not a defect in this repo.**
-**Severity:** an operator can detach the canary's debugger by accident, from a window they have no reason to associate with it.
-
-Attaching `chrome.debugger` shows the "controlled by automated test software" banner on windows belonging to **other Chrome profiles**, not only the controlled one. Confirmed by the canary operator as long-standing behaviour on this machine.
-
-`apps/extension/RUNBOOK.md` instructs operators not to click that banner's detach control, but the instruction reads as being about the controlled window. Someone seeing the banner over an unrelated profile may reasonably dismiss it there — detaching the canary and, per the reconnect entries above, potentially destroying its leases.
-
-It also means the banner is **not** a per-tab indicator of whether a given tab is under CDP control, so it cannot be used as a diagnostic. That mistake was made once already during this rollout.
-
-**Proposed fix:** documentation only. State in the extension runbook that the banner is process-wide, that dismissing it anywhere detaches the canary, and that it must not be read as evidence about a particular tab.
-
----
-
 ## The account plane has no HSTS, so a first plaintext request still crosses the wire
 
 **Baseline:** branch `dev`, commit `1522cdc` (deployed version `dc9c378e-6e6b-416b-b7ef-038411bc4ae5`).
@@ -345,32 +331,6 @@ Mitigated for now in copy only (`apps/backend/src/dashboard/pages.ts`, the Allow
 **Why deferred:** it is a protocol change with a version-skew story (an older extension must keep working against a newer backend), not a UI change, and it was found while shipping an unrelated one-card reorder. Do not fold it into that commit.
 
 **Note on the gate:** do NOT "simplify" by allowing pairing with an empty origin list before doing the above. Four layers refuse it, and the last one is the trap. (1) The dashboard's disabled button is advisory only. (2) `createPairingCode` (`apps/backend/src/account-directory.ts`) returns `no_origins`, which the route turns into a 303 to `/dashboard?notice=no-origins`. (3) `claimPairingCode` repeats the check for origins emptied between minting and redemption, collapsed to a 404 because every pairing failure mode is deliberately indistinguishable. (4) **`normalizeProfileConfig` (`apps/extension/src/core/profile-client.ts`) is ON the pairing path, not merely a manual-config backstop**: `pairDevice` (`apps/extension/src/entrypoints/background.ts`) feeds the claim response straight into `profileClient.configure()`, whose first statement normalizes and which rejects `originPolicy.length < 1`. `redeemPairingCode` does not check length, so nothing catches it earlier. The wire invariant for the rework is therefore: the claim response must carry at least one canonical origin, or the extension's validator must be relaxed and rolled out FIRST — otherwise every pairing fails with a generic "Pairing failed" after the server has already consumed the single-use code and emitted paired telemetry.
-
----
-
-## A paired extension dials a hardcoded localhost dev socket forever
-
-**Baseline:** branch `dev`, commit `1522cdc`.
-**Found:** 2026-07-31, on a freshly installed extension paired through the dashboard.
-**Severity:** continuous console errors on every user's browser, and a permanent reconnect loop doing no work.
-
-`DEFAULT_WS_URL = "ws://localhost:8787"` is hardcoded in both `apps/extension/src/entrypoints/background.ts` and `apps/extension/src/entrypoints/sidepanel/App.tsx`. It is the **attended** (legacy) session socket's default, pointing at a local `wrangler dev`. A real user never has one. The backstop alarm calls `ensureConnection()` → `connectWs()` → `ReconnectingWs`, which dials it and retries indefinitely.
-
-Measured on a paired, working browser driving real sessions — not merely at install:
-
-```
-[error] network :: WebSocket connection to 'ws://localhost:8787/' failed:
-        Error in connection establishment: net::ERR_CONNECTION_REFUSED
-        (chrome-extension://<id>/background.js)
-```
-
-Two consecutive 25-second samples of the service-worker console counted **24** then **48** occurrences. `ReconnectingWs` backs off 500 ms doubling to a 30 s cap (`BACKOFF_BASE_MS`/`BACKOFF_CAP_MS` in `apps/extension/src/core/ws-client.ts`), so one instance should settle to ~2/minute. Observing ~1–2/second, and *rising* between samples, means reconnect loops are accumulating rather than backing off — the count should have fallen, not doubled. The accumulation mechanism was not isolated; `ensureConnection` does guard on `ws !== null`, so whoever fixes this should diagnose where additional `ReconnectingWs` instances come from rather than assume the guard is sufficient.
-
-Note this is unattended-path collateral: the browser was paired via the dashboard and never configured for attended mode, yet the attended peer dials regardless.
-
-**Proposed fix:** do not connect at all without a configured attended session. The `DEFAULT_WS_URL` constant should go; `currentWsUrl` should be `null` until the panel supplies one, and `ensureConnection` should return early on a null URL. Then fix the instance accumulation separately, since a single leaked loop against a *reachable* backend would be invisible in the console while still burning a socket.
-
-**Do not fix by catching the error.** The message is emitted by Chrome's network stack, not by application code — there is no promise to catch and no handler that suppresses it. Only not dialing removes it.
 
 ---
 

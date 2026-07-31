@@ -88,16 +88,26 @@ function installBrowser(
     active: false,
   }));
   const createWindow = vi.fn();
+  const attachedTabs = new Set<number>();
   vi.stubGlobal("browser", {
     storage: { local: localArea, session: sessionArea },
     runtime: { getManifest: () => ({ version: "0.1.0" }) },
     debugger: {
-      getTargets: vi.fn(async () => []),
-      attach: vi.fn(async () => {}),
-      detach: vi.fn(async () => {}),
+      attach: vi.fn(async (target: { tabId: number }) => {
+        attachedTabs.add(target.tabId);
+      }),
+      detach: vi.fn(async (target: { tabId: number }) => {
+        attachedTabs.delete(target.tabId);
+      }),
       sendCommand: vi.fn(
-        async (_target: unknown, method: string) =>
-          method === "Page.getFrameTree"
+        async (target: { tabId: number }, method: string) => {
+          if (
+            method === "Page.getFrameTree" &&
+            !attachedTabs.has(target.tabId)
+          ) {
+            throw new Error("debugger is not attached");
+          }
+          return method === "Page.getFrameTree"
             ? {
                 frameTree: {
                   frame: {
@@ -107,7 +117,8 @@ function installBrowser(
                   },
                 },
               }
-            : {},
+            : {};
+        },
       ),
     },
     tabs: { remove: removeTab, get: getTab },
@@ -539,7 +550,7 @@ describe("ProfileClient generation fencing", () => {
     ).toHaveLength(0);
   });
 
-  it("fences a live runtime before disabled profile persistence can fail", async () => {
+  it("clears a profile durably when disabled profile persistence keeps failing", async () => {
     const fixture = installBrowser({
       session: { "understudy:browserEpoch": EPOCH },
     });
@@ -570,7 +581,7 @@ describe("ProfileClient generation fencing", () => {
       socket.url.includes("/agents/session/"),
     );
     if (sessionSocket === undefined) throw new Error("session socket missing");
-    fixture.localArea.set.mockRejectedValueOnce(new Error("profile write failed"));
+    fixture.localArea.set.mockRejectedValue(new Error("profile write failed"));
 
     const stopping = client.stopAll();
 
@@ -578,10 +589,17 @@ describe("ProfileClient generation fencing", () => {
     expect(client.sessions.assignments()).toEqual([
       expect.objectContaining({ cleanupIntent: "release" }),
     ]);
-    await expect(stopping).rejects.toThrow("profile write failed");
-    expect(client.sessions.assignments()).toEqual([
-      expect.objectContaining({ cleanupIntent: "release" }),
-    ]);
+    await expect(stopping).resolves.toBeUndefined();
+    expect(client.sessions.assignments()).toEqual([]);
+    expect(fixture.local.serviceOrigin).toBeUndefined();
+    expect(fixture.local.unattendedEnabled).toBeUndefined();
+
+    const socketCount = FakeWebSocket.instances.length;
+    const restarted = new ProfileClient();
+    await restarted.start();
+    expect(restarted.publicConfig()).toBeNull();
+    expect(restarted.currentStatus()).toBe("disabled");
+    expect(FakeWebSocket.instances).toHaveLength(socketCount);
   });
 
   it("fences replacement work before hashing or profile persistence", async () => {
@@ -686,6 +704,57 @@ describe("ProfileClient generation fencing", () => {
 });
 
 describe("ProfileClient startup cleanup", () => {
+  it("retries initialization after a startup failure", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    fixture.localArea.setAccessLevel.mockRejectedValueOnce(
+      new Error("storage unavailable"),
+    );
+    const client = new ProfileClient();
+
+    await expect(client.start()).rejects.toThrow("storage unavailable");
+    await expect(client.start()).resolves.toBeUndefined();
+
+    expect(fixture.localArea.setAccessLevel).toHaveBeenCalledTimes(2);
+    expect(client.currentStatus()).toBe("disabled");
+  });
+
+  it("rejects configuration outside a build-pinned service origin", () => {
+    const fixture = installBrowser();
+    const client = new ProfileClient(
+      undefined,
+      "https://understudy.proofof.tech",
+    );
+
+    expect(() => client.configure(CONFIG)).toThrow(
+      "profile service origin is not allowed in this build",
+    );
+    expect(fixture.localArea.set).not.toHaveBeenCalled();
+  });
+
+  it("discards a persisted profile outside a build-pinned service origin", async () => {
+    const fixture = installBrowser({
+      local: persistedConfig(CONFIG),
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    const fetchMock = vi.fn(async () => ticketResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient(
+      undefined,
+      "https://understudy.proofof.tech",
+    );
+
+    await client.start();
+
+    expect(client.publicConfig()).toBeNull();
+    expect(client.currentStatus()).toBe("disabled");
+    expect(fixture.local.serviceOrigin).toBeUndefined();
+    expect(fixture.local.deviceCredential).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
   it("retains and resends a closure until the backend acknowledges its exact fence", async () => {
     const closure = {
       sessionId: "session-closed",

@@ -14,9 +14,15 @@ import {
   DialogOutbox,
   handleDialogWithOutbox,
 } from "../core/dialog-outbox";
+import { resolveAttendedTransition } from "../core/attended-switch";
 import { sendIfPeerCurrent } from "../core/peer-binding";
 import { routeCommand } from "../core/router";
-import { PairingError, redeemPairingCode } from "../core/pairing-client";
+import { RetryableStartupGate } from "../core/startup-gate";
+import {
+  DEFAULT_SERVICE_ORIGIN,
+  PairingError,
+  redeemPairingCode,
+} from "../core/pairing-client";
 import { ReconnectingWs } from "../core/ws-client";
 import { ProfileClient } from "../core/profile-client";
 import { WriteJournal } from "../core/write-journal";
@@ -32,11 +38,12 @@ import type {
   StateMsg,
   WsStatus,
 } from "../messaging";
+import { controlledTabInfo } from "../tabs";
 
-const DEFAULT_WS_URL = "ws://localhost:8787";
 // Attended URLs can contain a legacy extension token. Keep them in
 // storage.session so they survive SW eviction but clear on browser restart.
 const WS_URL_KEY = "wsUrl";
+const WS_ISOLATION_BLOCK_KEY = "understudy:wsIsolationBlocked";
 // Persisted across SW eviction so a wake can re-discover the driven tab.
 const ATTACHED_TAB_KEY = "understudy:attachedTabId";
 const BACKSTOP_ALARM = "ws-backstop";
@@ -52,8 +59,8 @@ let ws: ReconnectingWs | null = null;
 let acceptingPeer: ReconnectingWs | null = null;
 let wsConnecting = false;
 // Tracked from ReconnectingWs's onConnecting/onOpen/onClose callbacks.
-let wsStatus: WsStatus = "connecting";
-let currentWsUrl = DEFAULT_WS_URL;
+let wsStatus: WsStatus = "idle";
+let currentWsUrl: string | null = null;
 // Storage is read at most once per SW life to hydrate currentWsUrl on cold start;
 // setWsUrl marks it hydrated immediately since it already holds the authoritative
 // value, and bumps the epoch so a slower in-flight cold-start read can never land
@@ -61,33 +68,57 @@ let currentWsUrl = DEFAULT_WS_URL;
 let wsUrlHydrated = false;
 let wsUrlEpoch = 0;
 let wsSwitching = false;
+let wsIsolationFailed = false;
 let wsSwitchRequest = 0;
-let requestedWsUrl: string | null = null;
 let wsSwitchTail: Promise<unknown> = Promise.resolve();
 
 let session: CdpSession | null = null;
 let attachedTitle: string | undefined;
 // Progress of the most recent pairing attempt, surfaced in StateMsg.pairing.
 let pairingState: StateMsg["pairing"];
+let hostingStopRequested = false;
+let hostingStopRequest = 0;
 
-// Write-replay record (idempotent-retry contract); hydrates lazily from
-// storage.session, so rebuilding it each wake loses nothing.
-const dedupe = new WriteDedupe(browser.storage.session);
-const attendedJournal = new WriteJournal(
-  browser.storage.session,
-  "understudy:attendedJournal",
-);
-const attendedDialogs = new DialogOutbox(
-  browser.storage.session,
-  "understudy:attendedDialogs",
-);
+interface AttendedRuntime {
+  dedupe: WriteDedupe;
+  journal: WriteJournal;
+  dialogs: DialogOutbox;
+  commandIngress: CommandIngress;
+}
+
+// The null store branch lets bundling eliminate attended constructors and their
+// authority. Internal call sites must unwrap the runtime explicitly.
+const attendedRuntime: AttendedRuntime | null = __UNDERSTUDY_STORE__
+  ? null
+  : {
+      dedupe: new WriteDedupe(browser.storage.session),
+      journal: new WriteJournal(
+        browser.storage.session,
+        "understudy:attendedJournal",
+      ),
+      dialogs: new DialogOutbox(
+        browser.storage.session,
+        "understudy:attendedDialogs",
+      ),
+      commandIngress: new CommandIngress(),
+    };
 let attendedWritesBlocked = false;
 let attendedTerminal = false;
-const commandIngress = new CommandIngress();
-const profileClient = new ProfileClient(() => broadcastState());
+const profileClient = new ProfileClient(
+  () => broadcastState(),
+  __UNDERSTUDY_STORE__ ? DEFAULT_SERVICE_ORIGIN : undefined,
+);
 
 const logBuffer: LogEntry[] = [];
 const ports = new Set<Browser.runtime.Port>();
+const storeRuntimeGate = new RetryableStartupGate(startStoreRuntime);
+
+function internalRuntime(): AttendedRuntime {
+  if (attendedRuntime === null) {
+    throw new Error("attended runtime is unavailable in the store build");
+  }
+  return attendedRuntime;
+}
 
 export default defineBackground({
   type: "module",
@@ -99,28 +130,62 @@ export default defineBackground({
     browser.debugger.onDetach.addListener(onDetach);
     browser.tabs.onCreated.addListener(onTabCreated);
     browser.runtime.onConnect.addListener(onConnect);
+    browser.sidePanel
+      .setPanelBehavior({ openPanelOnActionClick: true })
+      .catch((cause: unknown) => {
+        log(`side-panel action setup failed: ${errorMessage(cause)}`, "warn");
+      });
     browser.alarms.create(BACKSTOP_ALARM, { periodInMinutes: 0.5 }).catch((cause: unknown) => {
       log(`alarm create failed: ${errorMessage(cause)}`, "warn");
     });
 
     // Kick off the async wake tasks without awaiting (main() must stay non-async).
-    fireAndForget("ensureConnection", ensureConnection);
-    fireAndForget("reconcileAttachment", reconcileAttachment);
-    fireAndForget("profileClient", () => profileClient.start());
+    if (__UNDERSTUDY_STORE__) {
+      fireAndForget("store startup", () => storeRuntimeGate.wait());
+    } else {
+      fireAndForget("ensureConnection", ensureConnection);
+      fireAndForget("reconcileAttachment", reconcileAttachment);
+      fireAndForget("profileClient", () => profileClient.start());
+    }
   },
 });
 
-// ── WebSocket lifecycle ──────────────────────────────────────────────────────
-
-// Synchronous accessor for ReconnectingWs (which reads the URL when it opens a
-// socket); the async storage read hydrates `currentWsUrl` before the WS is built.
-function getUrl(): string {
-  return currentWsUrl;
+async function startStoreRuntime(): Promise<void> {
+  const stored = await browser.storage.session.get(ATTACHED_TAB_KEY);
+  const tabId = stored[ATTACHED_TAB_KEY];
+  if (typeof tabId === "number") {
+    await browser.debugger.detach({ tabId }).catch(() => {});
+  }
+  await Promise.all([
+    browser.storage.session.remove([
+      WS_URL_KEY,
+      WS_ISOLATION_BLOCK_KEY,
+      ATTACHED_TAB_KEY,
+      "understudy:completedWrites",
+      "understudy:attendedJournal",
+      "understudy:attendedDialogs",
+      ...(typeof tabId === "number"
+        ? [`understudy:cdp:gen:${tabId}`]
+        : []),
+    ]),
+    browser.storage.local.remove(WS_URL_KEY),
+  ]);
+  await profileClient.start();
 }
 
-async function readWsUrl(): Promise<string> {
+// ── WebSocket lifecycle ──────────────────────────────────────────────────────
+
+async function readWsUrl(): Promise<string | null> {
   try {
-    const stored = await browser.storage.session.get(WS_URL_KEY);
+    const stored = await browser.storage.session.get([
+      WS_URL_KEY,
+      WS_ISOLATION_BLOCK_KEY,
+    ]);
+    if (stored[WS_ISOLATION_BLOCK_KEY] === true) {
+      wsIsolationFailed = true;
+      log("attended session remains blocked after an incomplete endpoint switch", "warn");
+      return null;
+    }
     const value = stored[WS_URL_KEY];
     if (typeof value === "string" && value.length > 0) return value;
     const legacy = await browser.storage.local.get(WS_URL_KEY);
@@ -130,15 +195,15 @@ async function readWsUrl(): Promise<string> {
       await browser.storage.session.set({ [WS_URL_KEY]: legacyValue });
       return legacyValue;
     }
-    return DEFAULT_WS_URL;
+    return null;
   } catch (cause) {
-    log(`read wsUrl failed, using default: ${errorMessage(cause)}`, "warn");
-    return DEFAULT_WS_URL;
+    log(`read wsUrl failed; attended session remains idle: ${errorMessage(cause)}`, "warn");
+    return null;
   }
 }
 
 async function ensureConnection(): Promise<void> {
-  if (ws !== null || wsConnecting || wsSwitching) return;
+  if (ws !== null || wsConnecting || wsSwitching || wsIsolationFailed) return;
   wsConnecting = true;
   try {
     if (!wsUrlHydrated) {
@@ -151,17 +216,17 @@ async function ensureConnection(): Promise<void> {
         wsUrlHydrated = true;
       }
     }
-    if (ws === null && !wsSwitching) {
-      connectWs();
-    }
+    const url = currentWsUrl;
+    if (url === null || ws !== null || wsSwitching) return;
+    connectWs(url);
   } finally {
     wsConnecting = false;
   }
 }
 
-function connectWs(): void {
+function connectWs(url: string): void {
   let peer!: ReconnectingWs;
-  peer = new ReconnectingWs(getUrl, {
+  peer = new ReconnectingWs(() => url, {
     onCommand: (raw) => onCommand(raw, peer),
     onOpen: () => onOpen(peer),
     onClose: (event) => onClose(peer, event),
@@ -214,7 +279,7 @@ async function sendHello(peer: ReconnectingWs): Promise<void> {
     });
     return;
   }
-  const tab = await browser.tabs.get(active.tabId);
+  const tab = await controlledTabInfo(active.tabId, active.currentUrl);
   sendIfPeerCurrent(peer, acceptingPeer, (current) => {
     current.send({
       type: "hello",
@@ -225,8 +290,8 @@ async function sendHello(peer: ReconnectingWs): Promise<void> {
       tabs: [
         {
           tabId: active.tabId,
-          url: tab.url ?? active.currentUrl,
-          title: tab.title ?? "",
+          url: tab.url,
+          title: tab.title,
           active: tab.active,
         },
       ],
@@ -240,12 +305,14 @@ function onCommand(raw: unknown, peer: ReconnectingWs): void {
   const v2 = safeParseSessionServerFrame(raw);
   if (v2.success) {
     fireAndForget("v2 command ingress", () =>
-      commandIngress.enqueue(() => startV2Frame(v2.data, peer)),
+      internalRuntime().commandIngress.enqueue(() =>
+        startV2Frame(v2.data, peer),
+      ),
     );
     return;
   }
   fireAndForget("command ingress", () =>
-    commandIngress.enqueue(() => startCommand(raw, peer)),
+    internalRuntime().commandIngress.enqueue(() => startCommand(raw, peer)),
   );
 }
 
@@ -278,7 +345,7 @@ async function startV2Frame(
       ) {
         return undefined;
       }
-      await attendedJournal.prepare({
+      await internalRuntime().journal.prepare({
         attemptId: frame.attemptId,
         commandId: frame.commandId,
         requestFingerprint: frame.requestFingerprint,
@@ -304,14 +371,14 @@ async function startV2Frame(
       ) {
         return undefined;
       }
-      const record = await attendedJournal.get(frame.attemptId);
+      const record = await internalRuntime().journal.get(frame.attemptId);
       if (
         record?.state !== "prepared" ||
         record.commandId !== frame.command.commandId
       ) {
         return undefined;
       }
-      await attendedJournal.markStarted(frame.attemptId);
+      await internalRuntime().journal.markStarted(frame.attemptId);
       const active = session;
       const completion = executeAttendedWrite(
         frame.command,
@@ -324,13 +391,13 @@ async function startV2Frame(
       return { completion };
     }
     case "attempt_cancel":
-      await attendedJournal.cancelPrepared(frame.attemptId);
+      await internalRuntime().journal.cancelPrepared(frame.attemptId);
       return undefined;
     case "result_ack":
-      await attendedJournal.acknowledge(frame.attemptId);
+      await internalRuntime().journal.acknowledge(frame.attemptId);
       return undefined;
     case "dialog_ack":
-      await attendedDialogs.acknowledge(frame.dialogId);
+      await internalRuntime().dialogs.acknowledge(frame.dialogId);
       return undefined;
     case "writes_blocked":
       attendedWritesBlocked = true;
@@ -365,11 +432,11 @@ async function executeAttendedWrite(
 ): Promise<void> {
   const event = await executeAttendedWithDeadline(command, deadlineAt, active);
   if (event === null || session !== active) {
-    await attendedJournal.markUnknown(attemptId);
+    await internalRuntime().journal.markUnknown(attemptId);
     attendedWritesBlocked = true;
     return;
   }
-  await attendedJournal.markCompleted(attemptId, event);
+  await internalRuntime().journal.markCompleted(attemptId, event);
   sendAttendedResult(peer, attemptId, command.commandId, event);
 }
 
@@ -411,7 +478,7 @@ function sendAttendedResult(
 }
 
 async function replayAttendedState(peer: ReconnectingWs): Promise<void> {
-  for (const record of await attendedJournal.recover()) {
+  for (const record of await internalRuntime().journal.recover()) {
     if (record.state === "prepared") {
       sendIfPeerCurrent(peer, acceptingPeer, (current) => {
         current.send({
@@ -423,7 +490,7 @@ async function replayAttendedState(peer: ReconnectingWs): Promise<void> {
         });
       });
     } else if (record.state === "started") {
-      await attendedJournal.markUnknown(record.attemptId);
+      await internalRuntime().journal.markUnknown(record.attemptId);
       attendedWritesBlocked = true;
     } else if (
       record.state === "completed_unacked" &&
@@ -437,7 +504,7 @@ async function replayAttendedState(peer: ReconnectingWs): Promise<void> {
       );
     }
   }
-  for (const record of await attendedDialogs.pending()) {
+  for (const record of await internalRuntime().dialogs.pending()) {
     sendIfPeerCurrent(peer, acceptingPeer, (current) => {
       current.send({ type: "dialog", ...record });
     });
@@ -468,7 +535,7 @@ async function startCommand(
   // original is still executing (the service timed out and the consumer
   // retried) - is dropped so the write runs at most once; the running
   // execution's response resolves the service's parked promise.
-  const decision = await dedupe.claim(parsed.data);
+  const decision = await internalRuntime().dedupe.claim(parsed.data);
   if (decision.kind === "replay") {
     log(`replayed recorded result for duplicate write ${parsed.data.commandId}`);
     peer.send(decision.event);
@@ -485,12 +552,12 @@ async function startCommand(
       const ev = await routeCommand(parsed.data, activeSession);
       // Record before sending: once the write executed, a crash between the two
       // must leave the record (a replayable result), not a re-executable gap.
-      await dedupe.remember(parsed.data, ev);
+      await internalRuntime().dedupe.remember(parsed.data, ev);
       peer.send(ev);
     } finally {
       // No-op once remember() cleared the mark; guarantees a thrown execution
       // still frees its in-flight slot so a later retry can re-run it.
-      dedupe.release(parsed.data);
+      internalRuntime().dedupe.release(parsed.data);
     }
   })();
   fireAndForget("command execution", async () => completion);
@@ -516,6 +583,7 @@ async function onCdpEvent(
   params: unknown,
 ): Promise<void> {
   await profileClient.sessions.onCdpEvent(source, method, params);
+  if (__UNDERSTUDY_STORE__) return;
   const active = session;
   if (active === null || source.tabId !== active.tabId) return;
   const eventPeer = acceptingPeer;
@@ -569,7 +637,7 @@ async function onCdpEvent(
           (accept ? "accept" : "dismiss"),
       } as const;
       await handleDialogWithOutbox(
-        attendedDialogs,
+        internalRuntime().dialogs,
         record,
         () => active.send("Page.handleJavaScriptDialog", { accept }),
         (delivery) => {
@@ -597,6 +665,7 @@ async function onCdpEvent(
 
 async function onDetach(source: { tabId?: number }, reason: string): Promise<void> {
   await profileClient.sessions.onDebuggerDetach(source);
+  if (__UNDERSTUDY_STORE__) return;
   const active = session;
   if (active === null || source.tabId !== active.tabId) return;
   await fenceStartedAttendedWrites();
@@ -675,9 +744,9 @@ async function clearAttachment(): Promise<void> {
 }
 
 async function fenceStartedAttendedWrites(): Promise<void> {
-  for (const record of await attendedJournal.recover()) {
+  for (const record of await internalRuntime().journal.recover()) {
     if (record.state !== "started") continue;
-    await attendedJournal.markUnknown(record.attemptId);
+    await internalRuntime().journal.markUnknown(record.attemptId);
     attendedWritesBlocked = true;
   }
 }
@@ -697,23 +766,19 @@ async function reconcileAttachment(): Promise<void> {
     return;
   }
   try {
-    // chrome.debugger.getTargets() (the WebExtensions API) — distinct from the
-    // blocked CDP Target.getTargets.
-    const targets = await browser.debugger.getTargets();
-    const target = targets.find((t) => t.tabId === tabId);
-    if (target !== undefined && target.attached) {
-      const next = await CdpSession.create(tabId);
-      await next.reconcile();
-      session = next;
-      attachedTitle = target.title;
-      log(`reconciled attachment to tab ${tabId}`);
-      if (acceptingPeer !== null) await sendHello(acceptingPeer);
-    } else {
-      await clearAttachment();
-      log(`attachment to tab ${tabId} no longer present; cleared`);
-    }
+    const next = await CdpSession.create(tabId);
+    await next.reconcile();
+    const tab = await controlledTabInfo(tabId, next.currentUrl);
+    session = next;
+    attachedTitle = tab.title;
+    log(`reconciled attachment to tab ${tabId}`);
+    if (acceptingPeer !== null) await sendHello(acceptingPeer);
   } catch (cause) {
-    log(`reconcile failed: ${errorMessage(cause)}`, "error");
+    await clearAttachment();
+    log(
+      `attachment to tab ${tabId} could not be reconciled; cleared: ${errorMessage(cause)}`,
+      "warn",
+    );
   }
   broadcastState();
 }
@@ -727,29 +792,37 @@ async function persistAttachedTabId(tabId: number): Promise<void> {
 }
 
 async function setWsUrl(url: string): Promise<void> {
-  const previousRequestedUrl = requestedWsUrl ?? currentWsUrl;
-  const sessionChanged = url !== previousRequestedUrl;
-  requestedWsUrl = url;
   const request = ++wsSwitchRequest;
   wsSwitching = true;
   wsUrlHydrated = true;
   wsUrlEpoch += 1;
   wsStatus = "connecting";
-  const oldPeer = acceptingPeer;
   acceptingPeer = null;
   broadcastState();
 
-  const change = wsSwitchTail.then(async () => {
-    await commandIngress.barrier(async () => {
-      oldPeer?.stop();
-      if (ws === oldPeer) ws = null;
-      if (!sessionChanged) return;
+  let isolatedPeer: ReconnectingWs | null = null;
+  const operation = wsSwitchTail.then(async () => {
+    const transition = resolveAttendedTransition(
+      url,
+      currentWsUrl,
+      wsIsolationFailed,
+      acceptingPeer,
+      ws,
+    );
+    isolatedPeer = transition.peer;
+    await browser.storage.session.set({
+      [WS_ISOLATION_BLOCK_KEY]: true,
+    });
+    await internalRuntime().commandIngress.barrier(async () => {
+      isolatedPeer?.stop();
+      if (ws === isolatedPeer) ws = null;
+      if (!transition.sessionChanged) return;
       // The session id lives in the URL. Wait for every command accepted from
       // the old peer before clearing replay state and rotating the ref scope;
       // this prevents an old snapshot from repopulating refs after invalidation.
-      await dedupe.clear();
-      await attendedJournal.clear();
-      await attendedDialogs.clear();
+      await internalRuntime().dedupe.clear();
+      await internalRuntime().journal.clear();
+      await internalRuntime().dialogs.clear();
       attendedWritesBlocked = false;
       attendedTerminal = false;
       const active = session;
@@ -762,23 +835,51 @@ async function setWsUrl(url: string): Promise<void> {
       }
     });
     currentWsUrl = url;
-    try {
-      await browser.storage.session.set({ [WS_URL_KEY]: url });
-    } catch (cause) {
-      log(`persist wsUrl failed: ${errorMessage(cause)}`, "warn");
-    }
+    await browser.storage.session.set({
+      [WS_URL_KEY]: url,
+      [WS_ISOLATION_BLOCK_KEY]: false,
+    });
     log("attended session endpoint updated; reconnecting");
+  });
+  const change = operation.catch(async (cause: unknown) => {
+    wsIsolationFailed = true;
+    currentWsUrl = null;
+    isolatedPeer?.stop();
+    if (ws === isolatedPeer) ws = null;
+    const safeguards = await Promise.allSettled([
+      browser.storage.session.set({
+        [WS_ISOLATION_BLOCK_KEY]: true,
+      }),
+      browser.storage.session.remove(WS_URL_KEY),
+    ]);
+    for (const safeguard of safeguards) {
+      if (safeguard.status === "rejected") {
+        log(
+          `persist attended isolation failure failed: ${errorMessage(safeguard.reason)}`,
+          "warn",
+        );
+      }
+    }
+    throw cause;
   });
   wsSwitchTail = change.then(
     () => undefined,
     () => undefined,
   );
+  let switched = false;
   try {
     await change;
+    switched = true;
   } finally {
     if (request === wsSwitchRequest) {
       wsSwitching = false;
-      connectWs();
+      if (switched) {
+        wsIsolationFailed = false;
+        connectWs(url);
+      } else {
+        wsStatus = currentWsUrl === null ? "idle" : "closed";
+        broadcastState();
+      }
     }
   }
 }
@@ -798,20 +899,51 @@ function onConnect(port: Browser.runtime.Port): void {
 }
 
 function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
+  if (msg.type === "getState") {
+    pushState(port);
+    return;
+  }
+  if (msg.type === "stopAll") {
+    const request = ++hostingStopRequest;
+    hostingStopRequested = true;
+    pairingState = undefined;
+    const stopping = __UNDERSTUDY_STORE__
+      ? storeRuntimeGate.wait().then(() => profileClient.stopAll())
+      : profileClient.stopAll();
+    broadcastState();
+    fireAndForget("stopAll", async () => {
+      try {
+        await stopping;
+      } finally {
+        if (request === hostingStopRequest) {
+          hostingStopRequested = false;
+          broadcastState();
+        }
+      }
+    });
+    return;
+  }
+  if (msg.type === "pair") {
+    fireAndForget("pair", () => pairDevice(msg.code));
+    return;
+  }
+  if (__UNDERSTUDY_STORE__) return;
+
   switch (msg.type) {
-    case "getState":
-      pushState(port);
-      break;
     case "attach":
       fireAndForget("attach", attach);
       break;
     case "detach":
-      fireAndForget("detach", () => commandIngress.barrier(detach));
+      fireAndForget("detach", () =>
+        internalRuntime().commandIngress.barrier(detach),
+      );
       break;
     case "setWsUrl":
       fireAndForget("setWsUrl", () => setWsUrl(msg.url));
       break;
     case "configureProfile":
+      hostingStopRequest += 1;
+      hostingStopRequested = false;
       fireAndForget("configureProfile", () =>
         profileClient.configure({
           serviceOrigin: msg.serviceOrigin,
@@ -822,12 +954,6 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
         }),
       );
       break;
-    case "stopAll":
-      fireAndForget("stopAll", () => profileClient.stopAll());
-      break;
-    case "pair":
-      fireAndForget("pair", () => pairDevice(msg.code));
-      break;
   }
 }
 
@@ -836,9 +962,12 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
 // deviceId+credential per redemption means the new profileKey can never
 // match a stored ControlBlock, so pairing again is the universal recovery.
 async function pairDevice(code: string): Promise<void> {
+  hostingStopRequest += 1;
+  hostingStopRequested = false;
   pairingState = { phase: "pairing" };
   broadcastState();
   try {
+    if (__UNDERSTUDY_STORE__) await storeRuntimeGate.wait();
     const result = await redeemPairingCode(code);
     await profileClient.configure({
       serviceOrigin: result.serviceOrigin,
@@ -847,7 +976,7 @@ async function pairDevice(code: string): Promise<void> {
       deviceCredential: result.deviceCredential,
       originPolicy: result.originPolicy,
     });
-    pairingState = { phase: "paired" };
+    pairingState = { phase: "success" };
     log("paired with account; unattended hosting enabled");
   } catch (cause) {
     pairingState = {
@@ -865,6 +994,7 @@ async function pairDevice(code: string): Promise<void> {
 // ── State + logging ──────────────────────────────────────────────────────────
 
 function buildAttached(): AttachedTab | null {
+  if (__UNDERSTUDY_STORE__) return null;
   if (session === null) return null;
   const url = session.currentUrl.length > 0 ? session.currentUrl : undefined;
   return { tabId: session.tabId, title: attachedTitle, url };
@@ -872,6 +1002,7 @@ function buildAttached(): AttachedTab | null {
 
 function buildState(): StateMsg {
   const blockedReason = profileClient.blockedReason();
+  const profileConfig = profileClient.publicConfig();
   return {
     type: "state",
     wsStatus,
@@ -879,7 +1010,10 @@ function buildState(): StateMsg {
     attached: buildAttached(),
     profileStatus: profileClient.currentStatus(),
     controlledTabs: profileClient.sessions.assignments().length,
-    profileConfig: profileClient.publicConfig(),
+    profileConfig:
+      hostingStopRequested && profileConfig !== null
+        ? { ...profileConfig, unattendedEnabled: false }
+        : profileConfig,
     ...(pairingState === undefined ? {} : { pairing: pairingState }),
     ...(blockedReason === null ? {} : { profileStatusReason: blockedReason }),
     logs: [...logBuffer],
@@ -918,10 +1052,17 @@ function postToPort(port: Browser.runtime.Port, msg: StateMsg | LogMsg): void {
 function onAlarm(alarm: { name: string }): void {
   if (alarm.name === BACKSTOP_ALARM) {
     // Wake-driven reconnect backstop across SW eviction.
-    fireAndForget("ensureConnection", ensureConnection);
-    fireAndForget("ensureProfileConnection", () =>
-      profileClient.ensureConnection(),
-    );
+    if (__UNDERSTUDY_STORE__) {
+      fireAndForget("ensureStoreRuntime", async () => {
+        await storeRuntimeGate.wait();
+        await profileClient.ensureConnection();
+      });
+    } else {
+      fireAndForget("ensureConnection", ensureConnection);
+      fireAndForget("ensureProfileConnection", () =>
+        profileClient.ensureConnection(),
+      );
+    }
   }
 }
 

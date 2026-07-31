@@ -14,7 +14,9 @@ Before you start:
 - Log into the required sites and complete Multi-Factor Authentication (MFA) or CAPTCHA
 - Keep the machine, Chrome, and network awake
 - Do not open DevTools on a controlled tab
-- Do not click the debugger banner’s detach control
+- Treat Chrome’s debugger banner as process-wide: it may appear in unrelated profiles or windows
+- Do not dismiss the debugger banner anywhere; doing so can detach the controlled tab
+- Do not use the banner as a per-tab diagnostic
 
 Two sessions in one profile share cookies, local storage, IndexedDB, and browser extensions. Use separate profiles when the sessions require different browser identities.
 
@@ -35,7 +37,7 @@ Then:
 2. Enable **Developer mode**
 3. Select **Load unpacked**
 4. Choose `apps/extension/.output/chrome-mv3/`
-5. Approve debugger, tabs, storage, alarms, and host permissions
+5. Approve debugger, storage, alarms, and host permissions
 
 Use this production build. Do not use WXT development mode for acceptance.
 
@@ -182,6 +184,51 @@ Use the side panel’s attended section:
 5. Select **Detach tab**
 
 Done means the command path negotiates protocol 2 after attachment, reports only that tab, and detaching leaves the tab open.
+
+Chrome’s debugger banner is process-wide. Dismissing it in any Chrome profile or window can detach the controlled tab, and its presence does not identify which tab is controlled.
+
+## Run the automated store-release checks
+
+From the repository root:
+
+```bash
+pnpm --filter @understudy/protocol build
+pnpm --filter @understudy/extension typecheck
+pnpm --filter @understudy/extension test
+pnpm --filter @understudy/extension build
+pnpm --filter @understudy/extension build:store
+pnpm --filter @understudy/extension zip:store
+pnpm --filter @understudy/backend typecheck
+pnpm --filter @understudy/backend exec vitest run test/dashboard-auth.test.ts
+pnpm typecheck
+pnpm test
+```
+
+Inspect the store output:
+
+```bash
+zipinfo -1 apps/extension/.output/understudyextension-0.1.2-chrome-store.zip
+unzip -p apps/extension/.output/understudyextension-0.1.2-chrome-store.zip manifest.json | jq
+rg -a "localhost:8787|Advanced: manual configuration|Attended session" \
+  apps/extension/.output/chrome-mv3-store
+```
+
+Done means the ZIP has `manifest.json` at its root; its icons and listing metadata are present; permissions are `debugger`, `storage`, `alarms`, and WXT’s `sidePanel`; the only host permission is `https://understudy.proofof.tech/*`; and the final `rg` prints nothing.
+
+## Accept the unlisted store build in Chrome
+
+Use a fresh Chrome profile. Load `apps/extension/.output/chrome-mv3-store/` through `chrome://extensions` → **Load unpacked**; command-line extension loading is not an acceptance substitute.
+
+1. Select the toolbar action. The Understudy side panel must open.
+2. Leave the extension unpaired for at least 65 seconds. The service-worker console must show no localhost request, WebSocket attempt, or connection error.
+3. Enter an invalid or expired pairing code. The field must retain and select the code, and the panel must show an actionable error.
+4. Pair with a valid hosted code. The status must progress through **Connecting** to **Connected**, then show controlled-tab capacity.
+5. Confirm **Manual configuration** and **Attended session** are absent.
+6. With an active hosted session, select **Stop hosting**. Confirm the warning, then verify the session ends and the panel shows **Paused** without claiming hosting is enabled.
+7. Confirm the Privacy and Support links open the intended HTTPS policy and public issue tracker.
+8. Confirm `store-assets/screenshot-first-run-1280x800.png` still matches this build. Capture a replacement from the accepted build if the panel changed.
+
+Do not submit the extension until `https://understudy.proofof.tech/privacy` returns `200`.
 
 ## Record the release decision
 

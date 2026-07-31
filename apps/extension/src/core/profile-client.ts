@@ -13,6 +13,7 @@ import {
   StaleProvisionError,
   type ClosureRecord,
 } from "./session-manager";
+import { RetryableStartupGate } from "./startup-gate";
 import { ReconnectingWs } from "./ws-client";
 
 const BROWSER_EPOCH_KEY = "understudy:browserEpoch";
@@ -25,6 +26,12 @@ const CONFIG_KEYS = [
   "deviceId",
   "deviceCredential",
   "originPolicy",
+] as const;
+const PROFILE_STATE_KEYS = [
+  ...CONFIG_KEYS,
+  STAGED_CONFIG_KEY,
+  CREDENTIAL_REVOKED_KEY,
+  CONTROL_BLOCK_KEY,
 ] as const;
 const TICKET_BACKOFF_BASE_MS = 500;
 const TICKET_BACKOFF_CAP_MS = 30_000;
@@ -72,10 +79,15 @@ export class ProfileClient {
   private status: ProfileStatus = "disabled";
   private controlFrameTail: Promise<void> = Promise.resolve();
   private configWriteTail: Promise<void> = Promise.resolve();
-  private initialization: Promise<void> | null = null;
+  private readonly initialization = new RetryableStartupGate(() =>
+    this.initialize(),
+  );
   private lifecycleTail: Promise<void> = Promise.resolve();
 
-  constructor(private readonly onStatus?: (status: ProfileStatus) => void) {
+  constructor(
+    private readonly onStatus?: (status: ProfileStatus) => void,
+    private readonly requiredServiceOrigin?: string,
+  ) {
     this.sessions = new SessionManager(
       () => this.requiredConfig().serviceOrigin,
       () => this.epoch,
@@ -94,7 +106,7 @@ export class ProfileClient {
   }
 
   private ensureInitialized(): Promise<void> {
-    return (this.initialization ??= this.initialize());
+    return this.initialization.wait();
   }
 
   private async initialize(): Promise<void> {
@@ -176,6 +188,7 @@ export class ProfileClient {
 
   configure(config: ProfileConfig): Promise<void> {
     const normalized = normalizeProfileConfig(config);
+    this.assertServiceOrigin(normalized);
     const generation = this.invalidateControl();
     const cleanupIntent = this.configureCleanupIntent(normalized);
     if (cleanupIntent !== null) {
@@ -290,7 +303,7 @@ export class ProfileClient {
     this.stagedConfig = null;
     if (this.config !== null) {
       this.config = { ...this.config, unattendedEnabled: false };
-      if (!(await this.persistProfileState(this.config, null, generation))) return;
+      if (!(await this.persistStoppedProfile(generation))) return;
     }
     await this.sessions.stopAll(intent);
     if (!this.isGenerationCurrent(generation)) return;
@@ -852,6 +865,29 @@ export class ProfileClient {
     return written;
   }
 
+  private async persistStoppedProfile(generation: number): Promise<boolean> {
+    const config = this.requiredConfig();
+    try {
+      return await this.persistProfileState(config, null, generation);
+    } catch (firstError) {
+      if (!this.isGenerationCurrent(generation)) return false;
+      try {
+        return await this.persistProfileState(config, null, generation);
+      } catch (secondError) {
+        if (!this.isGenerationCurrent(generation)) return false;
+        try {
+          await browser.storage.local.remove([...PROFILE_STATE_KEYS]);
+        } catch (removeError) {
+          throw new AggregateError(
+            [firstError, secondError, removeError],
+            "could not persist or clear the stopped profile",
+          );
+        }
+        return this.isGenerationCurrent(generation);
+      }
+    }
+  }
+
   private async loadBrowserEpoch(): Promise<string> {
     const stored = await browser.storage.session.get(BROWSER_EPOCH_KEY);
     const value = stored[BROWSER_EPOCH_KEY];
@@ -867,12 +903,7 @@ export class ProfileClient {
     credentialRevoked: boolean;
     controlBlock: ControlBlock | null;
   }> {
-    const stored = await browser.storage.local.get([
-      ...CONFIG_KEYS,
-      STAGED_CONFIG_KEY,
-      CREDENTIAL_REVOKED_KEY,
-      CONTROL_BLOCK_KEY,
-    ]);
+    const stored = await browser.storage.local.get([...PROFILE_STATE_KEYS]);
     const candidate = {
       serviceOrigin: stored.serviceOrigin,
       unattendedEnabled: stored.unattendedEnabled,
@@ -896,6 +927,30 @@ export class ProfileClient {
     } catch {
       staged = null;
     }
+    if (
+      this.requiredServiceOrigin !== undefined &&
+      stored.serviceOrigin !== undefined &&
+      (active === null ||
+        active.serviceOrigin !== this.requiredServiceOrigin)
+    ) {
+      await browser.storage.local.remove([...PROFILE_STATE_KEYS]);
+      return {
+        active: null,
+        staged: null,
+        credentialRevoked: false,
+        controlBlock: null,
+      };
+    }
+    if (
+      this.requiredServiceOrigin !== undefined &&
+      stored[STAGED_CONFIG_KEY] !== null &&
+      stored[STAGED_CONFIG_KEY] !== undefined &&
+      (staged === null ||
+        staged.serviceOrigin !== this.requiredServiceOrigin)
+    ) {
+      staged = null;
+      await browser.storage.local.remove(STAGED_CONFIG_KEY);
+    }
     return {
       active,
       staged,
@@ -918,6 +973,15 @@ export class ProfileClient {
       throw new Error("unattended profile is not configured");
     }
     return this.config;
+  }
+
+  private assertServiceOrigin(config: ProfileConfig): void {
+    if (
+      this.requiredServiceOrigin !== undefined &&
+      config.serviceOrigin !== this.requiredServiceOrigin
+    ) {
+      throw new Error("profile service origin is not allowed in this build");
+    }
   }
 
   private isControlBlocked(): boolean {
@@ -949,6 +1013,8 @@ function normalizeProfileConfig(value: unknown): ProfileConfig {
       ? new URL(input.serviceOrigin)
       : null;
   const serviceLoopback =
+    (typeof __UNDERSTUDY_STORE__ === "undefined" ||
+      !__UNDERSTUDY_STORE__) &&
     origin !== null &&
     (origin.hostname === "localhost" ||
       origin.hostname === "127.0.0.1" ||

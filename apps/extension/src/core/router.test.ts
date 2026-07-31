@@ -36,12 +36,21 @@ function asSession(mock: MockSession): CdpSession {
   return mock as unknown as CdpSession;
 }
 
-function stubBrowserTabs(): { get: Mock; query: Mock; update: Mock } {
+function stubBrowserTabs(): {
+  get: Mock;
+  query: Mock;
+  sendCommand: Mock;
+  update: Mock;
+} {
   const get = vi.fn();
   const query = vi.fn();
+  const sendCommand = vi.fn(async () => ({ targetInfo: {} }));
   const update = vi.fn();
-  vi.stubGlobal("browser", { tabs: { get, query, update } });
-  return { get, query, update };
+  vi.stubGlobal("browser", {
+    debugger: { sendCommand },
+    tabs: { get, query, update },
+  });
+  return { get, query, sendCommand, update };
 }
 
 afterEach(() => {
@@ -265,18 +274,26 @@ describe("routeCommand", () => {
   });
 
   it("returns only the session-owned tab for get_tabs", async () => {
-    const { get, query } = stubBrowserTabs();
+    const { get, query, sendCommand } = stubBrowserTabs();
     get.mockResolvedValue({
       id: 7,
-      url: "https://owned.example/",
-      title: "Owned",
       active: false,
+    });
+    sendCommand.mockResolvedValue({
+      targetInfo: {
+        url: "https://owned.example/",
+        title: "Owned",
+      },
     });
     const cmd: Command = { type: "get_tabs", commandId: "c-tabs" };
 
     const result = await routeCommand(cmd, asSession(createMockSession()));
 
     expect(get).toHaveBeenCalledWith(7);
+    expect(sendCommand).toHaveBeenCalledWith(
+      { tabId: 7 },
+      "Target.getTargetInfo",
+    );
     expect(query).not.toHaveBeenCalled();
     expect(result).toEqual({
       type: "tabs_result",

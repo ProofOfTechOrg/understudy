@@ -15,7 +15,7 @@ WXT + React MV3 extension driving protocol Commands into a real Chromium tab via
 | `tsconfig.json` | TS project config (extends WXT-generated `.wxt/tsconfig.json`) | Adjusting compiler options |
 | `scripts/stub-server.mjs` | Throwaway M2 WS peer: validates every Event with real protocol schemas, sends Commands from stdin | Driving/debugging the extension over the real WS wire |
 | `src/events.ts` | `errorMessage`, `actionError` — shared error-to-`action_result` helpers | Adding an executor that can fail |
-| `src/tabs.ts` | `queryTabInfos` — `chrome.tabs.query` to `TabInfo[]` | Changing tab metadata reported to the backend |
+| `src/tabs.ts` | `controlledTabInfo` — scoped CDP URL/title plus non-sensitive tab state for one controlled tab | Changing tab metadata reported to the backend |
 | `src/messaging.ts` | `PanelMsg`/`SwMsg` discriminated unions for the sidepanel↔service-worker `Port` | Changing panel/background message shapes |
 | `src/driver/a11y.ts` | `buildA11ySnapshot` — pure AX-tree → pruned `A11yNode[]` + opaque session/attachment/generation-bound ref map | Changing which roles are surfaced, ref format, or snapshot pruning |
 | `src/driver/a11y.test.ts` | Unit tests for `buildA11ySnapshot` against a hand-authored AX fixture, including scope isolation | Verifying a11y pruning/re-parenting or ref-binding behavior |
@@ -31,8 +31,12 @@ WXT + React MV3 extension driving protocol Commands into a real Chromium tab via
 | `src/core/ws-client.test.ts` | Unit tests for ordinary reconnect and terminal backend replacement close code 4001 | Changing reconnect termination behavior |
 | `src/core/command-ingress.ts` | `CommandIngress` — serial command-admission queue plus drain barrier for WebSocket session changes | Changing wire-order or session-switch command draining |
 | `src/core/command-ingress.test.ts` | Unit tests for dedupe-hydration order, drain ordering, and captured-peer responses | Verifying command ingress/session-switch concurrency |
+| `src/core/attended-switch.ts` | `resolveAttendedTransition` — derives replay isolation and peer ownership from serialized committed state | Changing attended endpoint switching |
+| `src/core/attended-switch.test.ts` | Unit tests for queued endpoint retries after isolation failures | Verifying attended switch failure recovery |
 | `src/core/peer-binding.ts` | `sendIfPeerCurrent` — drops delayed hello/page/dialog sends after peer authority changes | Changing post-await WebSocket event routing |
 | `src/core/peer-binding.test.ts` | Unit tests for current-peer send/drop behavior | Verifying cross-session event isolation |
+| `src/core/startup-gate.ts` | `RetryableStartupGate` — coalesces store cleanup, caches success, and permits retry after failure | Changing hosted-build startup ordering |
+| `src/core/startup-gate.test.ts` | Unit tests for startup coalescing, downstream blocking, and retry | Verifying store startup gating |
 | `src/core/router.ts` | `routeCommand` — dispatches a parsed `Command` to a `CdpSession` executor or tab handler | Adding a new protocol Command type |
 | `src/core/router.test.ts` | Unit tests for `routeCommand` (one Event per Command, error paths) | Verifying command routing |
 | `src/core/dedupe.ts` | `WriteDedupe` — `claim()` (execute / replay a completed write / drop an in-flight duplicate) + `remember`/`release`/`clear`; idempotent-retry contract, storage.session-mirrored, cap 100 | Changing write replay/dedupe/in-flight behavior |
