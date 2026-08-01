@@ -17,5 +17,7 @@ dist/
 # codebase-memory MCP local bundle — never commit
 .codebase-memory/
 
+.local/
+
 .DS_Store
 *.log
