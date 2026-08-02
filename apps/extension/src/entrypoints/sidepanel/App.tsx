@@ -25,12 +25,7 @@ type HostStatus =
 
 export function App(): ReactElement {
   const [swState, setSwState] = useState<StateSnapshot | null>(null);
-  const [pairingCode, setPairingCode] = useState("");
   const portRef = useRef<Browser.runtime.Port | null>(null);
-  const pairingInputRef = useRef<HTMLInputElement>(null);
-  const previousPairingPhase = useRef<PairingState["phase"] | undefined>(
-    undefined,
-  );
 
   const send = (msg: PanelMsg): void => {
     try {
@@ -78,18 +73,6 @@ export function App(): ReactElement {
   }, []);
 
   const pairing = swState?.pairing;
-  useEffect(() => {
-    const previous = previousPairingPhase.current;
-    const current = pairing?.phase;
-    previousPairingPhase.current = current;
-    if (previous === "pairing" && current === "success") {
-      setPairingCode("");
-    } else if (current === "error") {
-      pairingInputRef.current?.focus();
-      pairingInputRef.current?.select();
-    }
-  }, [pairing?.phase]);
-
   const isLoading = swState === null;
   const isPairing = pairing?.phase === "pairing";
   const profileConfig = swState?.profileConfig ?? null;
@@ -105,17 +88,10 @@ export function App(): ReactElement {
     swState?.profileStatusReason,
   );
 
-  const submitPairing = (event: FormEvent<HTMLFormElement>): void => {
-    event.preventDefault();
-    const code = pairingCode.trim();
-    if (code.length === 0 || isLoading || isPairing) return;
-    send({ type: "pair", code });
-  };
-
   const stopHosting = (): void => {
     if (!canStop) return;
     const confirmed = window.confirm(
-      "Stop hosting? Any active sessions will end, and you will need a fresh pairing code to resume.",
+      "Stop hosting? Any active sessions will end. You can resume from the dashboard.",
     );
     if (confirmed) send({ type: "stopAll" });
   };
@@ -157,58 +133,20 @@ export function App(): ReactElement {
           </div>
         </div>
         <p className="card-intro">
-          Generate a one-time code in your dashboard, then enter it here to
-          authorize this Chrome profile.
+          Use the dashboard to send a one-time offer directly to this extension.
+          Pairing credentials never appear in a URL or require transcription.
         </p>
-        <form className="enrollment-form" onSubmit={submitPairing}>
-          <label>
-            <span>Pairing code</span>
-            <input
-              ref={pairingInputRef}
-              name="pairingCode"
-              type="text"
-              required
-              value={pairingCode}
-              onChange={(event) => setPairingCode(event.currentTarget.value)}
-              placeholder="K7Q2-M9XR"
-              spellCheck={false}
-              autoCapitalize="characters"
-              autoComplete="off"
-              disabled={isLoading || isPairing}
-              aria-describedby={
-                pairingNotice === null
-                  ? "pairing-help"
-                  : "pairing-help pairing-result"
-              }
-            />
-          </label>
-          <div className="form-actions">
-            <a
-              className="dashboard-link"
-              href={DASHBOARD_URL}
-              target="_blank"
-              rel="noreferrer"
-            >
-              Open dashboard
-            </a>
-            <button
-              className="button button-primary"
-              type="submit"
-              disabled={
-                isLoading || isPairing || pairingCode.trim().length === 0
-              }
-            >
-              {isPairing
-                ? "Pairing…"
-                : isPaired
-                  ? "Replace pairing"
-                  : "Pair browser"}
-            </button>
-          </div>
-        </form>
+        <a
+          className="button button-primary dashboard-link"
+          href={DASHBOARD_URL}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {isPaired ? "Manage pairing" : "Open pairing dashboard"}
+        </a>
         <PairingStatus notice={pairingNotice} />
         <p className="privacy-note" id="pairing-help">
-          Pairing replaces this browser’s previous enrollment. Only sites
+          Re-pairing rotates this installation’s credential. Only exact origins
           allowed in your dashboard can be operated.
         </p>
       </section>
@@ -244,6 +182,8 @@ export function App(): ReactElement {
         </button>
       </section>
 
+      <CardVaultPanel vault={swState?.cardVault ?? null} send={send} />
+
       {__UNDERSTUDY_STORE__ ? null : (
         <InternalTools
           state={swState}
@@ -267,15 +207,169 @@ export function App(): ReactElement {
   );
 }
 
+function CardVaultPanel({
+  vault,
+  send,
+}: {
+  vault: StateSnapshot["cardVault"] | null;
+  send: (message: PanelMsg) => void;
+}): ReactElement {
+  const saveCard = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    send({
+      type: "saveCard",
+      card: {
+        alias: String(data.get("alias") ?? ""),
+        cardholderName: String(data.get("cardholderName") ?? ""),
+        pan: String(data.get("pan") ?? ""),
+        expiryMonth: String(data.get("expiryMonth") ?? ""),
+        expiryYear: String(data.get("expiryYear") ?? ""),
+        cvv: String(data.get("cvv") ?? ""),
+      },
+    });
+    form.reset();
+  };
+
+  const saveOrigins = (event: FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const origins = String(data.get("paymentOrigins") ?? "")
+      .split(/\r?\n/)
+      .map((origin) => origin.trim())
+      .filter((origin) => origin.length > 0);
+    send({ type: "setPaymentOrigins", origins });
+  };
+
+  const deleteVault = (): void => {
+    if (
+      window.confirm(
+        "Delete every local card, the encryption key, and payment origins? Recovery is impossible.",
+      )
+    ) {
+      send({ type: "deleteCardVault" });
+    }
+  };
+
+  return (
+    <section className="card vault-card">
+      <div className="section-heading">
+        <div>
+          <p className="section-index">03 / Local cards</p>
+          <h2>Payment vault</h2>
+        </div>
+        <span className="vault-local">This device</span>
+      </div>
+      <p className="card-intro">
+        Card values and the non-exportable encryption key stay inside this
+        extension. Only aliases are exposed to an authorized agent.
+      </p>
+      {vault?.error === undefined ? null : (
+        <p className="warning" role="status">{vault.error}</p>
+      )}
+      <form className="enrollment-form" onSubmit={saveCard} autoComplete="off">
+        <label>
+          <span>Alias</span>
+          <input name="alias" required maxLength={64} placeholder="travel-card" />
+        </label>
+        <label>
+          <span>Cardholder name</span>
+          <input name="cardholderName" maxLength={128} />
+        </label>
+        <label>
+          <span>Card number</span>
+          <input
+            name="pan"
+            required
+            inputMode="numeric"
+            pattern="[0-9 -]{12,25}"
+            autoComplete="off"
+          />
+        </label>
+        <div className="vault-field-row">
+          <label>
+            <span>Month</span>
+            <input name="expiryMonth" required inputMode="numeric" placeholder="MM" />
+          </label>
+          <label>
+            <span>Year</span>
+            <input name="expiryYear" required inputMode="numeric" placeholder="YYYY" />
+          </label>
+          <label>
+            <span>CVV</span>
+            <input
+              name="cvv"
+              required
+              inputMode="numeric"
+              pattern="[0-9]{3,4}"
+              maxLength={4}
+              autoComplete="off"
+            />
+          </label>
+        </div>
+        <button className="button button-primary" type="submit">
+          Encrypt card locally
+        </button>
+      </form>
+
+      <div className="vault-aliases">
+        <p className="section-index">Saved aliases</p>
+        {vault === null || vault.aliases.length === 0 ? (
+          <p className="privacy-note">No local cards enrolled.</p>
+        ) : (
+          <ul>
+            {vault.aliases.map((alias) => (
+              <li key={alias}>
+                <code>{alias}</code>
+                <button
+                  className="button button-danger button-compact"
+                  type="button"
+                  onClick={() => send({ type: "deleteCard", alias })}
+                >
+                  Delete
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <form className="enrollment-form vault-origins" onSubmit={saveOrigins}>
+        <label>
+          <span>Approved payment origins</span>
+          <textarea
+            key={vault?.revision ?? 0}
+            name="paymentOrigins"
+            defaultValue={vault?.approvedOrigins.join("\n") ?? ""}
+            placeholder="https://checkout.example.com"
+          />
+        </label>
+        <button className="button button-secondary" type="submit">
+          Save payment origins
+        </button>
+      </form>
+      <p className="privacy-note">
+        CVV is persisted by design. There is no backup, export, recovery, or
+        payment-status inspection. Approved origins and the controlling agent
+        are inside this feature’s trust boundary.
+      </p>
+      <button className="button button-danger stop-button" type="button" onClick={deleteVault}>
+        Delete entire local vault
+      </button>
+    </section>
+  );
+}
+
 const REJECTED_CREDENTIAL =
-  "The service rejected this browser’s credential. Pair again with a fresh code.";
+  "The service rejected this browser’s credential. Pair again with a fresh offer.";
 const BLOCK_REASON_COPY: Record<ProfileBlockReason, string> = {
   ticket_rejected: REJECTED_CREDENTIAL,
   invalid_ticket: REJECTED_CREDENTIAL,
-  replaced: "Another browser took over this pairing. Pair again with a fresh code.",
-  terminal_close: "The service ended this browser’s enrollment. Pair again with a fresh code.",
+  replaced: "Another browser took over this pairing. Pair again with a fresh offer.",
+  terminal_close: "The service ended this browser’s enrollment. Pair again with a fresh offer.",
   credential_revoked:
-    "This browser’s pairing was revoked in the dashboard. Pair again with a fresh code.",
+    "This browser’s pairing was revoked in the dashboard. Pair again with a fresh offer.",
 };
 
 function deriveHostStatus(state: StateSnapshot | null): HostStatus {
@@ -308,9 +402,9 @@ function pairingNoticeFor(
   let message: string | undefined;
   let warning = false;
   if (pairing?.phase === "pairing") {
-    message = "Checking the pairing code and securing this browser…";
+    message = "Redeeming the dashboard offer and securing this browser…";
   } else if (pairing?.phase === "error") {
-    message = pairing.message ?? "Pairing failed. Try a fresh code.";
+    message = pairing.message ?? "Pairing failed. Send a fresh dashboard offer.";
     warning = true;
   } else if (statusReason !== undefined) {
     message = BLOCK_REASON_COPY[statusReason];
@@ -361,7 +455,7 @@ function HostStatusCopy({
     Connected:
       "Ready for your authorized AI client to open controlled tabs on allowed sites.",
     Paused:
-      "Hosting is paused. Pair with a fresh code when you want to resume.",
+      "Hosting is paused. Pair with a fresh offer when you want to resume.",
     "Needs attention":
       "Hosting stopped because the service could not authorize this browser. Pair again.",
   };
@@ -400,6 +494,7 @@ function InternalTools({
       deviceId: String(data.get("deviceId") ?? "").trim(),
       deviceCredential: String(data.get("deviceCredential") ?? ""),
       originPolicy,
+      policyVersion: profileConfig?.policyVersion ?? 1,
       enabled: data.get("enabled") === "on",
     });
     const credential =

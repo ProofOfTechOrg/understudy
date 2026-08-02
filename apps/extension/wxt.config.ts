@@ -23,6 +23,9 @@ export default defineConfig({
       mode === 'store'
         ? ['https://understudy.proofof.tech/*']
         : ['<all_urls>'],
+    externally_connectable: {
+      matches: ['https://understudy.proofof.tech/*'],
+    },
     icons: {
       16: 'icon-16.png',
       32: 'icon-32.png',

@@ -277,6 +277,283 @@ describe("CdpSession keyboard dispatch", () => {
   });
 });
 
+describe("CdpSession sensitive payment submission", () => {
+  it("prevalidates every ref before issuing any CDP command", async () => {
+    const sendCommand = stubActionBrowser();
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([[testRef(0, 1), 41]]);
+
+    await expect(
+      session.submitSensitiveFields(
+        [
+          { ref: testRef(0, 1), text: "4111111111111111" },
+          { ref: testRef(0, 2), text: "123" },
+        ],
+        testRef(0, 3),
+        "https://approved.example",
+        vi.fn(),
+        vi.fn(),
+      ),
+    ).resolves.toEqual({
+      stale: true,
+      originMismatch: false,
+      cardBytesMayHaveBeenInserted: false,
+      submissionAttempted: false,
+    });
+    expect(sendCommand).not.toHaveBeenCalled();
+  });
+
+  it("fills all mapped fields and invokes submit without reading the page afterward", async () => {
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string) => {
+      if (method === "Page.getFrameTree") {
+        return Promise.resolve({
+          frameTree: {
+            frame: {
+              id: "main",
+              loaderId: "loader",
+              url: "https://approved.example/checkout",
+            },
+          },
+        });
+      }
+      if (method === "DOM.getBoxModel") {
+        return Promise.resolve({ model: { content: [0, 0, 10, 0, 10, 10, 0, 10] } });
+      }
+      return Promise.resolve({});
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([
+      [testRef(0, 1), 41],
+      [testRef(0, 2), 42],
+      [testRef(0, 3), 43],
+    ]);
+    const beforeInsert = vi.fn();
+    const beforeSubmit = vi.fn();
+
+    await expect(
+      session.submitSensitiveFields(
+        [
+          { ref: testRef(0, 1), text: "4111111111111111" },
+          { ref: testRef(0, 2), text: "123" },
+        ],
+        testRef(0, 3),
+        "https://approved.example",
+        beforeInsert,
+        beforeSubmit,
+      ),
+    ).resolves.toEqual({
+      stale: false,
+      originMismatch: false,
+      cardBytesMayHaveBeenInserted: true,
+      submissionAttempted: true,
+    });
+    expect(beforeInsert).toHaveBeenCalledTimes(2);
+    expect(beforeSubmit).toHaveBeenCalledOnce();
+    expect(
+      sendCommand.mock.calls.filter((call) => call[1] === "Input.insertText").map((call) => call[2]),
+    ).toEqual([
+      { text: "4111111111111111" },
+      { text: "123" },
+    ]);
+    expect(
+      sendCommand.mock.calls.some((call) =>
+        ["Accessibility.getFullAXTree", "Page.captureScreenshot", "Runtime.evaluate"].includes(
+          call[1] as string,
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("rechecks use-time eligibility inside the queue before the first insertion", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-31T23:59:59.999Z"));
+    let releaseBlocker!: () => void;
+    let blocked = false;
+    const sendCommand = vi.fn().mockImplementation((_target, method: string) => {
+      if (method === "DOM.focus" && !blocked) {
+        blocked = true;
+        return new Promise<void>((resolve) => {
+          releaseBlocker = resolve;
+        });
+      }
+      if (method === "Page.getFrameTree") {
+        return Promise.resolve({
+          frameTree: {
+            frame: {
+              id: "main",
+              loaderId: "loader",
+              url: "https://approved.example/checkout",
+            },
+          },
+        });
+      }
+      return Promise.resolve({});
+    });
+    vi.stubGlobal("browser", {
+      storage: {
+        session: {
+          get: vi.fn().mockResolvedValue({}),
+          set: vi.fn().mockResolvedValue(undefined),
+        },
+      },
+      debugger: { sendCommand },
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([
+      [testRef(0, 1), 41],
+      [testRef(0, 2), 42],
+      [testRef(0, 3), 43],
+    ]);
+    const blocker = session.type("queue-blocker", testRef(0, 1), "not-card-data");
+    await vi.waitFor(() => expect(blocked).toBe(true));
+    const submission = session.submitSensitiveFields(
+      [{ ref: testRef(0, 2), text: "synthetic marker" }],
+      testRef(0, 3),
+      "https://approved.example",
+      vi.fn(),
+      vi.fn(),
+      () => new Date().getUTCMonth() === 7,
+    );
+
+    await vi.advanceTimersByTimeAsync(1);
+    releaseBlocker();
+    await blocker;
+
+    await expect(submission).resolves.toEqual({
+      stale: false,
+      originMismatch: false,
+      cardBytesMayHaveBeenInserted: false,
+      submissionAttempted: false,
+      insertionRefused: true,
+    });
+    expect(
+      sendCommand.mock.calls
+        .filter((call) => call[1] === "Input.insertText")
+        .map((call) => call[2]),
+    ).toEqual([{ text: "not-card-data" }]);
+  });
+
+  it("returns a fixed insertion-unknown signal when CDP fails during input", async () => {
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string) => {
+      if (method === "Page.getFrameTree") {
+        return Promise.resolve({
+          frameTree: {
+            frame: {
+              id: "main",
+              loaderId: "loader",
+              url: "https://approved.example/checkout",
+            },
+          },
+        });
+      }
+      if (method === "Input.insertText") return Promise.reject(new Error("synthetic marker"));
+      return Promise.resolve({});
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([
+      [testRef(0, 1), 41],
+      [testRef(0, 2), 42],
+    ]);
+
+    await expect(
+      session.submitSensitiveFields(
+        [{ ref: testRef(0, 1), text: "synthetic marker" }],
+        testRef(0, 2),
+        "https://approved.example",
+        vi.fn(),
+        vi.fn(),
+      ),
+    ).resolves.toEqual({
+      stale: false,
+      originMismatch: false,
+      cardBytesMayHaveBeenInserted: true,
+      submissionAttempted: false,
+    });
+  });
+
+  it("refuses insertion when the live top-level origin changed after approval", async () => {
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string) => {
+      if (method === "Page.getFrameTree") {
+        return Promise.resolve({
+          frameTree: {
+            frame: {
+              id: "main",
+              loaderId: "loader",
+              url: "https://other.example/checkout",
+            },
+          },
+        });
+      }
+      return Promise.resolve({});
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([
+      [testRef(0, 1), 41],
+      [testRef(0, 2), 42],
+    ]);
+
+    await expect(
+      session.submitSensitiveFields(
+        [{ ref: testRef(0, 1), text: "synthetic marker" }],
+        testRef(0, 2),
+        "https://approved.example",
+        vi.fn(),
+        vi.fn(),
+      ),
+    ).resolves.toEqual({
+      stale: false,
+      originMismatch: true,
+      cardBytesMayHaveBeenInserted: false,
+      submissionAttempted: false,
+    });
+    expect(sendCommand.mock.calls.some((call) => call[1] === "Input.insertText")).toBe(false);
+  });
+
+  it("invalidates a sensitive fill when navigation changes its ref generation", async () => {
+    const sendCommand = stubActionBrowser();
+    let session!: CdpSession;
+    sendCommand.mockImplementation((_target, method: string) => {
+      if (method === "Page.getFrameTree") {
+        return Promise.resolve({
+          frameTree: {
+            frame: {
+              id: "main",
+              loaderId: "loader",
+              url: "https://approved.example/checkout",
+            },
+          },
+        });
+      }
+      if (method === "DOM.focus") void session.bumpGeneration();
+      return Promise.resolve({});
+    });
+    session = await CdpSession.create(7, TEST_SCOPE);
+    session.refMap = new Map([
+      [testRef(0, 1), 41],
+      [testRef(0, 2), 42],
+    ]);
+
+    await expect(
+      session.submitSensitiveFields(
+        [{ ref: testRef(0, 1), text: "synthetic marker" }],
+        testRef(0, 2),
+        "https://approved.example",
+        vi.fn(),
+        vi.fn(),
+      ),
+    ).resolves.toEqual({
+      stale: true,
+      originMismatch: false,
+      cardBytesMayHaveBeenInserted: false,
+      submissionAttempted: false,
+    });
+    expect(sendCommand.mock.calls.some((call) => call[1] === "Input.insertText")).toBe(false);
+  });
+});
+
 describe("CdpSession snapshot target identity", () => {
   function stubSnapshotBrowser(
     sendCommand: ReturnType<typeof vi.fn>,
@@ -845,6 +1122,74 @@ describe("CdpSession unattended containment", () => {
       { tabId: 7 },
       "Fetch.continueRequest",
       { requestId: "script" },
+    ]);
+  });
+
+  it("blocks navigation from the approved payment origin to another session-approved origin", async () => {
+    const { session, sendCommand } = await containmentSession();
+    session.mainFrameId = "main-frame";
+    await session.enableUnattendedContainment([
+      "https://approved.example",
+      "https://other.example",
+    ]);
+    session.pinSensitiveOrigin("https://approved.example");
+
+    await session.handleFetchRequestPaused({
+      requestId: "payment-redirect",
+      request: { url: "https://other.example/submit" },
+      frameId: "main-frame",
+      resourceType: "Document",
+    });
+
+    expect(sendCommand.mock.calls).toContainEqual([
+      { tabId: 7 },
+      "Fetch.failRequest",
+      { requestId: "payment-redirect", errorReason: "BlockedByClient" },
+    ]);
+  });
+
+  it("stops an already-continued navigation and blocks all new navigation until submission", async () => {
+    const { session, sendCommand } = await containmentSession();
+    session.mainFrameId = "main-frame";
+    await session.enableUnattendedContainment(["https://approved.example"]);
+    session.pinSensitiveOrigin("https://approved.example");
+    sendCommand.mockImplementation((_target, method: string) => {
+      if (method === "Page.getFrameTree") {
+        return Promise.resolve({
+          frameTree: {
+            frame: {
+              id: "main-frame",
+              loaderId: "loader",
+              url: "https://approved.example/checkout",
+            },
+          },
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    await expect(
+      session.stopPendingSensitiveNavigation("https://approved.example"),
+    ).resolves.toBe(true);
+    await session.handleFetchRequestPaused({
+      requestId: "same-origin-before-submit",
+      request: { url: "https://approved.example/redirect" },
+      frameId: "main-frame",
+      resourceType: "Document",
+    });
+
+    expect(sendCommand.mock.calls).toContainEqual([
+      { tabId: 7 },
+      "Page.stopLoading",
+      undefined,
+    ]);
+    expect(sendCommand.mock.calls).toContainEqual([
+      { tabId: 7 },
+      "Fetch.failRequest",
+      {
+        requestId: "same-origin-before-submit",
+        errorReason: "BlockedByClient",
+      },
     ]);
   });
 

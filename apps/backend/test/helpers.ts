@@ -7,7 +7,7 @@
 import { env } from "cloudflare:workers";
 import { getAgentByName } from "agents";
 import mainModule from "../src/index";
-import type { AccountDirectory } from "../src/account-directory";
+import type { AccountDirectory, SetOriginsResult } from "../src/account-directory";
 import type { SessionAgent } from "../src/session";
 
 export const BASE = "https://understudy.example";
@@ -28,6 +28,15 @@ export function getWebSocket(response: Response): WebSocket {
 /** The singleton account store — one accessor for every suite. */
 export function directory(): DurableObjectStub<AccountDirectory> {
   return env.ACCOUNT_DIRECTORY.getByName("directory");
+}
+
+export async function setUserOrigins(
+  userId: string,
+  origins: string[],
+): Promise<SetOriginsResult> {
+  const pending = await directory().beginAllowedOriginsUpdate(userId, origins);
+  if (pending.kind === "invalid") return pending;
+  return directory().commitAllowedOriginsUpdate(userId, pending.operationId);
 }
 
 /**
@@ -64,15 +73,26 @@ export interface PairedDevice {
   deviceId: string;
   deviceCredential: string;
   originPolicy: string[];
+  policyVersion: number;
   unattendedEnabled: boolean;
 }
 
-/** The code-for-credential exchange the extension's side panel drives. */
-export function claimRequest(code: string): Request {
+/** The offer-for-credential exchange the dashboard sends to the extension. */
+const TEST_PAIRING_CLAIM_ID = "c".repeat(43);
+
+export function claimRequest(
+  offer: string,
+  previousCredential?: string,
+  claimId = TEST_PAIRING_CLAIM_ID,
+): Request {
   return new Request(`${CANONICAL}/v1/pairing/claim`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code }),
+    body: JSON.stringify({
+      offer,
+      claimId,
+      ...(previousCredential === undefined ? {} : { previousCredential }),
+    }),
   });
 }
 
@@ -83,10 +103,9 @@ export function claimRequest(code: string): Request {
  * codes, reuse, expiry) drive claimRequest directly instead.
  */
 export async function pairDevice(userId: string): Promise<PairedDevice> {
-  await directory().setAllowedOrigins(userId, ["https://example.com"]);
-  const created = await directory().createPairingCode(userId);
-  if (created.kind !== "ok") throw new Error(`pairing code failed: ${created.kind}`);
-  const res = await fetchApp(claimRequest(created.code));
+  await setUserOrigins(userId, ["https://example.com"]);
+  const created = await directory().createPairingOffer(userId);
+  const res = await fetchApp(claimRequest(created.offer));
   if (!res.ok) throw new Error(`pairing claim failed: ${res.status}`);
   return (await res.json()) as PairedDevice;
 }

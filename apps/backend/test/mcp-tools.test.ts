@@ -7,23 +7,27 @@
 import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { AccountAgent, RunCommandInput, RunCommandResult } from "../src/account-agent";
+import type { Event } from "@understudy/protocol";
+import type {
+  AccountAgent,
+  McpActorRef,
+  RunCommandInput,
+  RunCommandResult,
+} from "../src/account-agent";
 import {
   mapCloseResult,
   mapGetResult,
   mapOpenResult,
   mapRunResult,
 } from "../src/mcp/outcomes";
-import { normalizePairingCode } from "../src/account-directory";
-import { taggedHmacHex } from "../src/auth";
-import { listVaultSecretNames, writeVaultSecret } from "../src/vault";
-import { directory, mintUser } from "./helpers";
+import { directory, mintUser, pairDevice } from "./helpers";
 
 const MCP_URL = "https://understudy.proofof.tech/mcp";
 
 async function mintUserToken(): Promise<{ token: string; tenantId: string; userId: string }> {
   const user = await mintUser();
-  const created = await directory().createMcpToken(user.userId, null);
+  const device = await pairDevice(user.userId);
+  const created = await directory().createMcpToken(user.userId, device.deviceId, null);
   if (created === null) throw new Error("token mint failed");
   return { token: created.token, tenantId: user.tenantId, userId: user.userId };
 }
@@ -83,7 +87,9 @@ async function mcpHandshake(token: string): Promise<string> {
   const sessionId = init.headers.get("mcp-session-id");
   if (sessionId === null) throw new Error("no mcp-session-id header");
   const parsed = await parseMcp(init);
-  expect((parsed.result as { instructions?: string }).instructions).toContain("SINGLE-USE");
+  expect((parsed.result as { instructions?: string }).instructions).toContain(
+    "current attachment and snapshot generation",
+  );
   await mcpPost(
     token,
     { jsonrpc: "2.0", method: "notifications/initialized" },
@@ -131,9 +137,8 @@ describe("MCP tool catalog over streamable HTTP", () => {
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       "browser_click",
       "browser_close",
-      "browser_fill_secret",
       "browser_get_result",
-      "browser_list_secrets",
+      "browser_list_cards",
       "browser_navigate",
       "browser_open",
       "browser_press_key",
@@ -141,6 +146,7 @@ describe("MCP tool catalog over streamable HTTP", () => {
       "browser_scroll",
       "browser_snapshot",
       "browser_status",
+      "browser_submit_card",
       "browser_type",
       "browser_wait",
     ]);
@@ -156,25 +162,21 @@ describe("MCP tool catalog over streamable HTTP", () => {
     expect(result.content[0]?.text).toContain("browser_open");
   });
 
-  it("points browser_open at the pairing flow when no device is paired", async () => {
+  it("guides browser_open when its bound browser is offline", async () => {
     const minted = await mintUserToken();
     const sessionId = await mcpHandshake(minted.token);
     const result = await callTool(minted.token, sessionId, 4, "browser_open", {});
     expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain("pairing code");
-    expect(result.content[0]?.text).toContain("dashboard");
+    expect(result.content[0]?.text).toContain("offline");
+    expect(result.content[0]?.text).toContain("open Chrome");
   });
 
-  it("keeps browser_status usable with no session and reports vault names", async () => {
+  it("keeps browser_status usable with no session", async () => {
     const minted = await mintUserToken();
     const sessionId = await mcpHandshake(minted.token);
     const status = await callTool(minted.token, sessionId, 5, "browser_status", {});
     expect(status.isError).not.toBe(true);
     expect(status.content[0]?.text).toContain("Session: none");
-
-    const secrets = await callTool(minted.token, sessionId, 6, "browser_list_secrets", {});
-    expect(secrets.isError).not.toBe(true);
-    expect(secrets.content[0]?.text).toContain("No vault secrets");
   });
 
   it("enforces browser_wait's exactly-iff ms rule in the handler", async () => {
@@ -191,29 +193,20 @@ describe("MCP tool catalog over streamable HTTP", () => {
     expect(extra.isError).toBe(true);
   });
 
-  it("refuses fill_secret names that could not be vault tails", async () => {
+  it("does not expose retired secret tools", async () => {
     const minted = await mintUserToken();
     const sessionId = await mcpHandshake(minted.token);
-    const result = await callTool(minted.token, sessionId, 9, "browser_fill_secret", {
-      ref: "a1:s0e0",
-      secret: "../other-tenant/key",
-    });
+    const result = await callTool(minted.token, sessionId, 9, "browser_fill_secret", {});
     expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain("Invalid secret name");
+    expect(result.content[0]?.text).not.toContain("secret names");
   });
 });
 
 describe("MCP cross-tenant isolation", () => {
   async function pairedTenant(): Promise<{ tenantId: string; token: string; deviceId: string }> {
     const user = await mintUser();
-    await directory().setAllowedOrigins(user.userId, ["https://example.com"]);
-    const code = await directory().createPairingCode(user.userId);
-    if (code.kind !== "ok") throw new Error("pairing code failed");
-    const claimed = await directory().claimPairingCode(
-      await taggedHmacHex(env, "pair-v1", normalizePairingCode(code.code)),
-    );
-    if (claimed.kind !== "ok") throw new Error("claim failed");
-    const created = await directory().createMcpToken(user.userId, null);
+    const claimed = await pairDevice(user.userId);
+    const created = await directory().createMcpToken(user.userId, claimed.deviceId, null);
     if (created === null) throw new Error("token failed");
     return { tenantId: user.tenantId, token: created.token, deviceId: claimed.deviceId };
   }
@@ -233,31 +226,111 @@ describe("MCP cross-tenant isolation", () => {
     // And A's AccountAgent lists exactly one device (its own), by tenant.
     const devices = await runInDurableObject(
       env.ACCOUNT.getByName(a.tenantId),
-      (instance: AccountAgent) => instance.status({ actorId: "usk:a" }),
+      (instance: AccountAgent) => instance.status({ actorId: "usk:a", deviceId: a.deviceId }),
     );
     expect(devices.devices).toHaveLength(1);
     expect(devices.devices[0]?.deviceId).toBe(a.deviceId);
   });
+});
 
-  it("builds fill_secret refs under the caller's own tenant namespace only", async () => {
-    const a = await pairedTenant();
-    // A stores a secret; a fill_secret from A targets vault://<A>/name.
-    await writeVaultSecret(env, a.tenantId, "pw", "sekret");
-    expect(await listVaultSecretNames(env, a.tenantId)).toContain("pw");
-    // A different tenant cannot see it.
-    const b = await pairedTenant();
-    expect(await listVaultSecretNames(env, b.tenantId)).not.toContain("pw");
+describe("AccountAgent device serialization", () => {
+  it("serializes one device without blocking another device", async () => {
+    const stub = env.ACCOUNT.getByName(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: AccountAgent) => {
+      const internals = instance as unknown as {
+        serialize<T>(actor: McpActorRef, task: () => Promise<T>): Promise<T>;
+        deviceTails: Map<string, Promise<void>>;
+      };
+      const firstActor = {
+        actorId: "usk:first",
+        deviceId: "00000000-0000-4000-8000-000000000001",
+      };
+      const secondActor = {
+        actorId: "usk:second",
+        deviceId: "00000000-0000-4000-8000-000000000002",
+      };
+      let releaseFirst!: () => void;
+      let markFirstStarted!: () => void;
+      const firstStarted = new Promise<void>((resolve) => {
+        markFirstStarted = resolve;
+      });
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let queuedOnFirstStarted = false;
+      const first = internals.serialize(firstActor, async () => {
+        markFirstStarted();
+        await firstGate;
+        return "first";
+      });
+      await firstStarted;
+      const queuedOnFirst = internals.serialize(firstActor, async () => {
+        queuedOnFirstStarted = true;
+        return "queued";
+      });
+      const independent = internals.serialize(secondActor, async () => "independent");
+
+      await expect(independent).resolves.toBe("independent");
+      expect(queuedOnFirstStarted).toBe(false);
+      releaseFirst();
+      await expect(Promise.all([first, queuedOnFirst])).resolves.toEqual([
+        "first",
+        "queued",
+      ]);
+      await Promise.resolve();
+      expect(internals.deviceTails.size).toBe(0);
+    });
+  });
+});
+
+describe("AccountAgent protocol-2 state migration", () => {
+  it("moves the account-wide binding only to its recorded device namespace", async () => {
+    const stub = env.ACCOUNT.getByName(`acct-${crypto.randomUUID()}`);
+    const actor: McpActorRef = {
+      actorId: "usk_v2:actor",
+      deviceId: crypto.randomUUID(),
+    };
+    await runInDurableObject(stub, async (instance: AccountAgent) => {
+      const ctx = (instance as unknown as { ctx: DurableObjectState }).ctx;
+      const binding = {
+        sessionId: "legacy-session",
+        profile: "default",
+        createKey: crypto.randomUUID(),
+        deviceId: actor.deviceId,
+        allowedOrigins: ["https://example.com"],
+        createdAt: new Date().toISOString(),
+      };
+      await ctx.storage.put("binding", binding);
+      await ctx.storage.put("refsValid", true);
+      const internals = instance as unknown as {
+        getBinding(subject: McpActorRef): Promise<typeof binding | undefined>;
+      };
+
+      await expect(
+        internals.getBinding({ ...actor, deviceId: crypto.randomUUID() }),
+      ).resolves.toBeUndefined();
+      await expect(internals.getBinding(actor)).resolves.toEqual(binding);
+
+      await expect(ctx.storage.get("binding")).resolves.toBeUndefined();
+      await expect(ctx.storage.get(`binding:${actor.deviceId}`)).resolves.toEqual(binding);
+      await expect(ctx.storage.get(`refsValid:${actor.deviceId}`)).resolves.toBe(true);
+    });
   });
 });
 
 describe("AccountAgent ref-staleness guard", () => {
+  const actor: McpActorRef = {
+    actorId: "usk:test",
+    deviceId: "00000000-0000-4000-8000-000000000001",
+  };
+
   async function seedBinding(
     stub: DurableObjectStub<AccountAgent>,
     refsValid: boolean,
   ): Promise<void> {
     await runInDurableObject(stub, async (instance: AccountAgent) => {
       const ctx = (instance as unknown as { ctx: DurableObjectState }).ctx;
-      await ctx.storage.put("binding", {
+      await ctx.storage.put(`binding:${actor.deviceId}`, {
         sessionId: "not-a-real-session",
         profile: "default",
         createKey: crypto.randomUUID(),
@@ -265,7 +338,7 @@ describe("AccountAgent ref-staleness guard", () => {
         allowedOrigins: ["https://example.com"],
         createdAt: new Date().toISOString(),
       });
-      await ctx.storage.put("refsValid", refsValid);
+      await ctx.storage.put(`refsValid:${actor.deviceId}`, refsValid);
     });
   }
 
@@ -278,7 +351,7 @@ describe("AccountAgent ref-staleness guard", () => {
 
     // #when a click arrives
     const envelope = await stub.runCommand(
-      { actorId: "usk:test" },
+      actor,
       {
         tool: "browser_click",
         draft: { type: "click", ref: "a1:s0e0" },
@@ -295,7 +368,7 @@ describe("AccountAgent ref-staleness guard", () => {
     const stub = env.ACCOUNT.getByName(`acct-${crypto.randomUUID()}`);
     await seedBinding(stub, false);
     const envelope = await stub.runCommand(
-      { actorId: "usk:test" },
+      actor,
       {
         tool: "browser_navigate",
         draft: { type: "navigate", url: "https://example.com/" },
@@ -314,7 +387,15 @@ describe("AccountAgent ref-staleness guard", () => {
     await runInDurableObject(stub, async (instance: AccountAgent) => {
       const internals = instance as unknown as {
         ctx: DurableObjectState;
-        applyRefBookkeeping(input: RunCommandInput, result: RunCommandResult): Promise<void>;
+        applyRefBookkeeping(
+          actor: McpActorRef,
+          input: RunCommandInput,
+          result: RunCommandResult,
+        ): Promise<void>;
+        applyPolledEventBookkeeping(
+          actor: McpActorRef,
+          event: Extract<Event, { type: "card_submission_result" }>,
+        ): Promise<void>;
       };
       const clickInput: RunCommandInput = {
         tool: "browser_click",
@@ -325,14 +406,15 @@ describe("AccountAgent ref-staleness guard", () => {
 
       // OUTCOME UNKNOWN forces refs stale, so the snapshot instruction is
       // enforced rather than requested.
-      await internals.applyRefBookkeeping(clickInput, {
+      await internals.applyRefBookkeeping(actor, clickInput, {
         kind: "unknown_outcome",
         commandId: "c1",
       });
-      expect(await internals.ctx.storage.get("refsValid")).toBe(false);
+      expect(await internals.ctx.storage.get(`refsValid:${actor.deviceId}`)).toBe(false);
 
       // A successful a11y snapshot restores validity and bumps the epoch.
       await internals.applyRefBookkeeping(
+        actor,
         {
           tool: "browser_snapshot",
           draft: { type: "snapshot", mode: "a11y" },
@@ -350,11 +432,12 @@ describe("AccountAgent ref-staleness guard", () => {
           },
         },
       );
-      expect(await internals.ctx.storage.get("refsValid")).toBe(true);
-      expect(await internals.ctx.storage.get("refsEpoch")).toBe(1);
+      expect(await internals.ctx.storage.get(`refsValid:${actor.deviceId}`)).toBe(true);
+      expect(await internals.ctx.storage.get(`refsEpoch:${actor.deviceId}`)).toBe(1);
 
       // A successful navigation invalidates every ref.
       await internals.applyRefBookkeeping(
+        actor,
         {
           tool: "browser_navigate",
           draft: { type: "navigate", url: "https://example.com/next" },
@@ -366,7 +449,46 @@ describe("AccountAgent ref-staleness guard", () => {
           event: { type: "action_result", commandId: "c3", ok: true },
         },
       );
-      expect(await internals.ctx.storage.get("refsValid")).toBe(false);
+      expect(await internals.ctx.storage.get(`refsValid:${actor.deviceId}`)).toBe(false);
+
+      const cardInput: RunCommandInput = {
+        tool: "browser_submit_card",
+        draft: {
+          type: "submit_card",
+          cardAlias: "work",
+          numberRef: "a1:s0e1",
+          expiry: { kind: "combined", ref: "a1:s0e2" },
+          cvvRef: "a1:s0e3",
+          submitRef: "a1:s0e4",
+        },
+        write: true,
+        usesRef: true,
+      };
+      const preflightResult = {
+        type: "card_submission_result",
+        commandId: "c4",
+        status: "not_started",
+        reason: "stale_ref",
+      } as const;
+      await internals.applyRefBookkeeping(actor, cardInput, {
+        kind: "terminal",
+        event: preflightResult,
+      });
+      expect(await internals.ctx.storage.get(`binding:${actor.deviceId}`)).toBeDefined();
+      expect(await internals.ctx.storage.get(`refsValid:${actor.deviceId}`)).toBe(false);
+
+      await internals.applyPolledEventBookkeeping(actor, preflightResult);
+      expect(await internals.ctx.storage.get(`binding:${actor.deviceId}`)).toBeDefined();
+
+      // A card result collected after the synchronous poll budget closes the
+      // binding just like a result returned by the original tool call.
+      await internals.applyPolledEventBookkeeping(actor, {
+        type: "card_submission_result",
+        commandId: "c5",
+        status: "outcome_unknown",
+        reason: "submission_attempted",
+      });
+      expect(await internals.ctx.storage.get(`binding:${actor.deviceId}`)).toBeUndefined();
     });
   });
 });
@@ -402,7 +524,7 @@ describe("outcome mapping", () => {
 
     expect(textOf(run({ kind: "busy_exhausted" }))).toContain("one command runs at a time");
     expect(textOf(run({ kind: "not_connected" }))).toContain("offline");
-    expect(textOf(run({ kind: "unsupported" }))).toContain("safe-write v2");
+    expect(textOf(run({ kind: "unsupported" }))).toContain("protocol-3");
     expect(textOf(run({ kind: "terminal_session" }))).toContain("logins are preserved");
     expect(textOf(run({ kind: "id_conflict", commandId: "c" }))).toContain(
       "was not performed",
@@ -476,7 +598,7 @@ describe("outcome mapping", () => {
     const text = textOf(snapshot);
     expect(text).toContain("UNTRUSTED PAGE CONTENT");
     expect(text).toContain('button "Sign in" [ref=a1:s0e0]');
-    expect(text).toContain("SINGLE-USE");
+    expect(text).toContain("snapshot generation");
 
     const shot = run(
       {
@@ -497,7 +619,7 @@ describe("outcome mapping", () => {
   });
 
   it("maps open/close/get_result helper outcomes", () => {
-    expect(textOf(mapOpenResult({ kind: "no_paired_devices" }))).toContain("pairing code");
+    expect(textOf(mapOpenResult({ kind: "no_paired_devices" }))).toContain("pairing offer");
     expect(
       textOf(
         mapOpenResult({

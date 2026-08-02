@@ -4,8 +4,16 @@ import type { Connection, ConnectionContext } from "agents";
 import { PROTOCOL_CAPABILITIES, PROTOCOL_VERSION } from "@understudy/protocol";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { mintWsTicket, type DeviceIdentity } from "../src/auth";
+import { mintWsTicket, sha256Hex, type DeviceIdentity } from "../src/auth";
 import type { DeviceAgent } from "../src/device";
+import {
+  claimRequest,
+  directory,
+  fetchApp,
+  mintUser,
+  pairDevice,
+  setUserOrigins,
+} from "./helpers";
 
 const TENANT_ID = "tenantA";
 
@@ -19,6 +27,8 @@ function identity(
     deviceId,
     credentialVersion: version,
     credentialDigest: digestByte.repeat(64),
+    allowedOrigins: ["https://example.com"],
+    policyVersion: 1,
   };
 }
 
@@ -36,6 +46,8 @@ async function ticket(
       leaseEpoch: 0,
       browserEpoch,
       agentName: deviceId,
+      allowedOrigins: ["https://example.com"],
+      policyVersion: 1,
     },
     env,
   );
@@ -71,6 +83,249 @@ function context(deviceId: string, ticketValue: string): ConnectionContext {
 }
 
 describe("DeviceAgent authority fencing", () => {
+  it("rejects a connect ticket minted before the directory policy changed", async () => {
+    const user = await mintUser();
+    const paired = await pairDevice(user.userId);
+    const browserEpoch = "stale-policy-ticket";
+    const digest = await sha256Hex(paired.deviceCredential);
+    const staleTicket = await mintWsTicket(
+      {
+        aud: "device-control",
+        tenantId: user.tenantId,
+        deviceId: paired.deviceId,
+        credentialVersion: 1,
+        leaseEpoch: 0,
+        browserEpoch,
+        agentName: paired.deviceId,
+        allowedOrigins: paired.originPolicy,
+        policyVersion: paired.policyVersion,
+      },
+      env,
+    );
+    const stub = await getAgentByName(env.DEVICE, paired.deviceId);
+    const candidate = fakeConnection("stale-policy-ticket");
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      await instance.authorizeCredential({
+        tenantId: user.tenantId,
+        deviceId: paired.deviceId,
+        credentialVersion: 1,
+        credentialDigest: digest,
+        allowedOrigins: paired.originPolicy,
+        policyVersion: paired.policyVersion,
+      });
+    });
+    await setUserOrigins(user.userId, ["https://new.example"]);
+
+    await runInDurableObject(stub, (instance: DeviceAgent) =>
+      instance.onConnect(candidate.connection, context(paired.deviceId, staleTicket)),
+    );
+
+    expect(candidate.close).toHaveBeenCalledWith(
+      1008,
+      "invalid or replayed device ticket",
+    );
+  });
+
+  it("retries a committed policy push on the next heartbeat", async () => {
+    const user = await mintUser();
+    const paired = await pairDevice(user.userId);
+    const browserEpoch = "policy-retry-browser";
+    const digest = await sha256Hex(paired.deviceCredential);
+    const deviceTicket = await mintWsTicket(
+      {
+        aud: "device-control",
+        tenantId: user.tenantId,
+        deviceId: paired.deviceId,
+        credentialVersion: 1,
+        leaseEpoch: 0,
+        browserEpoch,
+        agentName: paired.deviceId,
+        allowedOrigins: paired.originPolicy,
+        policyVersion: paired.policyVersion,
+      },
+      env,
+    );
+    const stub = await getAgentByName(env.DEVICE, paired.deviceId);
+    const candidate = fakeConnection("policy-retry");
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => [candidate.connection] });
+      await instance.authorizeCredential({
+        tenantId: user.tenantId,
+        deviceId: paired.deviceId,
+        credentialVersion: 1,
+        credentialDigest: digest,
+        allowedOrigins: paired.originPolicy,
+        policyVersion: paired.policyVersion,
+      });
+      await instance.onConnect(
+        candidate.connection,
+        context(paired.deviceId, deviceTicket),
+      );
+      await instance.onMessage(
+        candidate.connection,
+        JSON.stringify({
+          type: "device_hello",
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: [...PROTOCOL_CAPABILITIES],
+          deviceId: paired.deviceId,
+          browserEpoch,
+          browser: "Chrome/125",
+          extVersion: "0.2.0",
+          allowedOrigins: paired.originPolicy,
+          policyVersion: paired.policyVersion,
+          assignments: [],
+          ownedWindows: [],
+        }),
+      );
+    });
+    candidate.send.mockClear();
+
+    const targetOrigins = ["https://new.example"];
+    const pending = await directory().beginAllowedOriginsUpdate(
+      user.userId,
+      targetOrigins,
+    );
+    if (pending.kind !== "ok") throw new Error("policy update did not begin");
+    const coordinator = env.TENANT_CONTROL.getByName(user.tenantId);
+    for (const device of pending.devices) {
+      await coordinator.updateDevicePolicy({
+        deviceId: device.deviceId,
+        policyVersion: device.policyVersion,
+        allowedOrigins: targetOrigins,
+        narrowing: device.narrowing,
+      });
+    }
+    const committed = await directory().commitAllowedOriginsUpdate(
+      user.userId,
+      pending.operationId,
+    );
+    if (committed.kind !== "ok") throw new Error("policy update did not commit");
+
+    await runInDurableObject(stub, (instance: DeviceAgent) =>
+      instance.onMessage(
+        candidate.connection,
+        JSON.stringify({
+          type: "heartbeat",
+          deviceId: paired.deviceId,
+          browserEpoch,
+          assignments: [],
+          ownedWindows: [],
+        }),
+      ),
+    );
+
+    expect(candidate.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "policy_update",
+        policyVersion: 2,
+        allowedOrigins: targetOrigins,
+      }),
+    );
+  });
+
+  it("advances coordinator policy before pushing a changed static policy", async () => {
+    const credential = `static-${crypto.randomUUID()}`;
+    const credentialDigest = await sha256Hex(credential);
+    const deviceId = crypto.randomUUID();
+    const tenantId = `static-${crypto.randomUUID()}`;
+    const browserEpoch = crypto.randomUUID();
+    const initialOrigins = ["https://one.example", "https://two.example"];
+    const targetOrigins = ["https://two.example"];
+    const staticTokens = (allowedOrigins: string[], policyVersion: number) =>
+      JSON.stringify({
+        [credentialDigest]: {
+          tenantId,
+          deviceId,
+          credentialVersion: 1,
+          allowedOrigins,
+          policyVersion,
+        },
+      });
+    const previousTokens = env.DEVICE_TOKENS;
+    Reflect.set(env, "DEVICE_TOKENS", staticTokens(initialOrigins, 1));
+    try {
+      const deviceTicket = await mintWsTicket(
+        {
+          aud: "device-control",
+          tenantId,
+          deviceId,
+          credentialVersion: 1,
+          leaseEpoch: 0,
+          browserEpoch,
+          agentName: deviceId,
+          allowedOrigins: initialOrigins,
+          policyVersion: 1,
+        },
+        env,
+      );
+      const stub = await getAgentByName(env.DEVICE, deviceId);
+      const candidate = fakeConnection("static-policy-update");
+      await runInDurableObject(stub, async (instance: DeviceAgent) => {
+        Object.assign(instance, { getConnections: () => [candidate.connection] });
+        await instance.authorizeCredential({
+          tenantId,
+          deviceId,
+          credentialVersion: 1,
+          credentialDigest,
+          allowedOrigins: initialOrigins,
+          policyVersion: 1,
+        });
+        await instance.onConnect(
+          candidate.connection,
+          context(deviceId, deviceTicket),
+        );
+        await instance.onMessage(
+          candidate.connection,
+          JSON.stringify({
+            type: "device_hello",
+            protocolVersion: PROTOCOL_VERSION,
+            capabilities: [...PROTOCOL_CAPABILITIES],
+            deviceId,
+            browserEpoch,
+            browser: "Chrome/125",
+            extVersion: "0.2.0",
+            allowedOrigins: initialOrigins,
+            policyVersion: 1,
+            assignments: [],
+            ownedWindows: [],
+          }),
+        );
+      });
+      candidate.send.mockClear();
+
+      Reflect.set(env, "DEVICE_TOKENS", staticTokens(targetOrigins, 3));
+      await runInDurableObject(stub, (instance: DeviceAgent) =>
+        instance.onMessage(
+          candidate.connection,
+          JSON.stringify({
+            type: "heartbeat",
+            deviceId,
+            browserEpoch,
+            assignments: [],
+            ownedWindows: [],
+          }),
+        ),
+      );
+
+      expect(candidate.send).toHaveBeenCalledWith(
+        JSON.stringify({
+          type: "policy_update",
+          policyVersion: 3,
+          allowedOrigins: targetOrigins,
+        }),
+      );
+      await expect(env.TENANT_CONTROL.getByName(tenantId).listDevices()).resolves.toEqual([
+        expect.objectContaining({
+          deviceId,
+          policyVersion: 3,
+          acknowledgedPolicyVersion: null,
+        }),
+      ]);
+    } finally {
+      Reflect.set(env, "DEVICE_TOKENS", previousTokens);
+    }
+  });
+
   it("rejects an unconsumed ticket after its credential version rotates", async () => {
     const deviceId = crypto.randomUUID();
     const stub = await getAgentByName(env.DEVICE, deviceId);
@@ -155,7 +410,10 @@ describe("DeviceAgent authority fencing", () => {
           browserEpoch,
           browser: "Chrome/125",
           extVersion: "0.1.0",
-          allowedOrigins: ["https://app.example"],
+          allowedOrigins: ["https://example.com"],
+          policyVersion: 1,
+          assignments: [],
+          ownedWindows: [],
         }),
       );
     });
@@ -166,7 +424,7 @@ describe("DeviceAgent authority fencing", () => {
       fingerprint: "f".repeat(64),
       sessionId: `session-${crypto.randomUUID()}`,
       deviceId,
-      allowedOrigins: ["https://app.example"],
+      allowedOrigins: ["https://example.com"],
       profileStateHash: crypto.randomUUID(),
       actorPseudonym: "actor",
     });
@@ -217,7 +475,7 @@ describe("DeviceAgent authority fencing", () => {
         fingerprint: "e".repeat(64),
         sessionId: `session-${crypto.randomUUID()}`,
         deviceId,
-        allowedOrigins: ["https://app.example"],
+        allowedOrigins: ["https://example.com"],
         profileStateHash: crypto.randomUUID(),
         actorPseudonym: "actor",
       });
@@ -260,6 +518,102 @@ describe("DeviceAgent authority fencing", () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe("DeviceAgent credential rotation recovery", () => {
+  it("does not terminalize leases while the extension replays a lost rotation response", async () => {
+    const user = await mintUser();
+    const paired = await pairDevice(user.userId);
+    const browserEpoch = "rotation-browser";
+    const candidate = fakeConnection("rotation-old-credential");
+    const stub = await getAgentByName(env.DEVICE, paired.deviceId);
+    const deviceIdentity: DeviceIdentity = {
+      tenantId: user.tenantId,
+      deviceId: paired.deviceId,
+      credentialVersion: 1,
+      credentialDigest: await sha256Hex(paired.deviceCredential),
+      allowedOrigins: ["https://example.com"],
+      policyVersion: 1,
+    };
+    const deviceTicket = await mintWsTicket(
+      {
+        aud: "device-control",
+        tenantId: user.tenantId,
+        deviceId: paired.deviceId,
+        credentialVersion: 1,
+        leaseEpoch: 0,
+        browserEpoch,
+        agentName: paired.deviceId,
+        allowedOrigins: deviceIdentity.allowedOrigins,
+        policyVersion: 1,
+      },
+      env,
+    );
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      Object.assign(instance, { getConnections: () => [candidate.connection] });
+      await instance.authorizeCredential(deviceIdentity);
+      await instance.onConnect(
+        candidate.connection,
+        context(paired.deviceId, deviceTicket),
+      );
+      await instance.onMessage(
+        candidate.connection,
+        JSON.stringify({
+          type: "device_hello",
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: [...PROTOCOL_CAPABILITIES],
+          deviceId: paired.deviceId,
+          browserEpoch,
+          browser: "Chrome/125",
+          extVersion: "0.2.0",
+          allowedOrigins: deviceIdentity.allowedOrigins,
+          policyVersion: 1,
+          assignments: [],
+          ownedWindows: [],
+        }),
+      );
+    });
+    const coordinator = env.TENANT_CONTROL.getByName(user.tenantId);
+    const allocation = await coordinator.createLease({
+      idempotencyKey: crypto.randomUUID(),
+      fingerprint: "a".repeat(64),
+      sessionId: `session-${crypto.randomUUID()}`,
+      deviceId: paired.deviceId,
+      allowedOrigins: ["https://example.com"],
+      profileStateHash: "rotation-profile",
+      actorPseudonym: "rotation-actor",
+    });
+    if (allocation.kind !== "created") throw new Error("expected created lease");
+    const offer = await directory().createPairingOffer(user.userId);
+    expect(
+      (await fetchApp(claimRequest(offer.offer, paired.deviceCredential))).status,
+    ).toBe(200);
+
+    await runInDurableObject(stub, async (instance: DeviceAgent) => {
+      await instance.onMessage(
+        candidate.connection,
+        JSON.stringify({
+          type: "heartbeat",
+          deviceId: paired.deviceId,
+          browserEpoch,
+          assignments: [],
+          ownedWindows: [],
+        }),
+      );
+    });
+
+    expect(candidate.send).not.toHaveBeenCalledWith(
+      JSON.stringify({ type: "credential_revoked" }),
+    );
+    expect(candidate.close).not.toHaveBeenCalledWith(
+      1008,
+      "device credential revoked",
+    );
+    await expect(coordinator.getLease(allocation.lease.sessionId)).resolves.toMatchObject({
+      status: "provisioning",
+      adoptionExpiresAt: null,
+    });
   });
 });
 
@@ -322,8 +676,7 @@ describe("DeviceAgent credential revocation kill switch", () => {
       await expect(instance.revokeCredential(TENANT_ID)).resolves.toBe("no_socket");
     });
 
-    // #then the still-valid credential is refused — this is what defeats the
-    // Worker's 60 s positive cache, which would otherwise re-mint a ticket
+    // #then the persisted marker also refuses an already-minted ticket
     await runInDurableObject(stub, async (instance: DeviceAgent) => {
       expect(instance.state.credentialRevoked).toBe(true);
       await expect(
@@ -464,7 +817,7 @@ describe("DeviceAgent credential revocation kill switch", () => {
       );
     });
 
-    // #then it dies on that frame rather than riding out the cache window
+    // #then it dies on that frame rather than remaining connected until timeout
     expect(residue.send).toHaveBeenLastCalledWith(
       JSON.stringify({ type: "credential_revoked" }),
     );

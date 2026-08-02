@@ -1,170 +1,110 @@
 <!-- Content type: Reference -->
 
-# Submit Understudy Beta to the Chrome Web Store
+# Submit Understudy 0.2.0 to the Chrome Web Store
 
-This reference contains the exact dashboard copy, disclosures, reviewer flow, and asset paths for the first unlisted Understudy Beta submission. Do not submit until the hosted privacy URL returns `200`.
-
-## Block submission until the privacy page is live
-
-The submission is blocked until this command succeeds:
-
-```bash
-curl --fail --show-error --silent \
-  https://understudy.proofof.tech/privacy > /dev/null
-```
-
-The code in this repository does not deploy the backend or upload the extension.
-
-## Upload the package
-
-Build and inspect the store package from the repository root:
+Build and inspect the store artifact before upload:
 
 ```bash
 pnpm --filter @understudy/extension build:store
 pnpm --filter @understudy/extension zip:store
-zipinfo -1 apps/extension/.output/understudyextension-0.1.2-chrome-store.zip
+zipinfo -1 apps/extension/.output/understudyextension-0.2.0-chrome-store.zip
+curl --fail --silent --show-error https://understudy.proofof.tech/privacy >/dev/null
 ```
 
-Upload `apps/extension/.output/understudyextension-0.1.2-chrome-store.zip`. Confirm `manifest.json` is at the archive root before uploading.
+Confirm `manifest.json` is at the archive root. Distribution is unlisted, free,
+all regions, category Productivity → Tools.
 
-## Enter distribution settings
+## Listing copy
 
-- **Payments**: Free
-- **Contains in-app purchases**: No
-- **Visibility**: Unlisted
-- **Regions**: All regions
+**Title:** Understudy Beta
 
-These payment declarations describe the current beta, which has no billing flow. An unlisted item does not appear in Chrome Web Store search, but anyone with its listing URL can install it. Unlisted items receive the same policy review as public items.
+**Short description:** Pair Chrome with Understudy so an authorized AI client
+can operate controlled tabs on exact origins you allow.
 
-To introduce paid hosted-service plans later:
-
-1. Keep the extension installation free. Charge for a separate Understudy hosted-service subscription, not for extension copies that users installed during the free beta.
-2. Change **Contains in-app purchases** to **Yes** before enabling paid access.
-3. Update the listing with the subscription requirement, price, trial terms, and cancellation path.
-4. Add the required business or physical address to the developer account.
-5. Update the privacy declarations if the billing flow handles new data, then submit the changes for review.
-
-## Enter store listing details
-
-- **Language**: English
-- **Category**: Productivity → Tools
-- **Title**: Understudy Beta
-- **Short description**: BETA: Pair Chrome with Understudy so your authorized AI client can operate tabs on sites you allow.
-- **Official URL**: Select the verified `https://proofoftech.org/` entry. Leave this optional field blank if the dashboard does not offer it.
-- **Homepage URL**: `https://understudy.proofof.tech/dashboard`
-- **Support URL**: `https://github.com/ProofOfTechOrg/understudy/issues`
-- **Privacy policy URL**: `https://understudy.proofof.tech/privacy`
-- **Mature content**: No
-- **Promotional video**: Leave blank
-- **Marquee promo tile**: Leave blank
-
-Use this detailed description:
+**Detailed description:**
 
 ```text
-THIS EXTENSION IS FOR BETA TESTING.
+UNDERSTUDY IS BETA SOFTWARE.
 
-Understudy Beta pairs a dedicated Chrome profile with the hosted Understudy service. After you approve a one-time pairing code, an AI client you authorize can open and operate controlled tabs on the website origins you allow.
+Understudy pairs a dedicated Chrome profile with the hosted Understudy service. An AI client you authorize can open and operate extension-owned tabs only on exact website origins you allow.
 
-Understudy Beta is currently available at no charge for testing. Hosted-service plans and pricing may be introduced after the beta.
+Pairing is approved directly between the Understudy dashboard and the installed extension. The side panel shows device and policy state, controlled-window inventory, connection recovery, an emergency stop, and a local troubleshooting log.
 
-The side panel shows pairing and connection status, controlled-tab capacity, an emergency Stop hosting control, and a local troubleshooting log. The Chrome Web Store build connects only to https://understudy.proofof.tech.
+The optional payment-card vault is stored only in this extension's local IndexedDB. Card fields are encrypted with a non-extractable local key and are never sent to the Understudy backend. Card submission requires both the dashboard origin policy and a separate local payment-origin approval. After card data is inserted, Understudy reports only that the outcome is unknown and closes the controlled tab.
 
-Understudy does not choose tasks or approve actions. Your connected AI client requests browser actions, while you control the paired browser, allowed origins, API credentials, and revocation controls.
+Understudy does not choose tasks or approve actions. Your connected AI client selects page elements and requests actions. You control pairing, allowed origins, local cards, API or OAuth connections, and device revocation.
 
-This beta can handle page URLs and titles, website content, accessibility trees, screenshots, dialogs, requested input actions, browser metadata, status, errors, and command results when needed to perform authorized browser work. Review the privacy policy before pairing.
+For ordinary browser work the service may handle controlled-tab URLs and titles, website content, accessibility trees, screenshots, dialogs, requested input actions, browser metadata, status, errors, and command results. From payment sensitive-mode entry onward those observation channels are suppressed.
 
-Use a dedicated Chrome profile for beta testing. Controlled tabs in one profile share that profile’s cookies and browser storage.
+Use a dedicated Chrome profile. Controlled tabs in one profile share that profile's cookies and browser storage. Chrome's debugger banner is process-wide and cannot be suppressed by an extension.
 ```
 
-## Upload graphic assets
+Homepage: `https://understudy.proofof.tech/dashboard`
 
-Upload these files:
+Support: `https://github.com/ProofOfTechOrg/understudy/issues`
 
-- **Store icon, 128 × 128 PNG**: `public/icon-128.png`
-- **Small promo tile, 440 × 280 PNG**: `store-assets/small-promo-440x280.png`
-- **First-run screenshot, 1280 × 800 PNG**: `store-assets/screenshot-first-run-1280x800.png`
+Privacy: `https://understudy.proofof.tech/privacy`
 
-The vector source is `store-assets/understudy-mark.svg`. Do not add a connected-state screenshot unless it was captured from a real paired profile.
-
-## Enter the single-purpose statement
-
-Use this text:
+Single purpose:
 
 ```text
-Pair Chrome with the hosted Understudy service so an AI client the user authorizes can operate controlled tabs only on website origins the user allows.
+Pair Chrome with Understudy so an AI client the user authorizes can operate extension-owned tabs only on website origins the user allows, including optional submission of locally encrypted cards on separately approved payment origins.
 ```
 
-## Justify each permission
+## Permissions
 
-Use these permission justifications:
+- `debugger`: attach CDP only to extension-owned controlled tabs for requested
+  page observation and actions.
+- `storage`: retain the device credential and policy state, the physical-window
+  and recovery registry, and the encrypted local card vault with its
+  non-extractable key.
+- `alarms`: provide a Manifest V3 wake-up backstop for connection recovery,
+  policy/inventory reconciliation, and exact controlled-window cleanup.
+- `sidePanel`: pair, show connection and policy state, stop hosting, and manage
+  local cards and payment origins.
+- `https://understudy.proofof.tech/*`: receive direct one-time pairing offers,
+  request short-lived connect tickets, and exchange validated control/session
+  frames over HTTPS and WSS.
 
-- **debugger**: Understudy attaches the Chrome DevTools Protocol only to extension-created controlled tabs. It uses that connection to read the requested page state, take screenshots, handle dialogs, and perform authorized navigation and input actions. This is the extension’s core browser-control function.
-- **storage**: Understudy stores pairing configuration and device credentials in restricted extension storage. Browser-session storage holds lease, recovery, acknowledgement, and emergency-stop state needed to avoid duplicate actions and recover safely from Manifest V3 service-worker suspension.
-- **alarms**: Understudy uses a 30-second alarm as a Manifest V3 wake-up backstop for connection recovery and confirmed cleanup of controlled tabs. It does not use alarms for advertising, tracking, or unrelated background work.
-- **sidePanel**: Understudy uses Chrome’s side panel for pairing, hosted connection status, controlled-tab capacity, emergency stop, troubleshooting, privacy, and support.
-- **Host permission, `https://understudy.proofof.tech/*`**: The store build uses this single origin to redeem pairing codes, request short-lived connection tickets, and exchange validated control and session data with the hosted Understudy service over HTTPS and secure WebSockets.
+The package requests neither `tabs` nor `activeTab`. Select **No remote code**:
+all executable code is bundled; remote commands are validated data, not code.
 
-The package intentionally does not request `tabs` or `activeTab`.
+## Data-use declarations
 
-## Declare remote code
+Declare, conservatively:
 
-Select **No, I am not using remote code**.
+- Personally identifiable information
+- Authentication information
+- Financial and payment information
+- Web history
+- User activity
+- Website content
+- Personal communications
 
-Use this explanation if the dashboard presents a text field:
+The local card vault handles payment information even though its plaintext,
+ciphertext, and key do not cross the extension boundary. Do not claim that
+local-only storage removes the category. Confirm the privacy policy states that
+Understudy does not sell data, use it for advertising, or permit routine human
+review.
+
+## Reviewer flow
+
+Do not provide a shared API token, pairing offer, mailbox password, card, or
+personal login. The reviewer uses temporary data.
 
 ```text
-All executable extension code is bundled in the uploaded Manifest V3 package. Understudy receives validated data and browser-control commands over HTTPS and secure WebSockets, but it does not download or execute JavaScript, WebAssembly, or other code from a remote source.
+1. Install the extension and open its side panel. While unpaired it remains idle.
+2. Open the dashboard from the panel and sign in with an email address you control.
+3. Add https://example.com to the default origins.
+4. Choose Pair this browser. The installed extension receives and redeems the one-time offer directly; no code is copied.
+5. Create a browser-bound API token or connect an OAuth-capable MCP client to https://understudy.proofoftech/mcp and select this device at consent.
+6. Ask the client to open https://example.com. The panel reports one controlled window.
+7. Add a synthetic test card in the side panel and approve https://example.com as a payment origin. Card details stay in local encrypted extension storage.
+8. Delete the card. Choose Stop hosting and confirm that the controlled window closes.
+9. Revoke the device in the dashboard. Existing API and OAuth access for that device fails immediately.
+
+Chrome's debugger banner is process-wide. Dismissing it can detach a controlled tab and does not identify which tab is controlled.
 ```
 
-## Select data-use categories conservatively
-
-Select these categories:
-
-- **Personally identifiable information**: Account email and persistent device or session identifiers are handled by the paired hosted service.
-- **Authentication information**: Pairing codes, device credentials, API credentials, browser authentication state, and requested credential-fill actions may be handled.
-- **Web history**: Controlled-tab URLs and titles are handled to report and operate the requested page.
-- **User activity**: Requested clicks, keyboard input, form input, scrolling, navigation, and dialog actions are handled.
-- **Website content**: Page content, accessibility trees, screenshots, dialogs, and command results are handled.
-- **Personal communications**: Controlled website content or requested input may include communications when the authorized client operates a communications site.
-
-Do not select health, financial, payment, or location categories unless the submitted beta intentionally adds a feature that collects those categories outside the general website-content handling disclosed above.
-
-Certify every limited-use statement only after confirming the privacy policy and package behavior still match these disclosures. Understudy does not sell data, use data for advertising, or allow routine human review of user data.
-
-## Enter reviewer test instructions
-
-Complete the optional **Test instructions** tab because pairing and external-client setup are not self-evident. The reviewer does not need a shared account.
-
-- **Username**: Leave blank. Enter `Not required` if the field requires a value.
-- **Password**: Leave blank. Enter `Not required` if the field requires a value.
-- **Other instructions**: Paste the following text.
-
-```text
-No pre-provisioned credentials are required. Understudy uses passwordless email sign-in.
-
-1. Install the extension and click its toolbar icon. The Understudy side panel opens.
-2. Leave the extension unpaired. It must remain idle without localhost or other failed connection attempts.
-3. Select Open dashboard and enter any email address you can access. Enter the 6-digit one-time code delivered to that address.
-4. Add https://example.com under Allowed origins and generate a browser pairing code.
-5. Enter the code in the extension. The panel shows Connecting, then Connected.
-6. Create an API token in the dashboard. Configure a Model Context Protocol (MCP) client for https://understudy.proofof.tech/mcp.
-7. Ask the client to open https://example.com. Chrome creates a controlled tab, and the panel shows 1 / 2 controlled tabs.
-8. Select Stop hosting and confirm. The controlled session ends, and the panel shows Paused.
-9. Generate a fresh pairing code to resume. Pairing codes are single-use.
-
-Chrome’s debugger banner is process-wide. Dismissing it in any Chrome window can detach a controlled tab. The banner does not identify which tab is controlled.
-```
-
-Do not provide a shared application programming interface (API) token, pairing code, mailbox password, or personal login. Reviewers generate temporary credentials during testing.
-
-## Complete the manual release checks
-
-Before uploading:
-
-1. Run every command in the automated verification section of `RUNBOOK.md`.
-2. Complete the store-build Chrome acceptance flow in `RUNBOOK.md`.
-3. Confirm the privacy and support links open the intended public pages.
-4. Confirm the screenshot matches the uploaded build.
-5. Confirm the hosted privacy URL returns `200`.
-
-Production deployment and the Chrome Web Store upload remain manual operations.
+Upload only after the full automated gate and the real-Chrome acceptance flow
+in `RUNBOOK.md` pass. Store submission is a manual external mutation.

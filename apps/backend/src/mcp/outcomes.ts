@@ -103,9 +103,12 @@ function mapTerminalEvent(
       renderTree(event.tree, 0, lines);
       const body = lines.length === 0 ? "(empty accessibility tree)" : lines.join("\n");
       return textResult(
-        `Page snapshot of ${event.url}\n` +
-          `${untrusted("accessibility tree with element refs", body)}\n` +
-          `Refs are fresh for this page state, SINGLE-USE, and die on any navigation.`,
+        `${untrusted(
+          "page URL and accessibility tree with element refs",
+          `URL: ${event.url}\n${body}`,
+        )}\n` +
+          "Refs are valid only for this attachment and snapshot generation. " +
+          "Navigation or a newer snapshot invalidates them.",
       );
     }
     case "screenshot_result": {
@@ -113,7 +116,14 @@ function mapTerminalEvent(
       return {
         content: [
           { type: "image", data: event.b64, mimeType: event.mime },
-          { type: "text", text: `Screenshot of ${event.url} (${event.mime}, ~${sizeKb} KB).` },
+          {
+            type: "text",
+            text:
+              untrusted(
+                "screenshot pixels and page URL",
+                `Screenshot of ${event.url}`,
+              ) + `\nImage type: ${event.mime}; approximate size: ${sizeKb} KB.`,
+          },
         ],
       };
     }
@@ -138,8 +148,8 @@ function mapTerminalEvent(
               : ` This session's allowed origins: ${allowedOrigins.join(", ")}.`;
           return errorResult(
             `Navigation refused: the target origin is not on this session's allowlist.${origins} ` +
-              `The user can change allowed origins in the dashboard (${DASHBOARD_URL}), ` +
-              `then re-pair and reopen the session.`,
+              `The user can change allowed origins in the dashboard (${DASHBOARD_URL}); ` +
+              `the extension applies the policy update before another session opens.`,
           );
         }
         return errorResult(
@@ -148,13 +158,34 @@ function mapTerminalEvent(
             `Take browser_snapshot to see the current page state.`,
         );
       }
-      const where = event.url === undefined ? "" : ` Now at: ${event.url}.`;
+      const where =
+        event.url === undefined
+          ? ""
+          : `\n${untrusted("post-action page URL", event.url)}`;
       if (tool === "browser_navigate") {
         return textResult(`Navigated.${where} ${REFS_NOW_STALE_NOTE}`);
       }
       const simulated = event.simulated === true ? " (simulated)" : "";
       return textResult(`Done${simulated}.${where}`);
     }
+    case "cards_result":
+      return textResult(
+        `Local card aliases: ${event.aliases.length === 0 ? "(none)" : event.aliases.join(", ")}.\n` +
+          `Locally approved payment origins: ${
+            event.approvedOrigins.length === 0
+              ? "(none)"
+              : event.approvedOrigins.join(", ")
+          }. Card values and masked card data remain inside the extension.`,
+      );
+    case "card_submission_result":
+      return event.status === "not_started"
+        ? errorResult(
+            `Card submission did not start (${event.reason}). Take a new browser_snapshot before retrying.`,
+          )
+        : errorResult(
+            `OUTCOME UNKNOWN (${event.reason}): card data may have been submitted. ` +
+              "Do not retry automatically. Open a fresh session to inspect a receipt or status page.",
+          );
     default:
       return textResult(`Completed with a ${event.type} event.`);
   }
@@ -206,7 +237,7 @@ export function mapRunResult(
       );
     case "unsupported":
       return errorResult(
-        "The paired extension is too old for write actions (safe-write v2 required). " +
+        "The paired extension is too old for protocol-3 write actions. " +
           "Ask the user to update the Understudy extension.",
       );
     case "terminal_session":
@@ -227,7 +258,7 @@ export function mapOpenResult(result: OpenBrowserResult): ToolResult {
           : "";
         return textResult(
           `Attached to the existing browser session on profile "${result.profile}". ` +
-            `Current URL: ${where}. ${origins}${recovering} ` +
+          `${untrusted("current page URL", where)}\n${origins}${recovering} ` +
             `Take browser_snapshot to see the page.`,
         );
       }
@@ -254,7 +285,7 @@ export function mapOpenResult(result: OpenBrowserResult): ToolResult {
     case "no_paired_devices":
       return errorResult(
         `No browser is paired to this account. In the dashboard (${DASHBOARD_URL}) ` +
-          `generate a pairing code, then paste it into the Understudy extension's side panel.`,
+          `generate a pairing offer in Chrome; the dashboard sends it directly to the installed extension.`,
       );
     case "devices_offline":
       return errorResult(
@@ -272,7 +303,7 @@ export function mapOpenResult(result: OpenBrowserResult): ToolResult {
       return errorResult(
         `The origins argument must be a subset of the device's allowed origins: ` +
           `${result.allowed.join(", ")}. The user can extend the list in the dashboard ` +
-          `(${DASHBOARD_URL}) and re-pair.`,
+          `(${DASHBOARD_URL}); no re-pair is required.`,
       );
     case "disabled":
       return errorResult("Unattended browsing is disabled for this account.");
@@ -281,7 +312,9 @@ export function mapOpenResult(result: OpenBrowserResult): ToolResult {
         `The previous browser session ended (${result.status}). Call browser_open again to start fresh.`,
       );
     case "create_failed":
-      return errorResult(`Could not open a browser session: ${result.reason}.`);
+      return errorResult(
+        `Could not open a browser session: ${untrusted("device error", result.reason)}.`,
+      );
   }
 }
 
@@ -315,7 +348,7 @@ export function mapStatusReport(report: StatusReport): ToolResult {
       const session = report.session;
       lines.push(
         `Session: open on profile "${session.profile}" (${session.status}).`,
-        `Current URL: ${session.url ?? "about:blank"}.`,
+        untrusted("current page URL", session.url ?? "about:blank"),
         `Allowed origins: ${session.allowedOrigins.join(", ")}.`,
         session.refsValid
           ? `Refs: valid (epoch ${session.refsEpoch}).`

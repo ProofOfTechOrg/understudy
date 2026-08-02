@@ -15,6 +15,7 @@ export interface WriteJournalRecord {
   leaseId?: string;
   leaseEpoch?: number;
   browserEpoch?: string;
+  attachmentId?: string;
   event?: Event;
 }
 
@@ -145,9 +146,15 @@ export class WriteJournal {
 }
 
 function journalSafeEvent(event: Event): Event {
-  if (event.type !== "action_result") {
-    throw new Error("write journal accepts action results only");
+  if (event.type === "card_submission_result") {
+    return {
+      type: "card_submission_result",
+      commandId: event.commandId,
+      status: event.status,
+      reason: event.reason,
+    };
   }
+  if (event.type !== "action_result") throw new Error("unsupported write result");
   return {
     type: "action_result",
     commandId: event.commandId,

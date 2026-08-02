@@ -1,6 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import { getAgentByName } from "agents";
-import type { DeviceStatus, ProtocolCapability, UnattendedSessionLifecycle } from "@understudy/protocol";
+import type {
+  AssignmentInventory,
+  DeviceStatus,
+  OwnedWindow,
+  ProtocolCapability,
+  UnattendedSessionLifecycle,
+} from "@understudy/protocol";
 import { parseQuotaPolicy } from "./quota";
 import type { Env } from "./types";
 import { emitTelemetry } from "./telemetry";
@@ -8,6 +14,7 @@ import { emitTelemetry } from "./telemetry";
 const DEVICE_CAPACITY = 2;
 const DEVICE_OFFLINE_MS = 75_000;
 const DEVICE_LOST_MS = 90_000;
+const ADOPTION_WINDOW_MS = 15 * 60_000;
 const PROVISIONING_DEADLINE_MS = 30_000;
 const IDLE_EXPIRY_MS = 2 * 60 * 60 * 1000;
 const HARD_EXPIRY_MS = 24 * 60 * 60 * 1000;
@@ -24,6 +31,11 @@ interface DeviceRow {
   credential_version: number;
   origin_policy_json: string;
   capabilities_json: string;
+  policy_version: number;
+  acknowledged_policy_version: number;
+  assignments_json: string;
+  owned_windows_json: string;
+  inventory_compared_at: number;
 }
 
 interface DeviceCredentialRow {
@@ -51,6 +63,8 @@ interface LeaseRow {
   release_at: number | null;
   needs_reconciliation: number;
   dialog_delivery: "ok" | "interrupted" | "overflow";
+  policy_version: number;
+  adoption_expires_at: number | null;
 }
 
 export interface LeaseResource {
@@ -67,6 +81,8 @@ export interface LeaseResource {
   hardExpiresAt: number;
   needsReconciliation: boolean;
   dialogDelivery: "ok" | "interrupted" | "overflow";
+  policyVersion: number;
+  adoptionExpiresAt: number | null;
 }
 
 export interface ClosureConfirmation {
@@ -103,7 +119,20 @@ export interface RegisterDeviceInput {
   credentialDigest: string;
   credentialVersion: number;
   allowedOrigins: string[];
+  policyVersion: number;
+  authoritySource: "static" | "directory";
+  acknowledgedPolicyVersion: number | null;
+  assignments: AssignmentInventory[];
+  ownedWindows: OwnedWindow[];
   capabilities: ProtocolCapability[];
+  now?: number;
+}
+
+interface DevicePolicyUpdateInput {
+  deviceId: string;
+  policyVersion: number;
+  allowedOrigins: string[];
+  narrowing: boolean;
   now?: number;
 }
 
@@ -171,6 +200,25 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
         PRIMARY KEY(scope, subject, bucket)
       );
     `);
+    this.ensureColumn("device", "policy_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn(
+      "device",
+      "acknowledged_policy_version",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
+    this.ensureColumn("device", "assignments_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("device", "owned_windows_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.ensureColumn("device", "inventory_compared_at", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("lease", "policy_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("lease", "adoption_expires_at", "INTEGER");
+  }
+
+  private ensureColumn(table: "device" | "lease", name: string, definition: string): void {
+    const columns = this.ctx.storage.sql
+      .exec<{ name: string }>(`PRAGMA table_info(${table})`)
+      .toArray();
+    if (columns.some((column) => column.name === name)) return;
+    this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
   }
 
   async advanceDeviceCredential(input: {
@@ -181,14 +229,62 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     return { accepted: this.advanceCredentialFence(input) };
   }
 
+  async suspendForCredentialRotation(
+    deviceId: string,
+    expected: { credentialDigest: string; credentialVersion: number },
+  ): Promise<boolean> {
+    const device = this.device(deviceId);
+    if (device === undefined) return true;
+    if (!this.credentialFenceMatches(deviceId, expected)) return false;
+    this.ctx.storage.sql.exec(
+      `UPDATE device SET inventory_compared_at = 0
+       WHERE device_id = ? AND credential_digest = ? AND credential_version = ?`,
+      deviceId,
+      expected.credentialDigest,
+      expected.credentialVersion,
+    );
+    await this.scheduleNextAlarm();
+    return true;
+  }
+
   async registerDevice(
     input: RegisterDeviceInput,
   ): Promise<{ accepted: boolean; epochChanged: boolean }> {
+    let previous = this.device(input.deviceId);
+    if (
+      previous !== undefined &&
+      input.policyVersion > previous.policy_version &&
+      !sameStringArray(parseStringArray(previous.origin_policy_json), input.allowedOrigins)
+    ) {
+      if (input.authoritySource !== "static") {
+        return { accepted: false, epochChanged: false };
+      }
+      const priorOrigins = parseStringArray(previous.origin_policy_json);
+      const updated = await this.advanceStaticDevicePolicy({
+        deviceId: input.deviceId,
+        policyVersion: input.policyVersion,
+        allowedOrigins: input.allowedOrigins,
+        narrowing: priorOrigins.some((origin) => !input.allowedOrigins.includes(origin)),
+        now: input.now,
+      });
+      if (!updated) return { accepted: false, epochChanged: false };
+      previous = this.device(input.deviceId);
+    }
+    if (
+      previous !== undefined &&
+      (previous.policy_version > input.policyVersion ||
+        (previous.policy_version === input.policyVersion &&
+          !sameStringArray(
+            parseStringArray(previous.origin_policy_json),
+            input.allowedOrigins,
+          )))
+    ) {
+      return { accepted: false, epochChanged: false };
+    }
     if (!this.advanceCredentialFence(input)) {
       return { accepted: false, epochChanged: false };
     }
     const now = input.now ?? Date.now();
-    const previous = this.device(input.deviceId);
     const epochChanged =
       previous !== undefined &&
       previous.browser_epoch !== input.browserEpoch;
@@ -196,8 +292,9 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       `INSERT INTO device (
          device_id, enabled, last_seen_at, last_assigned_at, browser, ext_version,
          browser_epoch, credential_digest, credential_version, origin_policy_json,
-         capabilities_json
-       ) VALUES (?, 1, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+         capabilities_json, policy_version, acknowledged_policy_version,
+         assignments_json, owned_windows_json, inventory_compared_at
+       ) VALUES (?, 1, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(device_id) DO UPDATE SET
          enabled = 1,
          last_seen_at = excluded.last_seen_at,
@@ -207,7 +304,12 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
          credential_digest = excluded.credential_digest,
          credential_version = excluded.credential_version,
          origin_policy_json = excluded.origin_policy_json,
-         capabilities_json = excluded.capabilities_json`,
+         capabilities_json = excluded.capabilities_json,
+         policy_version = excluded.policy_version,
+         acknowledged_policy_version = excluded.acknowledged_policy_version,
+         assignments_json = excluded.assignments_json,
+         owned_windows_json = excluded.owned_windows_json,
+         inventory_compared_at = 0`,
       input.deviceId,
       now,
       input.browser,
@@ -217,12 +319,26 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       input.credentialVersion,
       JSON.stringify(input.allowedOrigins),
       JSON.stringify(input.capabilities),
+      input.policyVersion,
+      input.acknowledgedPolicyVersion ?? 0,
+      JSON.stringify(input.assignments),
+      JSON.stringify(input.ownedWindows),
+      0,
     );
+    if (previous !== undefined && input.policyVersion > previous.policy_version) {
+      this.ctx.storage.sql.exec(
+        `UPDATE lease SET policy_version = ?
+         WHERE device_id = ? AND release_at IS NULL
+           AND status IN ('allocating','provisioning','connected','recovering','suspended')`,
+        input.policyVersion,
+        input.deviceId,
+      );
+    }
 
     if (epochChanged) {
       this.ctx.storage.sql.exec(
         `UPDATE lease
-         SET status = CASE WHEN status = 'expired' THEN 'expired' ELSE 'lost' END,
+         SET status = CASE WHEN status = 'expired' THEN 'expired' ELSE 'closed' END,
              release_at = ?, needs_reconciliation = 1
          WHERE device_id = ? AND status IN ('closing','expired')
            AND release_at IS NULL`,
@@ -243,6 +359,49 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
         now + DEVICE_LOST_MS,
         input.deviceId,
       );
+      const suspended = this.leaseRows(
+        `SELECT * FROM lease
+         WHERE device_id = ? AND status = 'suspended' AND release_at IS NULL
+         ORDER BY created_at`,
+        input.deviceId,
+      );
+      for (const lease of suspended) {
+        const active = this.activeLeasesForDevice(input.deviceId).filter(
+          (candidate) => candidate.status !== "suspended",
+        );
+        const origins = parseStringArray(lease.allowed_origins_json);
+        const collision = active.some(
+          (candidate) =>
+            candidate.profile_state_hash === lease.profile_state_hash ||
+            intersects(origins, parseStringArray(candidate.allowed_origins_json)),
+        );
+        if (
+          active.length >= DEVICE_CAPACITY ||
+          collision ||
+          !isSubset(origins, input.allowedOrigins)
+        ) {
+          this.ctx.storage.sql.exec(
+            `UPDATE lease SET status = 'lost', release_at = ?, needs_reconciliation = 1
+             WHERE session_id = ? AND status = 'suspended' AND release_at IS NULL`,
+            now,
+            lease.session_id,
+          );
+          const session = await getAgentByName(this.env.SESSION, lease.session_id);
+          await session.markLifecycle("lost", true).catch(() => {});
+          continue;
+        }
+        this.ctx.storage.sql.exec(
+          `UPDATE lease
+           SET status = 'recovering', lease_epoch = lease_epoch + 1,
+               browser_epoch = ?, policy_version = ?, adoption_expires_at = NULL,
+               provisioning_deadline_at = ?, needs_reconciliation = 1
+           WHERE session_id = ? AND status = 'suspended' AND release_at IS NULL`,
+          input.browserEpoch,
+          input.policyVersion,
+          now + PROVISIONING_DEADLINE_MS,
+          lease.session_id,
+        );
+      }
     }
     await this.scheduleNextAlarm();
     return { accepted: true, epochChanged };
@@ -251,36 +410,64 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
   async heartbeat(
     deviceId: string,
     browserEpoch: string,
-    reportedLeaseIds: string[] = [],
+    reportedAssignments: AssignmentInventory[] = [],
+    ownedWindows: OwnedWindow[] = [],
     now = Date.now(),
   ): Promise<{
     ok: boolean;
     recoveries: LeaseResource[];
     assignments: LeaseResource[];
     closures: LeaseResource[];
+    orphans: OwnedWindow[];
   }> {
     const device = this.device(deviceId);
     if (device === undefined || device.browser_epoch !== browserEpoch || device.enabled !== 1) {
-      return { ok: false, recoveries: [], assignments: [], closures: [] };
+      return { ok: false, recoveries: [], assignments: [], closures: [], orphans: [] };
     }
     this.ctx.storage.sql.exec(
-      "UPDATE device SET last_seen_at = ? WHERE device_id = ? AND browser_epoch = ?",
+      `UPDATE device
+       SET last_seen_at = ?, assignments_json = ?, owned_windows_json = ?,
+           inventory_compared_at = ?
+       WHERE device_id = ? AND browser_epoch = ?`,
+      now,
+      JSON.stringify(reportedAssignments),
+      JSON.stringify(ownedWindows),
       now,
       deviceId,
       browserEpoch,
     );
-    const reported = new Set(reportedLeaseIds);
+    const reported = new Set(
+      reportedAssignments
+        .filter((assignment) => assignment.browserEpoch === browserEpoch)
+        .map(assignmentFenceKey),
+    );
     for (const lease of this.leaseRows(
       `SELECT * FROM lease
        WHERE device_id = ? AND status = 'connected' AND release_at IS NULL`,
       deviceId,
     )) {
-      if (reported.has(lease.lease_id)) continue;
+      if (reported.has(leaseFenceKey(lease))) continue;
       this.ctx.storage.sql.exec(
         `UPDATE lease SET status = 'recovering', needs_reconciliation = 1,
              provisioning_deadline_at = ?
          WHERE session_id = ? AND status = 'connected' AND release_at IS NULL`,
         now + DEVICE_LOST_MS,
+        lease.session_id,
+      );
+    }
+    for (const lease of this.leaseRows(
+      `SELECT * FROM lease
+       WHERE device_id = ? AND status = 'suspended' AND release_at IS NULL
+         AND browser_epoch = ?`,
+      deviceId,
+      browserEpoch,
+    )) {
+      if (!reported.has(leaseFenceKey(lease))) continue;
+      this.ctx.storage.sql.exec(
+        `UPDATE lease
+         SET status = 'connected', adoption_expires_at = NULL,
+             needs_reconciliation = 0
+         WHERE session_id = ? AND status = 'suspended' AND release_at IS NULL`,
         lease.session_id,
       );
     }
@@ -302,8 +489,110 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
        ORDER BY created_at`,
       deviceId,
     ).map(toLeaseResource);
+    const orphans = ownedWindows.filter((owned) => {
+      const lease = this.lease(owned.sessionId);
+      return (
+        lease === undefined ||
+        lease.release_at !== null ||
+        lease.device_id !== deviceId ||
+        lease.lease_id !== owned.leaseId ||
+        lease.lease_epoch !== owned.leaseEpoch ||
+        lease.browser_epoch !== owned.browserEpoch
+      );
+    });
     await this.scheduleNextAlarm();
-    return { ok: true, recoveries, assignments, closures };
+    return { ok: true, recoveries, assignments, closures, orphans };
+  }
+
+  async acknowledgePolicy(
+    deviceId: string,
+    browserEpoch: string,
+    policyVersion: number,
+  ): Promise<boolean> {
+    const cursor = this.ctx.storage.sql.exec(
+      `UPDATE device SET acknowledged_policy_version = ?
+       WHERE device_id = ? AND browser_epoch = ? AND policy_version = ? AND enabled = 1`,
+      policyVersion,
+      deviceId,
+      browserEpoch,
+      policyVersion,
+    );
+    return cursor.rowsWritten > 0;
+  }
+
+  async updateDevicePolicy(input: DevicePolicyUpdateInput): Promise<boolean> {
+    return this.applyDevicePolicy(input, true);
+  }
+
+  async advanceStaticDevicePolicy(
+    input: DevicePolicyUpdateInput,
+  ): Promise<boolean> {
+    return this.applyDevicePolicy(input, false);
+  }
+
+  private async applyDevicePolicy(
+    input: DevicePolicyUpdateInput,
+    requireNextVersion: boolean,
+  ): Promise<boolean> {
+    const now = input.now ?? Date.now();
+    const device = this.device(input.deviceId);
+    if (device === undefined) return true;
+    if (
+      device.policy_version === input.policyVersion &&
+      sameStringArray(parseStringArray(device.origin_policy_json), input.allowedOrigins)
+    ) {
+      return true;
+    }
+    if (device.enabled !== 1) return true;
+    if (
+      input.policyVersion <= device.policy_version ||
+      (requireNextVersion && input.policyVersion !== device.policy_version + 1)
+    ) {
+      return false;
+    }
+    const affected = input.narrowing
+      ? this.activeLeasesForDevice(input.deviceId).filter(
+          (lease) =>
+            !isSubset(parseStringArray(lease.allowed_origins_json), input.allowedOrigins),
+        )
+      : [];
+    this.ctx.storage.transactionSync(() => {
+      for (const lease of affected) {
+        this.ctx.storage.sql.exec(
+          `UPDATE lease
+           SET status = 'closed', release_at = ?, needs_reconciliation = 1
+           WHERE session_id = ? AND release_at IS NULL`,
+          now,
+          lease.session_id,
+        );
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE lease SET policy_version = ?
+         WHERE device_id = ? AND release_at IS NULL
+           AND status IN ('allocating','provisioning','connected','recovering','suspended')`,
+        input.policyVersion,
+        input.deviceId,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE device
+         SET origin_policy_json = ?, policy_version = ?,
+             acknowledged_policy_version = 0
+         WHERE device_id = ? AND enabled = 1`,
+        JSON.stringify(input.allowedOrigins),
+        input.policyVersion,
+        input.deviceId,
+      );
+    });
+    for (const lease of affected) {
+      try {
+        const session = await getAgentByName(this.env.SESSION, lease.session_id);
+        await session.markLifecycle("closed", true);
+      } catch {
+        // The exact-fenced terminal lease remains authoritative.
+      }
+    }
+    await this.scheduleNextAlarm();
+    return true;
   }
 
   async createLease(input: CreateLeaseInput): Promise<CreateLeaseResult> {
@@ -354,7 +643,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     let selected: DeviceRow | undefined;
     for (const device of candidates) {
       const leases = this.activeLeasesForDevice(device.device_id);
-      if (leases.length >= DEVICE_CAPACITY) {
+      if (leases.filter((lease) => lease.status !== "suspended").length >= DEVICE_CAPACITY) {
         sawCapacity = true;
         continue;
       }
@@ -398,8 +687,8 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
            profile_state_hash, lease_epoch, browser_epoch, created_at,
            last_activity_at, idle_expires_at, hard_expires_at,
            provisioning_deadline_at, release_at, needs_reconciliation,
-           dialog_delivery
-         ) VALUES (?, ?, ?, 'provisioning', ?, ?, 1, ?, ?, ?, ?, ?, ?, NULL, 0, 'ok')`,
+           dialog_delivery, policy_version, adoption_expires_at
+         ) VALUES (?, ?, ?, 'provisioning', ?, ?, 1, ?, ?, ?, ?, ?, ?, NULL, 0, 'ok', ?, NULL)`,
         input.sessionId,
         leaseId,
         selected.device_id,
@@ -411,6 +700,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
         idleExpiresAt,
         hardExpiresAt,
         now + PROVISIONING_DEADLINE_MS,
+        selected.policy_version,
       );
       this.ctx.storage.sql.exec(
         "UPDATE device SET last_assigned_at = ? WHERE device_id = ?",
@@ -458,12 +748,39 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     leaseEpoch: number;
     browserEpoch: string;
     deviceId: string;
-  }): Promise<void> {
-    this.ctx.storage.sql.exec(
+  }): Promise<LeaseResource | null> {
+    const changed = this.ctx.storage.sql.exec<LeaseRow>(
       `UPDATE lease SET status = 'closing', needs_reconciliation = 1
        WHERE session_id = ? AND lease_id = ? AND device_id = ?
          AND lease_epoch = ? AND browser_epoch = ?
-         AND status IN ('provisioning','recovering') AND release_at IS NULL`,
+         AND status IN ('provisioning','recovering') AND release_at IS NULL
+       RETURNING *`,
+      input.sessionId,
+      input.leaseId,
+      input.deviceId,
+      input.leaseEpoch,
+      input.browserEpoch,
+    ).toArray();
+    await this.scheduleNextAlarm();
+    return changed.length === 0 ? null : toLeaseResource(changed[0]!);
+  }
+
+  async releaseProvisioning(input: {
+    sessionId: string;
+    leaseId: string;
+    leaseEpoch: number;
+    browserEpoch: string;
+    deviceId: string;
+    now?: number;
+  }): Promise<boolean> {
+    const now = input.now ?? Date.now();
+    const cursor = this.ctx.storage.sql.exec(
+      `UPDATE lease
+       SET status = 'closed', release_at = ?, needs_reconciliation = 0
+       WHERE session_id = ? AND lease_id = ? AND device_id = ?
+         AND lease_epoch = ? AND browser_epoch = ?
+         AND status IN ('allocating','provisioning') AND release_at IS NULL`,
+      now,
       input.sessionId,
       input.leaseId,
       input.deviceId,
@@ -471,6 +788,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       input.browserEpoch,
     );
     await this.scheduleNextAlarm();
+    return cursor.rowsWritten > 0;
   }
 
   async getLease(sessionId: string, now = Date.now()): Promise<LeaseResource | null> {
@@ -479,12 +797,14 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       lease !== undefined &&
       lease.release_at === null &&
       (lease.hard_expires_at <= now || lease.idle_expires_at <= now) &&
-      ["allocating", "provisioning", "connected", "recovering"].includes(lease.status)
+      ["allocating", "provisioning", "connected", "recovering", "suspended"].includes(
+        lease.status,
+      )
     ) {
       this.ctx.storage.sql.exec(
         `UPDATE lease SET status = 'expired'
          WHERE session_id = ? AND release_at IS NULL
-           AND status IN ('allocating','provisioning','connected','recovering')
+           AND status IN ('allocating','provisioning','connected','recovering','suspended')
            AND (hard_expires_at <= ? OR idle_expires_at <= ?)`,
         sessionId,
         now,
@@ -499,7 +819,6 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
   async authorizeCommand(input: {
     sessionId: string;
     actorPseudonym: string;
-    credentialFill: boolean;
     now?: number;
   }): Promise<{ ok: true; idleExpiresAt: number } | { ok: false; reason: "terminal" | "quota" }> {
     const now = input.now ?? Date.now();
@@ -525,15 +844,6 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
         subject: this.tenantId,
         limit: policy.commandsPerTenantMinute,
       },
-      ...(input.credentialFill
-        ? [
-            {
-              scope: "credential_fill_actor",
-              subject: input.actorPseudonym,
-              limit: policy.credentialFillsPerActorMinute,
-            },
-          ]
-        : []),
     ];
     if (!this.consumeQuotas(quotas, now)) {
       await emitTelemetry(this.env, {
@@ -560,7 +870,6 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
   async authorizeAttendedCommand(input: {
     sessionId: string;
     actorPseudonym: string;
-    credentialFill: boolean;
     now?: number;
   }): Promise<boolean> {
     const now = input.now ?? Date.now();
@@ -577,15 +886,6 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
           subject: this.tenantId,
           limit: policy.commandsPerTenantMinute,
         },
-        ...(input.credentialFill
-          ? [
-              {
-                scope: "credential_fill_actor",
-                subject: input.actorPseudonym,
-                limit: policy.credentialFillsPerActorMinute,
-              },
-            ]
-          : []),
       ],
       now,
     );
@@ -685,6 +985,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
         before.status === "provisioning" ||
         before.status === "connected" ||
         before.status === "recovering" ||
+        before.status === "suspended" ||
         before.status === "closing" ||
         before.status === "expired"
       )
@@ -698,7 +999,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
        WHERE session_id = ? AND lease_id = ? AND device_id = ?
          AND lease_epoch = ? AND browser_epoch = ?
          AND release_at IS NULL
-         AND status IN ('allocating','provisioning','connected','recovering','closing','expired')
+         AND status IN ('allocating','provisioning','connected','recovering','suspended','closing','expired')
        RETURNING status`,
       terminalStatus,
       now,
@@ -755,7 +1056,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     this.ctx.storage.sql.exec(
       `UPDATE lease SET status = 'lost', release_at = ?, needs_reconciliation = 1
        WHERE device_id = ? AND release_at IS NULL
-         AND status IN ('allocating','provisioning','connected','recovering','closing','expired')`,
+         AND status IN ('allocating','provisioning','connected','recovering','suspended','closing','expired')`,
       now,
       deviceId,
     );
@@ -776,24 +1077,49 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       .exec<DeviceRow>("SELECT * FROM device ORDER BY device_id")
       .toArray()
       .map((device) => {
-        const used = this.activeLeasesForDevice(device.device_id).length;
+        const leases = this.activeLeasesForDevice(device.device_id);
+        const capacityLeases = leases.filter((lease) => lease.status !== "suspended");
+        const serverFences = new Set(capacityLeases.map(leaseFenceKey));
+        const managed = parseJsonArray<AssignmentInventory>(device.assignments_json);
+        const owned = parseJsonArray<OwnedWindow>(device.owned_windows_json);
+        const managedFences = new Set(managed.map(assignmentFenceKey));
+        const missingOnServer = managed
+          .filter((assignment) => !serverFences.has(assignmentFenceKey(assignment)))
+          .map((assignment) => assignment.leaseId);
+        const missingOnDevice = capacityLeases
+          .filter((lease) => !managedFences.has(leaseFenceKey(lease)))
+          .map((lease) => lease.lease_id);
+        const serverUsed = Math.min(DEVICE_CAPACITY, capacityLeases.length);
         const capabilities = parseStringArray(device.capabilities_json);
         let status: DeviceStatus["status"];
         if (device.enabled !== 1) status = "disabled";
-        else if (!capabilities.includes("safe-write-v2")) status = "incompatible";
+        else if (!capabilities.includes("safe-write-v3")) status = "incompatible";
         else if (now - device.last_seen_at > DEVICE_OFFLINE_MS) status = "offline";
-        else if (
-          this.activeLeasesForDevice(device.device_id).some((lease) => lease.status === "recovering")
-        ) {
+        else if (leases.some((lease) => lease.status === "recovering")) {
           status = "recovering";
         } else status = "online";
         return {
           deviceId: device.device_id,
           status,
           capacity: 2,
-          used,
+          used: serverUsed,
           browser: { browser: device.browser, extVersion: device.ext_version },
           lastSeenAt: new Date(device.last_seen_at).toISOString(),
+          serverUsed,
+          managedAssignments: managed.length,
+          ownedWindows: owned.length,
+          missingOnServer,
+          missingOnDevice,
+          diverged: missingOnServer.length > 0 || missingOnDevice.length > 0,
+          comparedAt:
+            device.inventory_compared_at > 0
+              ? new Date(device.inventory_compared_at).toISOString()
+              : null,
+          policyVersion: device.policy_version,
+          acknowledgedPolicyVersion:
+            device.acknowledged_policy_version > 0
+              ? device.acknowledged_policy_version
+              : null,
         };
       });
   }
@@ -847,13 +1173,13 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
           now - device.last_seen_at < DEVICE_LOST_MS,
       )
       .map((device) => device.device_id);
-    const lostDeviceIds = devices
+    const suspendedDeviceIds = devices
       .filter((device) => now - device.last_seen_at >= DEVICE_LOST_MS)
       .map((device) => device.device_id);
     const expiringLeases = this.leaseRows(
       `SELECT * FROM lease
        WHERE release_at IS NULL
-         AND status IN ('allocating','provisioning','connected','recovering')
+         AND status IN ('allocating','provisioning','connected','recovering','suspended')
          AND (hard_expires_at <= ? OR idle_expires_at <= ?)`,
       now,
       now,
@@ -861,11 +1187,9 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
 
     for (const deviceId of offlineDeviceIds) {
       this.ctx.storage.sql.exec(
-        `UPDATE lease SET status = 'recovering', needs_reconciliation = 1,
-             provisioning_deadline_at = ?
+        `UPDATE lease SET status = 'recovering', needs_reconciliation = 1
          WHERE device_id = ? AND release_at IS NULL
            AND status IN ('allocating','provisioning','connected')`,
-        now + (DEVICE_LOST_MS - DEVICE_OFFLINE_MS),
         deviceId,
       );
       await emitTelemetry(this.env, {
@@ -878,31 +1202,63 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     this.ctx.storage.sql.exec(
       `UPDATE lease SET status = 'expired'
        WHERE release_at IS NULL
-         AND status IN ('allocating','provisioning','connected','recovering')
+         AND status IN ('allocating','provisioning','connected','recovering','suspended')
          AND (hard_expires_at <= ? OR idle_expires_at <= ?)`,
       now,
       now,
     );
     this.ctx.storage.sql.exec(
       `UPDATE lease SET status = 'closing', needs_reconciliation = 1
-       WHERE release_at IS NULL AND status IN ('provisioning','recovering')
+       WHERE release_at IS NULL AND status = 'provisioning'
          AND provisioning_deadline_at <= ?`,
       now,
     );
-    for (const deviceId of lostDeviceIds) {
+    for (const deviceId of suspendedDeviceIds) {
       this.ctx.storage.sql.exec(
-        `UPDATE lease SET status = 'lost', release_at = ?, needs_reconciliation = 1
+        `UPDATE lease
+         SET status = CASE WHEN status = 'expired' THEN 'expired' ELSE 'closed' END,
+             release_at = ?, needs_reconciliation = 1
          WHERE device_id = ? AND release_at IS NULL
-           AND status IN ('allocating','provisioning','connected','recovering','closing','expired')`,
+           AND status IN ('closing','expired')`,
         now,
+        deviceId,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE lease
+         SET status = 'suspended', adoption_expires_at = ?, needs_reconciliation = 1
+         WHERE device_id = ? AND release_at IS NULL
+           AND status IN ('allocating','provisioning','connected','recovering')`,
+        now + ADOPTION_WINDOW_MS,
         deviceId,
       );
       await emitTelemetry(this.env, {
         event: "device_offline",
-        outcome: "lost",
+        outcome: "suspended",
         tenantId: this.tenantId,
         deviceId,
       });
+    }
+    const adoptionExpired = this.leaseRows(
+      `SELECT * FROM lease
+       WHERE status = 'suspended' AND release_at IS NULL
+         AND adoption_expires_at <= ?`,
+      now,
+    );
+    this.ctx.storage.sql.exec(
+      `UPDATE lease
+       SET status = 'lost', release_at = ?, needs_reconciliation = 1
+       WHERE status = 'suspended' AND release_at IS NULL
+         AND adoption_expires_at <= ?`,
+      now,
+      now,
+    );
+    for (const lease of adoptionExpired) {
+      try {
+        const session = await getAgentByName(this.env.SESSION, lease.session_id);
+        await session.markLifecycle("lost", true);
+      } catch {
+        // The coordinator remains authoritative and retries reconciliation.
+      }
     }
     for (const lease of expiringLeases) {
       await emitTelemetry(this.env, {
@@ -965,7 +1321,7 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
     return this.leaseRows(
       `SELECT * FROM lease
        WHERE device_id = ? AND release_at IS NULL
-         AND status IN ('allocating','provisioning','connected','recovering','closing','expired')`,
+         AND status IN ('allocating','provisioning','connected','recovering','suspended','closing','expired')`,
       deviceId,
     );
   }
@@ -1032,14 +1388,21 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
       )
       .toArray()
       .filter((device) =>
-        parseStringArray(device.capabilities_json).includes("safe-write-v2") &&
+        parseStringArray(device.capabilities_json).includes("safe-write-v3") &&
+        device.acknowledged_policy_version === device.policy_version &&
+        device.inventory_compared_at > 0 &&
         !this.activeLeasesForDevice(device.device_id).some(
           (lease) => lease.status === "recovering",
         ),
       );
     return rows.sort((left, right) => {
-      const capacity = this.activeLeasesForDevice(left.device_id).length -
-        this.activeLeasesForDevice(right.device_id).length;
+      const capacity =
+        this.activeLeasesForDevice(left.device_id).filter(
+          (lease) => lease.status !== "suspended",
+        ).length -
+        this.activeLeasesForDevice(right.device_id).filter(
+          (lease) => lease.status !== "suspended",
+        ).length;
       if (capacity !== 0) return capacity;
       if (left.last_assigned_at !== right.last_assigned_at) {
         return left.last_assigned_at - right.last_assigned_at;
@@ -1090,10 +1453,13 @@ export class TenantDeviceCoordinator extends DurableObject<Env> {
         `SELECT MIN(deadline) AS deadline FROM (
            SELECT MIN(idle_expires_at, hard_expires_at) AS deadline
              FROM lease WHERE release_at IS NULL
-               AND status IN ('allocating','provisioning','connected','recovering')
+               AND status IN ('allocating','provisioning','connected','recovering','suspended')
            UNION ALL
            SELECT provisioning_deadline_at AS deadline
-             FROM lease WHERE release_at IS NULL AND status IN ('provisioning','recovering')
+             FROM lease WHERE release_at IS NULL AND status = 'provisioning'
+           UNION ALL
+           SELECT adoption_expires_at AS deadline
+             FROM lease WHERE release_at IS NULL AND status = 'suspended'
            UNION ALL
            SELECT last_seen_at + ${DEVICE_OFFLINE_MS} AS deadline FROM device WHERE enabled = 1
            UNION ALL
@@ -1125,6 +1491,8 @@ function toLeaseResource(row: LeaseRow): LeaseResource {
     hardExpiresAt: row.hard_expires_at,
     needsReconciliation: row.needs_reconciliation === 1,
     dialogDelivery: row.dialog_delivery,
+    policyVersion: row.policy_version,
+    adoptionExpiresAt: row.adoption_expires_at,
   };
 }
 
@@ -1134,6 +1502,15 @@ function parseStringArray(value: string): string[] {
     return Array.isArray(parsed) && parsed.every((item) => typeof item === "string")
       ? parsed
       : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseJsonArray<T>(value: string): T[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
   } catch {
     return [];
   }
@@ -1149,6 +1526,23 @@ function isSubset(values: readonly string[], allowed: readonly string[]): boolea
   return values.every((value) => set.has(value));
 }
 
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 function isTerminal(status: UnattendedSessionLifecycle): boolean {
   return status === "closed" || status === "expired" || status === "lost";
+}
+
+function assignmentFenceKey(assignment: AssignmentInventory): string {
+  return [
+    assignment.sessionId,
+    assignment.leaseId,
+    assignment.leaseEpoch,
+    assignment.browserEpoch,
+  ].join("\0");
+}
+
+function leaseFenceKey(lease: LeaseRow): string {
+  return [lease.session_id, lease.lease_id, lease.lease_epoch, lease.browser_epoch].join("\0");
 }

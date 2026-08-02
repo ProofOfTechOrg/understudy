@@ -11,26 +11,13 @@
 
 import { getDirectory } from "../account-directory";
 import { sha256Hex } from "../auth";
-import { createPositiveCache } from "../cache";
 import type { Env } from "../types";
-import type { McpTokenIdentity } from "../account-directory";
+import { AUTH_CONTRACT_VERSION, type McpTokenIdentity } from "../account-directory";
 import { guardedMcpHandler } from "./handler";
 import { mcpUnauthorized, type UnderstudyMcpProps } from "./props";
 
 const BEARER_PREFIX = "Bearer ";
-const USK_PATTERN = /^usk_v1_[0-9A-Za-z]{16}_[A-Za-z0-9_-]{43}$/;
-
-/**
- * Positive-only 60s cache, keyed by token digest. Never caches misses — a
- * token created in the dashboard must work on the very next request.
- * Revocation therefore takes up to 60s beyond the directory row flip.
- */
-const tokenCache = createPositiveCache<McpTokenIdentity>(60_000, 1024);
-
-/** Test seam: the cache is module state, shared across a pool-worker run. */
-export function clearMcpTokenCache(): void {
-  tokenCache.clear();
-}
+const USK_PATTERN = /^usk_v2_[0-9A-Za-z]{16}_[A-Za-z0-9_-]{43}$/;
 
 export async function tryStaticMcpAuth(
   request: Request,
@@ -47,13 +34,8 @@ export async function tryStaticMcpAuth(
   if (!USK_PATTERN.test(token)) return mcpUnauthorized(origin);
 
   const digest = await sha256Hex(token);
-  let identity = tokenCache.get(digest);
-  if (identity === undefined) {
-    const verified = await getDirectory(env).verifyMcpToken(digest);
-    if (verified === null) return mcpUnauthorized(origin);
-    tokenCache.put(digest, verified);
-    identity = verified;
-  }
+  const identity: McpTokenIdentity | null = await getDirectory(env).verifyMcpToken(digest);
+  if (identity === null) return mcpUnauthorized(origin);
 
   const props: UnderstudyMcpProps = {
     userId: identity.userId,
@@ -61,6 +43,9 @@ export async function tryStaticMcpAuth(
     actorId: `usk:${identity.tokenId}`,
     authMethod: "static",
     scopes: ["mcp"],
+    deviceId: identity.deviceId,
+    authEpoch: identity.authEpoch,
+    contractVersion: AUTH_CONTRACT_VERSION,
   };
   // The provider sets props by MUTATING the live ExecutionContext
   // (oauth-provider.js does `ctx.props = …`); mirror that exactly rather than

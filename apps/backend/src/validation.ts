@@ -5,7 +5,10 @@ import {
 } from "@understudy/protocol";
 import type { z } from "zod";
 import { hashProfileStateKey } from "./auth";
+import { canonicalOrigin } from "./origin-policy";
 import type { Env } from "./types";
+
+export { isLoopback } from "./origin-policy";
 
 export class RequestBodyError extends Error {
   constructor(
@@ -143,16 +146,6 @@ export async function parseBoundedStrictJson<T extends z.ZodType>(
   return parsed.data;
 }
 
-export function isLoopback(hostname: string): boolean {
-  const normalized = hostname.toLowerCase();
-  return (
-    normalized === "localhost" ||
-    normalized === "127.0.0.1" ||
-    normalized === "[::1]" ||
-    normalized.endsWith(".localhost")
-  );
-}
-
 export function canonicalizeOrigins(origins: readonly string[]): string[] {
   const canonical = new Set<string>();
   for (const raw of origins) {
@@ -164,25 +157,11 @@ export function canonicalizeOrigins(origins: readonly string[]): string[] {
     if (/^[a-z][a-z0-9+.-]*:\/\/[^/]*@/i.test(raw)) {
       throw new RequestBodyError("allowed origin must not contain credentials");
     }
-    let url: URL;
-    try {
-      url = new URL(raw);
-    } catch {
-      throw new RequestBodyError("invalid allowed origin");
-    }
-    if (
-      url.username !== "" ||
-      url.password !== "" ||
-      (url.pathname !== "" && url.pathname !== "/") ||
-      url.search !== "" ||
-      url.hash !== ""
-    ) {
-      throw new RequestBodyError("allowed origin must not contain credentials, path, query, or fragment");
-    }
-    if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback(url.hostname))) {
+    const normalized = canonicalOrigin(raw);
+    if (normalized === null) {
       throw new RequestBodyError("allowed origin must use HTTPS");
     }
-    canonical.add(url.origin);
+    canonical.add(normalized);
   }
   return [...canonical].sort();
 }

@@ -23,7 +23,12 @@ import type {
   UnattendedSessionRequest,
 } from "@understudy/protocol";
 import { isWriteCommand } from "@understudy/protocol";
-import type { DirectoryDeviceRecord } from "../account-directory";
+import type {
+  ClaimPairingOfferResult,
+  DirectoryDeviceRecord,
+  OriginPolicyDevicePlan,
+  SetOriginsResult,
+} from "../account-directory";
 import { getDirectory } from "../account-directory";
 import type { Actor, DeviceIdentity } from "../auth";
 import { mintSessionId, mintWsTicket, scopeSession, telemetryPseudonym } from "../auth";
@@ -32,7 +37,11 @@ import type { SessionAgent } from "../session";
 import { emitTelemetry, type TelemetryEvent } from "../telemetry";
 import type { TenantDeviceCoordinator } from "../tenant-coordinator";
 import type { DispatchOutcome, Env, V2DispatchOutcome } from "../types";
-import { canonicalizeUnattendedRequest, RequestBodyError } from "../validation";
+import {
+  canonicalizeOrigins,
+  canonicalizeUnattendedRequest,
+  RequestBodyError,
+} from "../validation";
 
 export function getSessionStub(
   env: Env,
@@ -60,6 +69,17 @@ function getDeviceStub(env: Env, deviceId: string): DurableObjectStub<DeviceAgen
   return env.DEVICE.getByName(deviceId);
 }
 
+export async function suspendDeviceForCredentialRotation(
+  env: Env,
+  claim: Extract<ClaimPairingOfferResult, { kind: "ok" }>,
+): Promise<boolean> {
+  if (claim.rotatedFrom === undefined) return true;
+  return getTenantStub(env, claim.tenantId).suspendForCredentialRotation(
+    claim.deviceId,
+    claim.rotatedFrom,
+  );
+}
+
 /**
  * Tenant allowlist check for UNATTENDED_ENABLED_TENANTS /
  * SAFE_WRITE_REQUIRED_TENANTS. Entries are exact tenant ids or
@@ -85,11 +105,11 @@ export function enabledForTenant(raw: string, tenantId: string): boolean {
   }
 }
 
-export function sessionLocation(requestUrl: string, sessionId: string): string {
+function sessionLocation(requestUrl: string, sessionId: string): string {
   return new URL(`/v1/sessions/${encodeURIComponent(sessionId)}`, requestUrl).toString();
 }
 
-export function commandLocation(
+function commandLocation(
   requestUrl: string,
   sessionId: string,
   commandId: string,
@@ -154,7 +174,6 @@ export type CreateSessionResult =
   | { kind: "no_device" }
   | { kind: "capacity" }
   | { kind: "collision" }
-  | { kind: "provision_failed" }
   | {
       kind: "pending";
       sessionId: string;
@@ -218,13 +237,27 @@ export async function createSession(
     case "created":
     case "replay": {
       const session = await getSessionStub(env, sessionId);
-      if (allocation.created) {
+      if (
+        allocation.lease.status === "allocating" ||
+        allocation.lease.status === "provisioning"
+      ) {
         try {
           await session.initializeUnattended(actor.tenantId, allocation.lease);
-          const device = getDeviceStub(env, allocation.lease.deviceId);
-          if (!(await device.requestProvision(allocation.lease))) {
-            throw new Error("device connection unavailable");
-          }
+        } catch {
+          await coordinator.releaseProvisioning({
+            sessionId,
+            leaseId: allocation.lease.leaseId,
+            deviceId: allocation.lease.deviceId,
+            leaseEpoch: allocation.lease.leaseEpoch,
+            browserEpoch: allocation.lease.browserEpoch,
+          });
+          await session.markLifecycle("closed", false);
+          return { kind: "terminal", sessionId, status: "closed" };
+        }
+        const device = getDeviceStub(env, allocation.lease.deviceId);
+        let dispatched: boolean;
+        try {
+          dispatched = await device.requestProvision(allocation.lease);
         } catch {
           await coordinator.markProvisionFailed({
             sessionId,
@@ -234,10 +267,26 @@ export async function createSession(
             browserEpoch: allocation.lease.browserEpoch,
           });
           await session.markLifecycle("closing", true);
-          return { kind: "provision_failed" };
+          return {
+            kind: "pending",
+            sessionId,
+            status: "closing",
+            location: sessionLocation(input.requestUrl, sessionId),
+          };
+        }
+        if (!dispatched) {
+          await coordinator.releaseProvisioning({
+            sessionId,
+            leaseId: allocation.lease.leaseId,
+            deviceId: allocation.lease.deviceId,
+            leaseEpoch: allocation.lease.leaseEpoch,
+            browserEpoch: allocation.lease.browserEpoch,
+          });
+          await session.markLifecycle("closed", false);
+          return { kind: "terminal", sessionId, status: "closed" };
         }
       }
-      const connected = await session.waitForProtocolV2Connection(5_000);
+      const connected = await session.waitForProtocolV3Connection(5_000);
       if (!connected) {
         return {
           kind: "pending",
@@ -255,10 +304,104 @@ export function listDevices(env: Env, actor: Actor): Promise<DeviceStatusPayload
   return getTenantStub(env, actor.tenantId).listDevices();
 }
 
+async function prepareOriginPolicyUpdate(
+  env: Env,
+  tenantId: string,
+  devices: OriginPolicyDevicePlan[],
+  allowedOrigins: string[],
+): Promise<boolean> {
+  const coordinator = getTenantStub(env, tenantId);
+  for (const device of devices) {
+    try {
+      if (
+        await coordinator.updateDevicePolicy({
+          deviceId: device.deviceId,
+          policyVersion: device.policyVersion,
+          allowedOrigins,
+          narrowing: device.narrowing,
+        })
+      ) {
+        continue;
+      }
+    } catch {
+      // The directory operation remains pending and can be resumed exactly.
+    }
+    return false;
+  }
+  return true;
+}
+
+export async function updateOriginPolicyForOwner(
+  env: Env,
+  owner: { userId: string; tenantId: string },
+  requestedOrigins: string[],
+): Promise<SetOriginsResult> {
+  let targetOrigins: string[];
+  try {
+    targetOrigins = canonicalizeOrigins(requestedOrigins);
+  } catch (error) {
+    return {
+      kind: "invalid",
+      message: error instanceof RequestBodyError ? error.message : "invalid origin policy",
+    };
+  }
+  const directory = getDirectory(env);
+  for (let pass = 0; pass < 4; pass += 1) {
+    const pending = await directory.beginAllowedOriginsUpdate(owner.userId, targetOrigins);
+    if (pending.kind === "invalid") return pending;
+    if (
+      !(await prepareOriginPolicyUpdate(
+        env,
+        owner.tenantId,
+        pending.devices,
+        pending.origins,
+      ))
+    ) {
+      return { kind: "invalid", message: "browser policies are still reconciling; retry" };
+    }
+    const committed = await directory.commitAllowedOriginsUpdate(
+      owner.userId,
+      pending.operationId,
+    );
+    if (committed.kind === "invalid") return committed;
+    await pushOriginPolicyUpdate(env, owner.tenantId, committed.devices, committed.origins);
+    if (sameOrigins(committed.origins, targetOrigins)) return committed;
+  }
+  return { kind: "invalid", message: "browser policies changed concurrently; retry" };
+}
+
+async function pushOriginPolicyUpdate(
+  env: Env,
+  tenantId: string,
+  devices: Array<{ deviceId: string; policyVersion: number }>,
+  allowedOrigins: string[],
+): Promise<void> {
+  await Promise.allSettled(
+    devices.map((device) =>
+      getDeviceStub(env, device.deviceId).pushPolicy(
+        tenantId,
+        device.policyVersion,
+        allowedOrigins,
+      ),
+    ),
+  );
+}
+
+function sameOrigins(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((origin, index) => origin === right[index]);
+}
+
 export type MintTicketResult =
   | { kind: "quota_exceeded" }
   | { kind: "device_not_found" }
-  | { kind: "ok"; ticket: string; expiresIn: number; websocketPath: string };
+  | {
+      kind: "ok";
+      ticket: string;
+      expiresIn: number;
+      websocketPath: string;
+      allowedOrigins: string[];
+      policyVersion: number;
+    };
 
 /**
  * Device connect-ticket issuance for an already-authenticated device (either
@@ -285,6 +428,8 @@ export async function mintDeviceConnectTicket(
       tenantId: device.tenantId,
       deviceId: device.deviceId,
       credentialVersion: device.credentialVersion,
+      allowedOrigins: device.allowedOrigins,
+      policyVersion: device.policyVersion,
       leaseEpoch: 0,
       browserEpoch,
       agentName: device.deviceId,
@@ -296,6 +441,8 @@ export async function mintDeviceConnectTicket(
     ticket,
     expiresIn: 60,
     websocketPath: `/agents/device/${encodeURIComponent(device.deviceId)}`,
+    allowedOrigins: device.allowedOrigins,
+    policyVersion: device.policyVersion,
   };
 }
 
@@ -322,7 +469,7 @@ export type OwnerRevokeResult = "revoked" | "not_revoked";
  * that must correspond are a swap waiting to happen.
  *
  * `owner.tenantId` is the right tenant to fence the DeviceAgent on because
- * `devices.tenant_id` has a single writer (claimPairingCode, which copies the
+ * `devices.tenant_id` has a single writer (claimPairingOffer, which copies the
  * claiming user's tenant) and `users.tenant_id` is never updated after
  * ensureUser. Should tenants ever become multi-user or renameable, this is the
  * one site that must start reading the tenant off the device row instead.
@@ -358,16 +505,16 @@ const PUSH_TELEMETRY: Record<
 
 /**
  * The teardown half of the kill switch: DeviceAgent marker + socket teardown
- * FIRST (instant, and durable against the 60 s positive credential cache),
+ * FIRST (instant, including for already-minted tickets),
  * coordinator lease/session cleanup second. Agent-first is deliberate: marker +
  * dead socket means zero reconnects even if the coordinator leg never runs,
  * whereas coordinator-first with a crash strands a live socket in a
  * heartbeat-reject reconnect flap.
  *
  * Both legs are best-effort, and only the agent leg is durable. If it throws,
- * the feature degrades to exactly the lazy path it exists to bypass — up to
- * the cache window plus one heartbeat (≤60 s + ≤22 s) — and the coordinator
- * leg does not cover the gap: registerDevice's upsert sets `enabled = 1`, so
+ * the directory revocation still blocks fresh tickets and heartbeat liveness
+ * closes an existing connection. The coordinator leg does not cover that gap:
+ * registerDevice's upsert sets `enabled = 1`, so
  * the device's own reconnect re-enables the row (this resurrection is why
  * agent-first wins, not because the flap is unique to coordinator-first). The
  * directory's revoked_at flip stays authoritative throughout, which is what
@@ -521,7 +668,12 @@ export async function deleteSession(
   if (closing.lease !== undefined) {
     await session.markLifecycle("closing", closing.lease.needsReconciliation);
     const device = getDeviceStub(env, closing.lease.deviceId);
-    await device.requestClose(closing.lease);
+    try {
+      await device.requestClose(closing.lease);
+    } catch {
+      // The exact-fenced closing lease is durable; alarms and inventory
+      // reconciliation retry delivery while the polling handle remains valid.
+    }
   }
   await emitTelemetry(env, {
     event: "session_close",
@@ -565,7 +717,7 @@ export async function dispatchCommand(
     return { kind: "terminal_session" };
   }
 
-  if (input.contractV2 || (await stub.usesV2CommandProtocol())) {
+  if (input.contractV2 || (await stub.usesV3CommandProtocol())) {
     const statusUrl = commandLocation(input.requestUrl, sessionId, command.commandId);
     const actorPseudonym = await telemetryPseudonym("actor", actor.actor, env);
     const outcome = await stub.dispatchV2(command, input.dryRun, actorPseudonym, statusUrl);
@@ -592,14 +744,10 @@ export async function dispatchCommand(
   const admitted = await getTenantStub(env, actor.tenantId).authorizeAttendedCommand({
     sessionId,
     actorPseudonym,
-    credentialFill: command.type === "fill_secret" && !input.dryRun,
   });
   if (!admitted) return { kind: "legacy_quota_exceeded" };
 
-  const outcome: DispatchOutcome =
-    command.type === "fill_secret"
-      ? await stub.fillSecret(command, input.dryRun)
-      : await stub.dispatch(command, input.dryRun);
+  const outcome: DispatchOutcome = await stub.dispatch(command, input.dryRun);
   await emitTelemetry(env, {
     event: "command",
     outcome: outcome.ok ? "legacy_terminal" : `legacy_${outcome.reason}`,

@@ -2,9 +2,9 @@
 
 # Use the Understudy protocol
 
-`@understudy/protocol` is the strict Zod 4 contract shared by the Understudy Worker, Manifest V3 extension, and consumer connectors. Version 0.7.0 adds protocol 2 command safety, unattended devices and sessions, durable status polling, dialog acknowledgements, and bounded inputs.
+`@understudy/protocol` is the strict Zod 4 contract shared by the Understudy Worker, Manifest V3 extension, MCP server, and consumer connectors. The next minor release is 0.9.0 and carries wire protocol 3.
 
-## Install the package
+## Install
 
 ```bash
 pnpm add @understudy/protocol zod
@@ -12,160 +12,128 @@ pnpm add @understudy/protocol zod
 
 The package uses no platform APIs and runs anywhere Zod 4 runs.
 
-## Negotiate protocol 2
+## Negotiate protocol 3
 
-A protocol-2 extension sends:
+A current extension sends `protocolVersion: PROTOCOL_VERSION` and all `PROTOCOL_CAPABILITIES` in its session and device hello frames. Protocol 3 is required for self-serve MCP and unattended sessions after the coordinated cutover.
 
-```typescript
-import {
-  PROTOCOL_CAPABILITIES,
-  PROTOCOL_VERSION,
-  type Event,
-} from "@understudy/protocol";
-
-const hello: Event = {
-  type: "hello",
-  protocolVersion: PROTOCOL_VERSION,
-  capabilities: [...PROTOCOL_CAPABILITIES],
-  browser: navigator.userAgent,
-  extVersion: "0.1.0",
-  tabs: [ownedTab],
-};
-```
-
-A legacy `hello` without `protocolVersion` is protocol 1. Safe writes require the `safe-write-v2` capability.
-
-## Parse command requests
-
-The HTTP request body is strict. Unknown fields and values such as `{ "dryRun": "true" }` fail validation.
-
-```typescript
-import { CommandRequestSchema } from "@understudy/protocol";
-
-const request = CommandRequestSchema.parse(await response.json());
-const dryRun = request.dryRun ?? false;
-```
-
-The HTTP layer must enforce `COMMAND_HTTP_BODY_MAX_BYTES` before JSON parsing. WebSocket layers must enforce `DEVICE_CONTROL_FRAME_MAX_BYTES` and `SESSION_RESULT_FRAME_MAX_BYTES` before parsing.
+Protocol 1 and 2 may retain non-secret attended reads during transition. The retired `fill_secret` command is rejected on every protocol version.
 
 ## Classify commands
 
-Commands use a discriminated union:
-
 | Command | Class |
 |---|---|
-| `snapshot`, `get_tabs`, `wait`, `resolve_ref` | Read |
-| `click`, `type`, `fill_secret`, `key`, `navigate`, `scroll`, `switch_tab` | Write |
+| `snapshot`, `get_tabs`, `list_cards`, `wait`, `resolve_ref` | Read |
+| `click`, `type`, `submit_card`, `key`, `navigate`, `scroll`, `switch_tab` | Write |
 
-Use `isWriteCommand` or `WRITE_COMMAND_TYPES` instead of maintaining another classification.
+Use `isWriteCommand` or `WRITE_COMMAND_TYPES`; do not maintain a second classification. `resolve_ref` is internal.
 
-`resolve_ref` is internal. Consumers express simulation with `{ command, dryRun: true }`.
+The HTTP layer must enforce `COMMAND_HTTP_BODY_MAX_BYTES` before parsing. WebSocket layers must enforce `DEVICE_CONTROL_FRAME_MAX_BYTES` and `SESSION_RESULT_FRAME_MAX_BYTES` before parsing.
 
-Accessibility refs are opaque capabilities. They bind to one extension session, tab attachment, and snapshot generation. Do not parse or reuse them after navigation, attachment replacement, or browser restart.
+## Use accessibility refs
+
+Refs are opaque capabilities valid for the current browser attachment and snapshot generation. Navigation, a newer snapshot, attachment replacement, or browser restart invalidates them. A ref is not consumed by a successful action and must not be parsed as a selector.
+
+## Submit a local card
+
+The extension-local vault exposes only these protocol-3 commands:
+
+```typescript
+type ListCards = {
+  type: "list_cards";
+  commandId: string;
+};
+
+type SubmitCard = {
+  type: "submit_card";
+  commandId: string;
+  cardAlias: string;
+  numberRef: string;
+  expiry:
+    | { kind: "combined"; ref: string }
+    | { kind: "split"; monthRef: string; yearRef: string };
+  cvvRef: string;
+  cardholderNameRef?: string;
+  submitRef: string;
+};
+```
+
+Aliases match `[A-Za-z0-9._-]` and are 1–64 characters. Local enrollment also refuses aliases containing card-number digit runs.
+
+`cards_result` returns aliases and locally approved exact origins. It never returns a PAN, masked PAN, expiration, CVV, cardholder name, ciphertext, or key material.
+
+`card_submission_result` is fixed:
+
+```typescript
+{
+  status: "not_started" | "outcome_unknown";
+  reason:
+    | "card_not_found"
+    | "origin_not_approved"
+    | "stale_ref"
+    | "invalid_mapping"
+    | "input_failed"
+    | "submission_attempted";
+}
+```
+
+`not_started` means no card byte may have been inserted. Once insertion may have begun, the result is `outcome_unknown`; callers must not retry automatically or infer payment approval.
 
 ## Handle write frames
 
-Protocol 2 uses a prepare and grant handshake:
+Protocol 3 retains the durable write handshake:
 
 ```text
 write_prepare -> write_ready -> write_grant -> command_result -> result_ack
 ```
 
-`write_prepare` contains metadata only. The backend persists the grant before sending `write_grant`. The extension persists `started` before its first browser-visible operation.
+The backend persists the grant before sending it. The extension persists `started` before its first browser-visible operation. Every unattended frame binds attempt, deadline, lease ID, lease epoch, and browser epoch.
 
-Every frame is fenced by attempt and deadline. Unattended frames also bind lease ID, lease epoch, and browser epoch.
+The guarantee is at-most-once browser execution with explicit pending and unknown outcomes. It is not exactly-once external outcome delivery.
 
-The guarantee is at-most-once execution with explicit pending and unknown outcomes. It is not exactly-once external outcome delivery.
+## Reconcile device state
 
-## Poll command outcomes
+Device hello and heartbeat frames carry complete assignment and owned-window inventories. Policy updates carry a monotonic version; a device is unavailable for new allocation until it acknowledges the exact current version. Provision frames must match that version and must not widen the extension policy.
 
-`PendingCommandResponseSchema` validates HTTP `202`:
+An offline unattended lease becomes `recovering` after 75 seconds, `suspended` after 90 seconds, and `lost` after its 15-minute adoption window. Suspended leases do not consume capacity but continue to reserve their profile and origins.
 
-```json
-{
-  "commandId": "command_123",
-  "status": "pending",
-  "statusUrl": "https://service.example/v1/sessions/session_123/commands/command_123",
-  "retryPolicy": "poll_same_command"
-}
-```
-
-`CommandStatusResponseSchema` validates polling responses. `safeToRetry` is false for granted work without a proven terminal result.
-
-## Use device-control frames
-
-`DeviceControlClientFrameSchema` validates device hello, heartbeat, provision acknowledgement, closure confirmation, and provisioning failure frames. `DeviceControlServerFrameSchema` validates provision, close, reconnect ticket, closure acknowledgement, and credential-revocation frames.
-
-Device control never carries consumer commands or vaulted plaintext.
-
-## Confirm session closure
-
-Session closure uses a reciprocal acknowledgement:
+Closure uses reciprocal acknowledgement:
 
 ```text
-persist closed -> send closed -> confirm backend lifecycle -> closed_ack
+persist closure -> send closed -> confirm exact fence -> closed_ack
 ```
 
-The device retains each `closed` record until it receives a `closed_ack` with the exact session, lease, lease epoch, and browser epoch. It resends unacknowledged records after reconnects. The backend accepts exact replays after a successful closure and exact lost-fence replays while preserving `lost`. It never acknowledges a missing lease or a stale or mismatched fence.
+The device resends unacknowledged records after reconnect. Exact server-reported orphan windows can be closed; ordinary restored tabs cannot.
 
-Deploy the backend before the extension. An older extension ignores the additive `closed_ack` frame. A newer extension connected to an older backend retains the closure record and does not promote a staged profile.
+## Handle attended detach
 
-## Handle terminal WebSocket closes
-
-The package exports two application close codes:
-
-| Export | Code | Meaning |
-|---|---:|---|
-| `WS_CLOSE_REPLACED` | `4001` | A newer extension connection replaced this connection |
-| `WS_CLOSE_SESSION_TERMINAL` | `4003` | The backend retired the session permanently |
-
-Clients must cancel reconnect state before invoking their close handler for either code. Code `4001` is terminal for that extension instance. Code `4003` also stops command admission and detaches local browser control.
-
-## Deliver dialogs
-
-Every `dialog` record includes `dialogId` and `occurredAt`. The server answers with `dialog_ack`. The extension can replay unacknowledged records within the same browser epoch while the server deduplicates them.
+Attended hello frames carry an attachment incarnation UUID. `attended_detached` repeats that UUID and tab ID. The backend ignores stale detach frames, clears browser-derived state for the current attachment, and moves the session to `idle`. Socket loss remains `detached`.
 
 ## Enforce limits
 
-The schemas enforce:
-
 | Field | Limit |
-|---|---|
+|---|---:|
 | IDs | 128 characters |
+| Card aliases | 64 characters |
 | Refs and key specifications | 256 characters |
 | URLs | 8 KiB |
 | `type.text` | 64 KiB |
-| `secretRef` | 512 characters |
-| `wait.value` | Integer from 0 through 20,000 for `for: "ms"` only |
 | Dialog message | 4 KiB |
 | Dialog default prompt | 1 KiB |
 | Browser user agent | 512 characters |
 | Extension version | 64 characters |
 | Accessibility tree | 5,000 nodes, depth 64 |
 | Accessibility name or value | 4 KiB |
-| Session-owned tabs | One |
+| Owned-window inventory | 100 records |
 
-Schemas reject oversized values. Transport code rejects oversized frames before durable mutation and closes oversized WebSockets with code `1009`.
-
-## Main exports
-
-The package exports:
-
-- Command, event, HTTP request, status, device, session, and frame schemas
-- `parseCommand`, `parseEvent`, and safe parser variants
-- Protocol version and capabilities
-- Terminal WebSocket close codes
-- Command classification helpers
-- Byte and tree limits
-- TypeScript types inferred from every public schema
-
-See [`src/index.ts`](src/index.ts) for the exhaustive export surface.
+Schemas reject oversized or unknown fields. Transport code rejects oversized frames before durable mutation and closes oversized WebSockets with code `1009`.
 
 ## Version history
 
-- **0.7.0**: protocol 2, unattended status and control frames, strict bounds, durable command polling, and dialog acknowledgement
-- **0.6.0**: target-bound snapshots and accessibility refs
+- **0.9.0 / protocol 3**: cloud-secret hard cut, local-card commands, device policy acknowledgement, physical-window inventory, suspended adoption, and attended idle
+- **0.8.0**: durable device-control closure acknowledgements
+- **0.7.0**: protocol 2 write safety, unattended control, strict bounds, and command polling
+- **0.6.0**: target-bound snapshots and refs
 - **0.5.0**: dialog events
 - **0.4.0**: shared write classification
-- **0.3.0**: internal `resolve_ref`
-- **0.2.0**: `fill_secret` and simulated action results
+
+See [`src/index.ts`](src/index.ts) for the exhaustive export surface.

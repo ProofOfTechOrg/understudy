@@ -1,5 +1,13 @@
 # @understudy/extension
 
+## 0.2.0
+
+### Minor Changes
+
+- Add the extension-local AES-GCM payment-card vault, enrollment UI, exact payment-origin policy, and atomic card submission boundary.
+- Add direct dashboard pairing offers, versioned origin-policy acknowledgement, complete assignment and owned-window reconciliation, suspended-session adoption, and attended idle detach fencing.
+- Remove every cloud-vault and secret-fill interface.
+
 ## 0.1.2
 
 ### Patch Changes

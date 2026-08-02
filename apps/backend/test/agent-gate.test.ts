@@ -121,11 +121,40 @@ describe("OAuth path delegation", () => {
   it("keeps non-delegated routes on the existing pipeline", async () => {
     const health = await get(`${CANONICAL}/health`);
     expect(health.status).toBe(200);
-    expect(await health.json()).toEqual({ ok: true });
+    expect(await health.json()).toMatchObject({
+      ok: true,
+      commit: expect.any(String),
+      versionId: expect.any(String),
+      deployedAt: expect.any(String),
+    });
     // A dashboard path resolves to the dashboard app (login page when
     // signed out), not the /v1 pipeline.
     const dash = await get(`${CANONICAL}/dashboard`);
     expect(dash.status).toBe(200);
     expect(await dash.text()).toContain("Sign in");
+  });
+});
+
+describe("canonical transport policy", () => {
+  it("redirects every canonical HTTP path before routing", async () => {
+    for (const path of ["/health", "/v1/sessions", "/dashboard", "/mcp"]) {
+      const response = await directGet(`http://understudy.proofof.tech${path}`);
+      expect(response.status).toBe(308);
+      expect(response.headers.get("location")).toBe(`${CANONICAL}${path}`);
+    }
+  });
+
+  it("adds staged HSTS to success, error, dashboard, OAuth, and MCP responses", async () => {
+    for (const path of [
+      "/health",
+      "/v1/sessions",
+      "/dashboard",
+      "/.well-known/oauth-authorization-server",
+      "/mcp",
+      "/missing",
+    ]) {
+      const response = await directGet(`${CANONICAL}${path}`);
+      expect(response.headers.get("strict-transport-security"), path).toBe("max-age=300");
+    }
   });
 });

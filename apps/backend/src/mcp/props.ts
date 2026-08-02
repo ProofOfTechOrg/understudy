@@ -13,6 +13,9 @@ export type UnderstudyMcpProps = {
   actorId: string;
   authMethod: "oauth" | "static";
   scopes: string[];
+  deviceId: string;
+  authEpoch: number;
+  contractVersion: number;
 };
 
 export function isUnderstudyMcpProps(value: unknown): value is UnderstudyMcpProps {
@@ -26,7 +29,11 @@ export function isUnderstudyMcpProps(value: unknown): value is UnderstudyMcpProp
     typeof props.actorId === "string" &&
     props.actorId.length > 0 &&
     (props.authMethod === "oauth" || props.authMethod === "static") &&
-    Array.isArray(props.scopes)
+    Array.isArray(props.scopes) &&
+    typeof props.deviceId === "string" &&
+    props.deviceId.length > 0 &&
+    Number.isInteger(props.authEpoch) &&
+    Number.isInteger(props.contractVersion)
   );
 }
 

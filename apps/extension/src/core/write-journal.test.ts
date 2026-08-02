@@ -107,4 +107,31 @@ describe("WriteJournal", () => {
     expect(JSON.stringify(storage.values)).not.toContain("secret-ref");
     expect(JSON.stringify(storage.values)).not.toContain("prior-url.example");
   });
+
+  it("persists only the fixed payment result after a sensitive write", async () => {
+    const storage = new MemoryStorage();
+    const journal = new WriteJournal(storage, "journal");
+    await journal.prepare({ ...PREPARED, attachmentId: "attachment-1" });
+    await journal.markStarted(PREPARED.attemptId);
+    await journal.markCompleted(PREPARED.attemptId, {
+      type: "card_submission_result",
+      commandId: PREPARED.commandId,
+      status: "outcome_unknown",
+      reason: "submission_attempted",
+    });
+
+    expect(await journal.recover()).toEqual([
+      {
+        ...PREPARED,
+        attachmentId: "attachment-1",
+        state: "completed_unacked",
+        event: {
+          type: "card_submission_result",
+          commandId: PREPARED.commandId,
+          status: "outcome_unknown",
+          reason: "submission_attempted",
+        },
+      },
+    ]);
+  });
 });

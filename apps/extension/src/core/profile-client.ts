@@ -14,7 +14,13 @@ import {
   type ClosureRecord,
 } from "./session-manager";
 import { RetryableStartupGate } from "./startup-gate";
+import {
+  RequestDeadlineError,
+  readBoundedJson,
+  withRequestDeadline,
+} from "./request-deadline";
 import { ReconnectingWs } from "./ws-client";
+import type { CardVault } from "../payment/card-vault";
 
 const BROWSER_EPOCH_KEY = "understudy:browserEpoch";
 const STAGED_CONFIG_KEY = "understudy:stagedProfile";
@@ -26,6 +32,7 @@ const CONFIG_KEYS = [
   "deviceId",
   "deviceCredential",
   "originPolicy",
+  "policyVersion",
 ] as const;
 const PROFILE_STATE_KEYS = [
   ...CONFIG_KEYS,
@@ -35,6 +42,8 @@ const PROFILE_STATE_KEYS = [
 ] as const;
 const TICKET_BACKOFF_BASE_MS = 500;
 const TICKET_BACKOFF_CAP_MS = 30_000;
+const TICKET_REQUEST_TIMEOUT_MS = 15_000;
+const TICKET_RESPONSE_MAX_BYTES = 16 * 1024;
 
 type ControlPurpose = "hosting" | "cleanup";
 type ControlBlockReason = "replaced" | "terminal_close" | "ticket_rejected" | "invalid_ticket";
@@ -50,6 +59,7 @@ interface ControlAttempt {
   config: ProfileConfig;
   purpose: ControlPurpose;
   controller: AbortController;
+  helloSent: boolean;
 }
 
 export interface ProfileConfig {
@@ -58,6 +68,7 @@ export interface ProfileConfig {
   deviceId: string;
   deviceCredential: string;
   originPolicy: string[];
+  policyVersion: number;
 }
 
 export type ProfileStatus = "disabled" | "connecting" | "connected" | "error";
@@ -183,37 +194,114 @@ export class ProfileClient {
       unattendedEnabled: this.config.unattendedEnabled,
       deviceId: this.config.deviceId,
       originPolicy: [...this.config.originPolicy],
+      policyVersion: this.config.policyVersion,
     };
   }
 
+  async pairingCredential(): Promise<string | undefined> {
+    await this.ensureInitialized();
+    return this.credentialRevoked ? undefined : this.config?.deviceCredential;
+  }
+
+  async pairingTransitionPersisted(expected: ProfileConfig): Promise<boolean> {
+    await this.ensureInitialized();
+    await this.configWriteTail;
+    const stored = await browser.storage.local.get([
+      ...CONFIG_KEYS,
+      STAGED_CONFIG_KEY,
+      CREDENTIAL_REVOKED_KEY,
+    ]);
+    if (
+      stored[STAGED_CONFIG_KEY] !== null &&
+      stored[STAGED_CONFIG_KEY] !== undefined
+    ) {
+      return false;
+    }
+    let active: ProfileConfig;
+    try {
+      active = normalizeProfileConfig({
+        serviceOrigin: stored.serviceOrigin,
+        unattendedEnabled: stored.unattendedEnabled,
+        deviceId: stored.deviceId,
+        deviceCredential: stored.deviceCredential,
+        originPolicy: stored.originPolicy,
+        policyVersion: stored.policyVersion,
+      });
+    } catch {
+      return false;
+    }
+    return (
+      stored[CREDENTIAL_REVOKED_KEY] !== true &&
+      samePairingAuthority(active, normalizeProfileConfig(expected))
+    );
+  }
+
+  paymentVault(): CardVault {
+    return this.sessions.paymentVault();
+  }
+
   configure(config: ProfileConfig): Promise<void> {
+    return this.configureWithTransition(config, false, false);
+  }
+
+  configurePaired(
+    config: ProfileConfig,
+    previousCredential: string | undefined,
+  ): Promise<void> {
+    const discardPrevious =
+      previousCredential !== undefined &&
+      this.config?.deviceCredential === previousCredential &&
+      this.config.deviceId !== config.deviceId;
+    return this.configureWithTransition(config, discardPrevious, true);
+  }
+
+  private configureWithTransition(
+    config: ProfileConfig,
+    discardPrevious: boolean,
+    requireCommit: boolean,
+  ): Promise<void> {
     const normalized = normalizeProfileConfig(config);
     this.assertServiceOrigin(normalized);
     const generation = this.invalidateControl();
-    const cleanupIntent = this.configureCleanupIntent(normalized);
+    const cleanupIntent = discardPrevious
+      ? "discard"
+      : this.configureCleanupIntent(normalized);
     if (cleanupIntent !== null) {
       this.sessions.beginStopAll(cleanupIntent);
     }
-    return this.configureRequest(normalized, generation);
+    return this.configureRequest(
+      normalized,
+      generation,
+      discardPrevious,
+      requireCommit,
+    );
   }
 
   private async configureRequest(
     normalized: ProfileConfig,
     generation: number,
+    discardPrevious: boolean,
+    requireCommit: boolean,
   ): Promise<void> {
     await this.enqueueLifecycle(async () => {
       await this.ensureInitialized();
       if (!this.isGenerationCurrent(generation)) return;
-      await this.configureInitialized(normalized, generation);
+      await this.configureInitialized(normalized, generation, discardPrevious);
     });
     await this.resumeForGeneration(generation);
+    if (requireCommit && !this.pairedTransitionCommitted(normalized, generation)) {
+      throw new Error("paired profile configuration was superseded");
+    }
   }
 
   private async configureInitialized(
     normalized: ProfileConfig,
     generation: number,
+    discardPrevious: boolean,
   ): Promise<void> {
-    const cleanupIntent = this.configureCleanupIntent(normalized);
+    const cleanupIntent = discardPrevious
+      ? "discard"
+      : this.configureCleanupIntent(normalized);
     if (cleanupIntent !== null) {
       this.sessions.beginStopAll(cleanupIntent);
     }
@@ -222,30 +310,27 @@ export class ProfileClient {
     this.blockedProfileIdentity = null;
     this.controlBlock = null;
     const wasCredentialRevoked = this.credentialRevoked;
-    if (wasCredentialRevoked) {
-      this.config = normalized;
+    if (wasCredentialRevoked || discardPrevious) {
+      const active = { ...normalized, unattendedEnabled: false };
+      this.config = active;
       this.activeProfileKey = normalizedKey;
-      this.stagedConfig = null;
-      if (!(await this.persistProfileState(normalized, null, generation))) return;
+      this.stagedConfig = normalized;
+      this.credentialRevoked = true;
+      if (!(await this.persistProfileState(active, normalized, generation))) return;
       await this.sessions.stopAll("discard");
       if (!this.isGenerationCurrent(generation)) return;
       await this.sessions.discardServerState();
       if (!this.isGenerationCurrent(generation)) return;
-      this.credentialRevoked = false;
-      try {
-        if (!(await this.persistProfileState(normalized, null, generation))) return;
-      } catch (error) {
-        if (this.isGenerationCurrent(generation)) {
-          this.credentialRevoked = true;
-        }
-        throw error;
-      }
       return;
     }
     this.credentialRevoked = false;
     const current = this.config;
     const identityChanged =
       current !== null && profileIdentity(current) !== profileIdentity(normalized);
+    const rotatesCurrentDevice =
+      current !== null &&
+      identityChanged &&
+      sameDeviceAuthority(current, normalized);
     const ownsOldWork =
       current !== null &&
       (current.unattendedEnabled ||
@@ -253,7 +338,24 @@ export class ProfileClient {
         this.sessions.closureOutbox().length > 0 ||
         this.sessions.vacatedLeases().length > 0);
 
-    if (current !== null && identityChanged && ownsOldWork) {
+    if (current !== null && rotatesCurrentDevice) {
+      if (
+        normalized.policyVersion < current.policyVersion ||
+        (normalized.policyVersion === current.policyVersion &&
+          !sameOrigins(normalized.originPolicy, current.originPolicy))
+      ) {
+        throw new Error("paired profile policy conflicts with local authority");
+      }
+      if (normalized.policyVersion > current.policyVersion) {
+        await this.sessions.applyPolicy(
+          normalized.policyVersion,
+          normalized.originPolicy,
+        );
+        if (!this.isGenerationCurrent(generation)) return;
+      }
+    }
+
+    if (current !== null && identityChanged && !rotatesCurrentDevice && ownsOldWork) {
       this.config = { ...current, unattendedEnabled: false };
       this.stagedConfig = normalized;
       if (
@@ -319,6 +421,9 @@ export class ProfileClient {
       await this.ensureInitialized();
       generation = this.generation;
       await this.sessions.retryCleanup();
+      if (this.credentialRevoked && this.stagedConfig !== null) {
+        await this.sessions.discardServerState();
+      }
     });
     if (!this.isGenerationCurrent(generation)) return;
     const attempt = this.controlAttempt;
@@ -331,6 +436,24 @@ export class ProfileClient {
 
   private async resumeForGeneration(generation: number): Promise<void> {
     if (!this.isGenerationCurrent(generation)) return;
+    if (this.credentialRevoked && this.stagedConfig !== null) {
+      if (this.sessions.pendingCleanup()) {
+        this.setStatus("error");
+        return;
+      }
+      const active = this.requiredConfig();
+      this.credentialRevoked = false;
+      try {
+        if (!(await this.persistProfileState(active, this.stagedConfig, generation))) {
+          return;
+        }
+      } catch (error) {
+        if (this.isGenerationCurrent(generation)) {
+          this.credentialRevoked = true;
+        }
+        throw error;
+      }
+    }
     if (this.credentialRevoked || this.isControlBlocked()) {
       this.setStatus("error");
       return;
@@ -390,26 +513,36 @@ export class ProfileClient {
       config: cloneConfig(config),
       purpose,
       controller: new AbortController(),
+      helloSent: false,
     };
     this.controlAttempt = attempt;
     let response: Response;
     try {
-      response = await fetch(
-        new URL("/v1/device/connect-ticket", config.serviceOrigin).toString(),
-        {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${config.deviceCredential}`,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({ browserEpoch: this.epoch }),
-          signal: attempt.controller.signal,
+      response = await withRequestDeadline(
+        TICKET_REQUEST_TIMEOUT_MS,
+        (deadlineSignal) => {
+          const signal = AbortSignal.any([
+            attempt.controller.signal,
+            deadlineSignal,
+          ]);
+          return fetch(
+            new URL("/v1/device/connect-ticket", config.serviceOrigin).toString(),
+            {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${config.deviceCredential}`,
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({ browserEpoch: this.epoch }),
+              signal,
+            },
+          );
         },
       );
     } catch (error) {
       if (!this.isAttemptCurrent(attempt)) return;
       this.controlAttempt = null;
-      if (isAbortError(error)) return;
+      if (isAbortError(error) && !(error instanceof RequestDeadlineError)) return;
       this.scheduleRetry(attempt);
       return;
     }
@@ -418,6 +551,12 @@ export class ProfileClient {
       this.controlAttempt = null;
       if (isRetryableTicketStatus(response.status)) {
         this.scheduleRetry(attempt);
+      } else if (response.status === 401 || response.status === 404) {
+        this.invalidateControl();
+        this.sessions.beginStopAll("discard");
+        await this.enqueueLifecycle(async () => {
+          await this.handleCredentialRevoked();
+        });
       } else {
         await this.blockControlAfterTicketError(
           attempt.config,
@@ -429,10 +568,22 @@ export class ProfileClient {
 
     let value: unknown;
     try {
-      value = await response.json();
-    } catch {
+      value = await withRequestDeadline(
+        TICKET_REQUEST_TIMEOUT_MS,
+        (deadlineSignal) =>
+          readBoundedJson(
+            response,
+            AbortSignal.any([attempt.controller.signal, deadlineSignal]),
+            TICKET_RESPONSE_MAX_BYTES,
+          ),
+      );
+    } catch (error) {
       if (!this.isAttemptCurrent(attempt)) return;
       this.controlAttempt = null;
+      if (error instanceof RequestDeadlineError) {
+        this.scheduleRetry(attempt);
+        return;
+      }
       await this.blockControlAfterTicketError(
         attempt.config,
         "invalid_ticket",
@@ -447,6 +598,42 @@ export class ProfileClient {
         "invalid_ticket",
       );
       return;
+    }
+    let authoritativeOrigins: string[];
+    try {
+      authoritativeOrigins = normalizeOriginPolicy(value.allowedOrigins);
+    } catch {
+      this.controlAttempt = null;
+      await this.blockControlAfterTicketError(attempt.config, "invalid_ticket");
+      return;
+    }
+    if (
+      value.policyVersion < config.policyVersion ||
+      (value.policyVersion === config.policyVersion &&
+        !sameOrigins(authoritativeOrigins, config.originPolicy))
+    ) {
+      this.controlAttempt = null;
+      await this.blockControlAfterTicketError(attempt.config, "invalid_ticket");
+      return;
+    }
+    if (value.policyVersion > config.policyVersion) {
+      try {
+        const applied = await this.applyAuthoritativePolicy(
+          value.policyVersion,
+          authoritativeOrigins,
+          attempt.generation,
+          () => this.isAttemptCurrent(attempt),
+        );
+        if (applied === null) {
+          this.retryPolicyReconciliation(attempt);
+          return;
+        }
+        attempt.config.policyVersion = applied.policyVersion;
+        attempt.config.originPolicy = [...applied.originPolicy];
+      } catch {
+        this.retryPolicyReconciliation(attempt);
+        return;
+      }
     }
 
     let url: URL;
@@ -489,8 +676,31 @@ export class ProfileClient {
         },
         onOpen: () => {
           if (!this.isPeerCurrent(attempt, peer)) return;
+          const inventory = this.sessions.controlInventory();
+          if (inventory === null) {
+            peer.stop();
+            if (this.control === peer) this.control = null;
+            if (this.controlAttempt === attempt) this.controlAttempt = null;
+            this.scheduleRetry(attempt);
+            return;
+          }
           this.ticketBackoffMs = TICKET_BACKOFF_BASE_MS;
           this.setStatus("connected");
+          if (
+            attempt.purpose === "cleanup" ||
+            this.sessions.pendingReleaseCleanup()
+          ) {
+            void this.sessions
+              .retryCleanup()
+              .then(() => this.flushClosureOutbox(attempt, peer))
+              .catch(() => {});
+            return;
+          }
+          if (this.sessions.closureOutbox().length > 0) {
+            void this.flushClosureOutbox(attempt, peer).catch(() => {});
+            return;
+          }
+          attempt.helloSent = true;
           peer.send({
             type: "device_hello",
             protocolVersion: PROTOCOL_VERSION,
@@ -499,7 +709,10 @@ export class ProfileClient {
             browserEpoch: this.epoch,
             browser: navigator.userAgent,
             extVersion: browser.runtime.getManifest().version,
-            allowedOrigins: config.originPolicy,
+            allowedOrigins: attempt.config.originPolicy,
+            policyVersion: attempt.config.policyVersion,
+            assignments: inventory.assignments,
+            ownedWindows: inventory.ownedWindows,
           } satisfies DeviceControlClientFrame);
           void this.flushClosureOutbox(attempt, peer).catch(() => {});
         },
@@ -543,14 +756,23 @@ export class ProfileClient {
             void this.resumeForGeneration(attempt.generation);
           }
         },
-        heartbeatFrame: () => ({
-          type: "heartbeat",
-          deviceId: config.deviceId,
-          browserEpoch: this.epoch,
-          leaseIds: this.sessions
-            .assignments()
-            .map((assignment) => assignment.leaseId),
-        }),
+        heartbeatFrame: () => {
+          if (this.sessions.closureOutbox().length > 0) {
+            void this.flushClosureOutbox(attempt, peer).catch(() => {});
+            return null;
+          }
+          if (!attempt.helloSent) return null;
+          const inventory = this.sessions.controlInventory();
+          return inventory === null
+            ? null
+            : {
+                type: "heartbeat",
+                deviceId: config.deviceId,
+                browserEpoch: this.epoch,
+                assignments: inventory.assignments,
+                ownedWindows: inventory.ownedWindows,
+              };
+        },
       },
       DEVICE_CONTROL_FRAME_MAX_BYTES,
     );
@@ -573,6 +795,14 @@ export class ProfileClient {
     switch (frame.type) {
       case "provision":
         if (attempt.purpose !== "hosting") return;
+        if (
+          frame.policyVersion !== attempt.config.policyVersion ||
+          !frame.allowedOrigins.every((origin) =>
+            attempt.config.originPolicy.includes(origin),
+          )
+        ) {
+          return;
+        }
         try {
           const tab = await this.sessions.provision(
             frame,
@@ -604,6 +834,36 @@ export class ProfileClient {
             reason: "local provisioning failed",
           } satisfies DeviceControlClientFrame);
         }
+        return;
+      case "policy_update":
+        if (frame.policyVersion <= attempt.config.policyVersion) return;
+        try {
+          const applied = await this.applyAuthoritativePolicy(
+            frame.policyVersion,
+            frame.allowedOrigins,
+            attempt.generation,
+            () => this.isPeerCurrent(attempt, peer),
+          );
+          if (applied === null) {
+            this.retryPolicyReconciliation(attempt, peer);
+            return;
+          }
+          attempt.config.policyVersion = applied.policyVersion;
+          attempt.config.originPolicy = [...applied.originPolicy];
+        } catch {
+          this.retryPolicyReconciliation(attempt, peer);
+          return;
+        }
+        if (!this.isPeerCurrent(attempt, peer)) return;
+        peer.send({
+          type: "policy_ack",
+          deviceId: attempt.config.deviceId,
+          browserEpoch: this.epoch,
+          policyVersion: frame.policyVersion,
+        } satisfies DeviceControlClientFrame);
+        return;
+      case "close_orphan":
+        await this.sessions.closeOrphan(frame);
         return;
       case "close_lease":
         await this.sessions.closeLease(frame, "release");
@@ -640,7 +900,7 @@ export class ProfileClient {
       if (!peer.send(closedFrame(entry))) return;
     }
     if (
-      attempt.purpose === "cleanup" &&
+      !attempt.helloSent &&
       !this.sessions.pendingReleaseCleanup() &&
       this.sessions.closureOutbox().length === 0
     ) {
@@ -676,7 +936,7 @@ export class ProfileClient {
     this.stagedConfig = null;
     if (this.config !== null) {
       this.config = { ...this.config, unattendedEnabled: false };
-      if (!(await this.persistProfileState(this.config, null))) return;
+      if (!(await this.persistStoppedProfile(this.generation))) return;
     }
     await this.sessions.stopAll("discard");
     await this.sessions.discardServerState();
@@ -746,6 +1006,21 @@ export class ProfileClient {
         attempt.generation,
       );
     }, delayMs);
+  }
+
+  private retryPolicyReconciliation(
+    attempt: ControlAttempt,
+    peer?: ReconnectingWs,
+  ): void {
+    if (peer === undefined) {
+      if (!this.isAttemptCurrent(attempt)) return;
+    } else {
+      if (!this.isPeerCurrent(attempt, peer)) return;
+      this.control = null;
+      peer.stop();
+    }
+    if (this.controlAttempt === attempt) this.controlAttempt = null;
+    this.scheduleRetry(attempt);
   }
 
   private invalidateControl(): number {
@@ -829,7 +1104,8 @@ export class ProfileClient {
     const identityChanged =
       profileIdentity(current) !== profileIdentity(normalized);
     const disabling = current.unattendedEnabled && !normalized.unattendedEnabled;
-    if (!identityChanged && !disabling) return null;
+    const switchesAuthority = identityChanged && !sameDeviceAuthority(current, normalized);
+    if (!switchesAuthority && !disabling) return null;
     const ownsOldWork =
       current.unattendedEnabled ||
       this.sessions.assignments().length > 0 ||
@@ -910,12 +1186,20 @@ export class ProfileClient {
       deviceId: stored.deviceId,
       deviceCredential: stored.deviceCredential,
       originPolicy: stored.originPolicy,
+      // Protocol-2 profiles predate versioned policy but already carry the
+      // authoritative origin snapshot. Preserve their device credential and
+      // migrate that snapshot to the initial version instead of treating the
+      // whole installation as corrupt and forcing an identity-changing pair.
+      policyVersion: stored.policyVersion ?? 1,
     };
     let active: ProfileConfig | null;
     try {
       active = normalizeProfileConfig(candidate);
     } catch {
       active = null;
+    }
+    if (active !== null && stored.policyVersion === undefined) {
+      await browser.storage.local.set({ policyVersion: active.policyVersion });
     }
     let staged: ProfileConfig | null;
     try {
@@ -975,6 +1259,42 @@ export class ProfileClient {
     return this.config;
   }
 
+  private async applyAuthoritativePolicy(
+    policyVersion: number,
+    origins: string[],
+    generation: number,
+    isCurrent: () => boolean,
+  ): Promise<ProfileConfig | null> {
+    let applied: ProfileConfig | null = null;
+    await this.enqueueLifecycle(async () => {
+      if (!this.isGenerationCurrent(generation) || !isCurrent()) return;
+      const current = this.requiredConfig();
+      const normalized = normalizeOriginPolicy(origins);
+      if (policyVersion < current.policyVersion) return;
+      if (policyVersion === current.policyVersion) {
+        if (!sameOrigins(normalized, current.originPolicy)) {
+          throw new Error("authoritative policy conflicts at the current version");
+        }
+        applied = cloneConfig(current);
+        return;
+      }
+      await this.sessions.applyPolicy(policyVersion, normalized);
+      if (!this.isGenerationCurrent(generation) || !isCurrent()) return;
+      const updated = {
+        ...this.requiredConfig(),
+        originPolicy: normalized,
+        policyVersion,
+      };
+      if (!(await this.persistProfileState(updated, this.stagedConfig, generation))) {
+        return;
+      }
+      if (!isCurrent()) return;
+      this.config = updated;
+      applied = cloneConfig(updated);
+    });
+    return applied;
+  }
+
   private assertServiceOrigin(config: ProfileConfig): void {
     if (
       this.requiredServiceOrigin !== undefined &&
@@ -982,6 +1302,19 @@ export class ProfileClient {
     ) {
       throw new Error("profile service origin is not allowed in this build");
     }
+  }
+
+  private pairedTransitionCommitted(
+    expected: ProfileConfig,
+    generation: number,
+  ): boolean {
+    return (
+      this.isGenerationCurrent(generation) &&
+      this.config !== null &&
+      sameProfileConfig(this.config, expected) &&
+      this.stagedConfig === null &&
+      !this.credentialRevoked
+    );
   }
 
   private isControlBlocked(): boolean {
@@ -1038,21 +1371,22 @@ function normalizeProfileConfig(value: unknown): ProfileConfig {
     input.deviceCredential.length < 1 ||
     input.deviceCredential.length > 4 * 1024 ||
     !Array.isArray(input.originPolicy) ||
-    input.originPolicy.length < 1 ||
     input.originPolicy.length > 32 ||
-    !input.originPolicy.every((item) => typeof item === "string")
+    !input.originPolicy.every((item) => typeof item === "string") ||
+    typeof input.policyVersion !== "number" ||
+    !Number.isInteger(input.policyVersion) ||
+    input.policyVersion < 1
   ) {
     throw new Error("invalid profile config");
   }
-  const originPolicy = [
-    ...new Set(input.originPolicy.map(canonicalOrigin)),
-  ].sort();
+  const originPolicy = normalizeOriginPolicy(input.originPolicy);
   return {
     serviceOrigin: origin.origin,
     unattendedEnabled: input.unattendedEnabled,
     deviceId: input.deviceId.toLowerCase(),
     deviceCredential: input.deviceCredential,
     originPolicy,
+    policyVersion: input.policyVersion,
   };
 }
 
@@ -1083,6 +1417,10 @@ function canonicalOrigin(value: string): string {
   return url.origin;
 }
 
+function normalizeOriginPolicy(origins: readonly string[]): string[] {
+  return [...new Set(origins.map(canonicalOrigin))].sort();
+}
+
 function cloneConfig(config: ProfileConfig): ProfileConfig {
   return { ...config, originPolicy: [...config.originPolicy] };
 }
@@ -1092,8 +1430,34 @@ function profileIdentity(config: ProfileConfig): string {
     serviceOrigin: config.serviceOrigin,
     deviceId: config.deviceId,
     deviceCredential: config.deviceCredential,
-    originPolicy: config.originPolicy,
   });
+}
+
+function sameDeviceAuthority(left: ProfileConfig, right: ProfileConfig): boolean {
+  return (
+    left.serviceOrigin === right.serviceOrigin && left.deviceId === right.deviceId
+  );
+}
+
+function samePairingAuthority(left: ProfileConfig, right: ProfileConfig): boolean {
+  return (
+    left.serviceOrigin === right.serviceOrigin &&
+    left.deviceId === right.deviceId &&
+    left.deviceCredential === right.deviceCredential &&
+    left.policyVersion === right.policyVersion &&
+    sameOrigins(left.originPolicy, right.originPolicy)
+  );
+}
+
+function sameProfileConfig(left: ProfileConfig, right: ProfileConfig): boolean {
+  return (
+    left.serviceOrigin === right.serviceOrigin &&
+    left.unattendedEnabled === right.unattendedEnabled &&
+    left.deviceId === right.deviceId &&
+    left.deviceCredential === right.deviceCredential &&
+    left.policyVersion === right.policyVersion &&
+    sameOrigins(left.originPolicy, right.originPolicy)
+  );
 }
 
 async function profileKey(config: ProfileConfig): Promise<string> {
@@ -1125,15 +1489,35 @@ function parseControlBlock(value: unknown): ControlBlock | null {
 
 function isTicketResponse(
   value: unknown,
-): value is { ticket: string; websocketPath: string } {
+): value is {
+  ticket: string;
+  websocketPath: string;
+  allowedOrigins: string[];
+  policyVersion: number;
+} {
   if (typeof value !== "object" || value === null) return false;
-  const ticket = value as { ticket?: unknown; websocketPath?: unknown };
+  const ticket = value as {
+    ticket?: unknown;
+    websocketPath?: unknown;
+    allowedOrigins?: unknown;
+    policyVersion?: unknown;
+  };
   return (
     typeof ticket.ticket === "string" &&
     ticket.ticket.length > 0 &&
     typeof ticket.websocketPath === "string" &&
-    ticket.websocketPath.length > 0
+    ticket.websocketPath.length > 0 &&
+    Array.isArray(ticket.allowedOrigins) &&
+    ticket.allowedOrigins.length <= 32 &&
+    ticket.allowedOrigins.every((origin) => typeof origin === "string") &&
+    typeof ticket.policyVersion === "number" &&
+    Number.isInteger(ticket.policyVersion) &&
+    ticket.policyVersion >= 1
   );
+}
+
+function sameOrigins(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((origin, index) => origin === right[index]);
 }
 
 function isRetryableTicketStatus(status: number): boolean {

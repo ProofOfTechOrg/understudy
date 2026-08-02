@@ -53,6 +53,8 @@ export class CdpSession {
   // in order instead of racing to overwrite browser.storage.session.
   private genPersistChain: Promise<unknown> = Promise.resolve();
   private allowedOrigins: Set<string> | null = null;
+  private sensitiveOrigin: string | null = null;
+  private sensitiveSubmissionArmed = false;
 
   private constructor(
     readonly tabId: number,
@@ -121,6 +123,8 @@ export class CdpSession {
 
   async detach(): Promise<void> {
     this.enabled = false;
+    this.sensitiveOrigin = null;
+    this.sensitiveSubmissionArmed = false;
     await browser.debugger.detach({ tabId: this.tabId });
   }
 
@@ -170,7 +174,9 @@ export class CdpSession {
     const url = event.request?.url;
     if (
       isMainDocument &&
-      (typeof url !== "string" || !this.isAllowedTopLevelUrl(url))
+      (typeof url !== "string" ||
+        !this.isAllowedTopLevelUrl(url) ||
+        !this.isSensitiveTopLevelUrl(url))
     ) {
       await this.send("Fetch.failRequest", {
         requestId: event.requestId,
@@ -201,6 +207,20 @@ export class CdpSession {
     }
   }
 
+  pinSensitiveOrigin(origin: string): void {
+    this.sensitiveOrigin = origin;
+    this.sensitiveSubmissionArmed = false;
+  }
+
+  async stopPendingSensitiveNavigation(expectedOrigin: string): Promise<boolean> {
+    await this.send("Page.stopLoading");
+    try {
+      return new URL((await this.mainFrameIdentity()).url).origin === expectedOrigin;
+    } catch {
+      return false;
+    }
+  }
+
   async reconcile(): Promise<void> {
     this.enabled = false;
     await this.enableDomains();
@@ -216,6 +236,115 @@ export class CdpSession {
     });
     if (!ref.startsWith(prefix)) return null;
     return this.refMap.get(ref) ?? null;
+  }
+
+  hasCurrentRefs(refs: readonly string[]): boolean {
+    return refs.every((ref) => this.resolveRef(ref) !== null);
+  }
+
+  submitSensitiveFields(
+    fields: ReadonlyArray<{ ref: string; text: string }>,
+    submitRef: string,
+    expectedOrigin: string,
+    onBeforeInsert: () => void,
+    onBeforeSubmit: () => void,
+    canBeginInsertion: () => boolean | Promise<boolean> = () => true,
+  ): Promise<{
+    stale: boolean;
+    originMismatch: boolean;
+    cardBytesMayHaveBeenInserted: boolean;
+    submissionAttempted: boolean;
+    insertionRefused?: true;
+  }> {
+    return this.enqueue(async () => {
+      const expectedGeneration = this.generation;
+      const resolvedFields = fields.map((field) => ({
+        ...field,
+        backendNodeId: this.resolveRef(field.ref),
+      }));
+      const submitNodeId = this.resolveRef(submitRef);
+      if (
+        resolvedFields.some((field) => field.backendNodeId === null) ||
+        submitNodeId === null
+      ) {
+        return {
+          stale: true,
+          originMismatch: false,
+          cardBytesMayHaveBeenInserted: false,
+          submissionAttempted: false,
+        };
+      }
+      let currentOrigin: string;
+      try {
+        currentOrigin = new URL((await this.mainFrameIdentity()).url).origin;
+      } catch {
+        currentOrigin = "";
+      }
+      if (currentOrigin !== expectedOrigin) {
+        return {
+          stale: false,
+          originMismatch: true,
+          cardBytesMayHaveBeenInserted: false,
+          submissionAttempted: false,
+        };
+      }
+      let cardBytesMayHaveBeenInserted = false;
+      let submissionAttempted = false;
+      try {
+        for (const field of resolvedFields) {
+          if (this.generation !== expectedGeneration) break;
+          await this.focusOrClick(field.backendNodeId!);
+          await this.dispatchKey(parseKeys("Ctrl+a"));
+          if (this.generation !== expectedGeneration) break;
+          if (!cardBytesMayHaveBeenInserted && !(await canBeginInsertion())) {
+            return {
+              stale: false,
+              originMismatch: false,
+              cardBytesMayHaveBeenInserted: false,
+              submissionAttempted: false,
+              insertionRefused: true,
+            };
+          }
+          cardBytesMayHaveBeenInserted = true;
+          onBeforeInsert();
+          await this.send("Input.insertText", { text: field.text });
+        }
+        if (
+          this.generation !== expectedGeneration ||
+          resolvedFields.length === 0 ||
+          !cardBytesMayHaveBeenInserted
+        ) {
+          return {
+            stale: !cardBytesMayHaveBeenInserted,
+            originMismatch: false,
+            cardBytesMayHaveBeenInserted,
+            submissionAttempted: false,
+          };
+        }
+        submissionAttempted = true;
+        this.sensitiveSubmissionArmed = true;
+        onBeforeSubmit();
+        await this.dispatchClick(submitNodeId);
+      } catch {
+        // The fixed result exposes only whether insertion or submission may have started.
+      }
+      return {
+        stale: false,
+        originMismatch: false,
+        cardBytesMayHaveBeenInserted,
+        submissionAttempted,
+      };
+    });
+  }
+
+  private isSensitiveTopLevelUrl(value: string): boolean {
+    if (this.sensitiveOrigin === null) return true;
+    if (!this.sensitiveSubmissionArmed) return false;
+    try {
+      return new URL(value).origin === this.sensitiveOrigin;
+    } catch {
+      return false;
+    }
   }
 
   invalidateRefsForSessionChange(nextScopeId: string = crypto.randomUUID()): Promise<void> {

@@ -10,18 +10,18 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
   AccountDirectory,
-  normalizePairingCode,
+  AUTH_CONTRACT_VERSION,
+  PROTOCOL_3_AUTH_CUTOVER,
   TENANT_ID_PATTERN,
 } from "../src/account-directory";
 import {
   authenticateDeviceComposite,
-  clearDeviceCredentialCache,
   sha256Hex,
   taggedHmacHex,
 } from "../src/auth";
 import { enabledForTenant } from "../src/api/sessions";
 import type { Env } from "../src/types";
-import { directory, mintUser } from "./helpers";
+import { directory, mintUser, setUserOrigins } from "./helpers";
 
 function freshEmail(): string {
   return `${crypto.randomUUID()}@example.com`;
@@ -32,6 +32,14 @@ function bearerRequest(credential: string): Request {
     method: "POST",
     headers: { Authorization: `Bearer ${credential}` },
   });
+}
+
+async function claimOffer(offer: string, previousCredentialDigest?: string) {
+  return directory().claimPairingOffer(
+    await taggedHmacHex(env, "pair-v2", offer),
+    await sha256Hex("account-directory-test-claim"),
+    previousCredentialDigest,
+  );
 }
 
 /** Env whose directory binding throws if touched — proves a path does no RPC. */
@@ -206,7 +214,7 @@ describe("AccountDirectory dashboard sessions", () => {
 describe("AccountDirectory origins", () => {
   it("canonicalizes, deduplicates, and bounds the account origin list", async () => {
     const user = await mintUser();
-    const set = await directory().setAllowedOrigins(user.userId, [
+    const set = await setUserOrigins(user.userId, [
       "https://example.com",
       "https://example.com/",
       "https://another.example",
@@ -214,6 +222,7 @@ describe("AccountDirectory origins", () => {
     expect(set).toEqual({
       kind: "ok",
       origins: ["https://another.example", "https://example.com"],
+      devices: [],
     });
     const fetched = await directory().getUser(user.userId);
     expect(fetched?.allowedOrigins).toEqual([
@@ -222,11 +231,11 @@ describe("AccountDirectory origins", () => {
     ]);
 
     expect(
-      (await directory().setAllowedOrigins(user.userId, ["http://example.com"])).kind,
+      (await setUserOrigins(user.userId, ["http://example.com"])).kind,
     ).toBe("invalid");
     expect(
       (
-        await directory().setAllowedOrigins(
+        await setUserOrigins(
           user.userId,
           Array.from({ length: 33 }, (_, index) => `https://site${index}.example`),
         )
@@ -236,66 +245,35 @@ describe("AccountDirectory origins", () => {
 });
 
 describe("AccountDirectory pairing", () => {
-  async function pairedUser() {
+  it("mints a device and replays the same claim after a lost response", async () => {
     const user = await mintUser();
-    await directory().setAllowedOrigins(user.userId, ["https://example.com"]);
-    return user;
-  }
+    const created = await directory().createPairingOffer(user.userId);
+    expect(created.offer).toMatch(/^[A-Za-z0-9_-]{43}$/);
 
-  async function claim(code: string) {
-    return directory().claimPairingCode(
-      await taggedHmacHex(env, "pair-v1", normalizePairingCode(code)),
-    );
-  }
-
-  it("refuses to generate a code before any allowed origin exists", async () => {
-    const user = await mintUser();
-    expect((await directory().createPairingCode(user.userId)).kind).toBe("no_origins");
-  });
-
-  it("mints device identity + credential at redeem time, single-use", async () => {
-    const user = await pairedUser();
-    const created = await directory().createPairingCode(user.userId);
-    expect(created.kind).toBe("ok");
-    if (created.kind !== "ok") return;
-    expect(created.code).toMatch(/^[0-9A-HJKMNP-TV-Z]{8}$/);
-
-    // Nothing exists before redemption.
     expect(await directory().listDevices(user.userId)).toEqual([]);
 
-    const claimed = await claim(created.code);
+    const claimed = await claimOffer(created.offer);
     expect(claimed.kind).toBe("ok");
     if (claimed.kind !== "ok") return;
     expect(claimed.tenantId).toBe(user.tenantId);
     expect(claimed.deviceId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
     );
-    expect(claimed.deviceCredential).toMatch(/^udt_v1_[A-Za-z0-9_-]{43}$/);
-    expect(claimed.originPolicy).toEqual(["https://example.com"]);
+    expect(claimed.deviceCredential).toMatch(/^udt_v2_[A-Za-z0-9_-]{43}$/);
+    expect(claimed.originPolicy).toEqual([]);
+    expect(claimed.policyVersion).toBe(1);
 
     const devices = await directory().listDevices(user.userId);
     expect(devices).toHaveLength(1);
     expect(devices[0]?.deviceId).toBe(claimed.deviceId);
 
-    // Consume-once: the second claim is indistinguishable from an unknown code.
-    expect((await claim(created.code)).kind).toBe("invalid");
+    await expect(claimOffer(created.offer)).resolves.toEqual(claimed);
   });
 
-  it("normalizes transcription confusables the same way the extension will", async () => {
-    expect(normalizePairingCode("k7q2-m9xr")).toBe("K7Q2M9XR");
-    expect(normalizePairingCode("O1IL-0AB2 ")).toBe("01110AB2");
-    const user = await pairedUser();
-    const created = await directory().createPairingCode(user.userId);
-    if (created.kind !== "ok") throw new Error("pairing code failed");
-    const mangled = `${created.code.slice(0, 4).toLowerCase()}-${created.code.slice(4)}`;
-    expect((await claim(mangled)).kind).toBe("ok");
-  });
-
-  it("collapses expired and unknown codes to the same invalid result", async () => {
-    const user = await pairedUser();
-    const created = await directory().createPairingCode(user.userId);
-    if (created.kind !== "ok") throw new Error("pairing code failed");
-    const codeHash = await taggedHmacHex(env, "pair-v1", normalizePairingCode(created.code));
+  it("collapses expired and unknown offers to the same invalid result", async () => {
+    const user = await mintUser();
+    const created = await directory().createPairingOffer(user.userId);
+    const codeHash = await taggedHmacHex(env, "pair-v2", created.offer);
     await runInDurableObject(directory(), (instance: AccountDirectory) => {
       (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
         `UPDATE pairing_codes SET expires_at = ? WHERE code_hash = ?`,
@@ -303,15 +281,73 @@ describe("AccountDirectory pairing", () => {
         codeHash,
       );
     });
-    const expired = await claim(created.code);
-    const unknown = await claim("ZZZZZZZZ");
+    const expired = await claimOffer(created.offer);
+    const unknown = await claimOffer("z".repeat(43));
     expect(expired).toEqual({ kind: "invalid" });
     expect(unknown).toEqual({ kind: "invalid" });
+  });
+
+  it("serializes pairing against a pending origin-policy operation", async () => {
+    const user = await mintUser();
+    const first = await directory().createPairingOffer(user.userId);
+    const device = await claimOffer(first.offer);
+    if (device.kind !== "ok") throw new Error("pairing claim failed");
+    const second = await directory().createPairingOffer(user.userId);
+
+    const pending = await directory().beginAllowedOriginsUpdate(user.userId, [
+      "https://shop.example",
+    ]);
+    if (pending.kind !== "ok") throw new Error("origin update failed");
+    expect(pending.devices).toEqual([
+      {
+        deviceId: device.deviceId,
+        allowedOrigins: [],
+        policyVersion: 2,
+        narrowing: false,
+      },
+    ]);
+    await expect(claimOffer(second.offer)).resolves.toEqual({ kind: "invalid" });
+
+    await expect(
+      directory().commitAllowedOriginsUpdate(user.userId, pending.operationId),
+    ).resolves.toMatchObject({
+      kind: "ok",
+      origins: ["https://shop.example"],
+    });
+    await expect(claimOffer(second.offer)).resolves.toMatchObject({ kind: "ok" });
+  });
+
+  it("preserves authoritative device policy when rotating its credential", async () => {
+    const user = await mintUser();
+    await setUserOrigins(user.userId, ["https://device.example"]);
+    const firstOffer = await directory().createPairingOffer(user.userId);
+    const first = await claimOffer(firstOffer.offer);
+    if (first.kind !== "ok") throw new Error("pairing claim failed");
+
+    await runInDurableObject(directory(), (instance: AccountDirectory) => {
+      (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "UPDATE users SET allowed_origins = ? WHERE user_id = ?",
+        JSON.stringify(["https://new-default.example"]),
+        user.userId,
+      );
+    });
+    const rotationOffer = await directory().createPairingOffer(user.userId);
+    const rotated = await claimOffer(
+      rotationOffer.offer,
+      await sha256Hex(first.deviceCredential),
+    );
+
+    expect(rotated).toMatchObject({
+      kind: "ok",
+      deviceId: first.deviceId,
+      originPolicy: ["https://device.example"],
+      policyVersion: first.policyVersion,
+    });
   });
 });
 
 describe("authenticateDeviceComposite", () => {
-  it("resolves the legacy blob without touching the directory", async () => {
+  it("resolves a protocol-3 static blob without touching the directory", async () => {
     const credential = `legacy-${crypto.randomUUID()}`;
     const deviceId = crypto.randomUUID();
     const blobEnv = noDirectoryEnv({
@@ -320,6 +356,8 @@ describe("authenticateDeviceComposite", () => {
           tenantId: "metamind",
           deviceId,
           credentialVersion: 3,
+          allowedOrigins: ["https://example.com"],
+          policyVersion: 1,
         },
       }),
     });
@@ -331,6 +369,24 @@ describe("authenticateDeviceComposite", () => {
     });
   });
 
+  it("rejects a pre-protocol-3 static blob until policy fields are migrated", async () => {
+    const credential = `legacy-${crypto.randomUUID()}`;
+    const identity = await authenticateDeviceComposite(
+      bearerRequest(credential),
+      noDirectoryEnv({
+        DEVICE_TOKENS: JSON.stringify({
+          [await sha256Hex(credential)]: {
+            tenantId: "metamind",
+            deviceId: crypto.randomUUID(),
+            credentialVersion: 3,
+          },
+        }),
+      }),
+    );
+
+    expect(identity).toBeNull();
+  });
+
   it("never pays a directory RPC for a non-udt_ unknown credential", async () => {
     const identity = await authenticateDeviceComposite(
       bearerRequest(`unknown-${crypto.randomUUID()}`),
@@ -339,15 +395,11 @@ describe("authenticateDeviceComposite", () => {
     expect(identity).toBeNull();
   });
 
-  it("resolves a directory credential, with a positive-only cache", async () => {
-    clearDeviceCredentialCache();
+  it("revalidates a directory credential on every request", async () => {
     const user = await mintUser();
-    await directory().setAllowedOrigins(user.userId, ["https://example.com"]);
-    const created = await directory().createPairingCode(user.userId);
-    if (created.kind !== "ok") throw new Error("pairing code failed");
-    const claimed = await directory().claimPairingCode(
-      await taggedHmacHex(env, "pair-v1", normalizePairingCode(created.code)),
-    );
+    await setUserOrigins(user.userId, ["https://example.com"]);
+    const created = await directory().createPairingOffer(user.userId);
+    const claimed = await claimOffer(created.offer);
     if (claimed.kind !== "ok") throw new Error("claim failed");
 
     const identity = await authenticateDeviceComposite(
@@ -360,13 +412,7 @@ describe("authenticateDeviceComposite", () => {
       credentialVersion: 1,
     });
 
-    // Cached positive survives revocation until the TTL/clear...
     expect(await directory().revokeDevice(user.userId, claimed.deviceId)).toBe("revoked");
-    expect(
-      await authenticateDeviceComposite(bearerRequest(claimed.deviceCredential), env),
-    ).not.toBeNull();
-    // ...and the directory is authoritative once the cache entry is gone.
-    clearDeviceCredentialCache();
     expect(
       await authenticateDeviceComposite(bearerRequest(claimed.deviceCredential), env),
     ).toBeNull();
@@ -374,12 +420,9 @@ describe("authenticateDeviceComposite", () => {
 
   it("scopes device revocation to the owning user", async () => {
     const owner = await mintUser();
-    await directory().setAllowedOrigins(owner.userId, ["https://example.com"]);
-    const created = await directory().createPairingCode(owner.userId);
-    if (created.kind !== "ok") throw new Error("pairing code failed");
-    const claimed = await directory().claimPairingCode(
-      await taggedHmacHex(env, "pair-v1", normalizePairingCode(created.code)),
-    );
+    await setUserOrigins(owner.userId, ["https://example.com"]);
+    const created = await directory().createPairingOffer(owner.userId);
+    const claimed = await claimOffer(created.offer);
     if (claimed.kind !== "ok") throw new Error("claim failed");
 
     const stranger = await mintUser();
@@ -396,12 +439,18 @@ describe("authenticateDeviceComposite", () => {
 });
 
 describe("AccountDirectory MCP tokens", () => {
-  it("mints display-once usk_ tokens verifiable by digest, revocable by owner only", async () => {
+  it("mints device-bound usk_v2 tokens verifiable by digest and revocable by owner", async () => {
     const user = await mintUser();
-    const created = await directory().createMcpToken(user.userId, "laptop");
+    const offer = await directory().createPairingOffer(user.userId);
+    const device = await directory().claimPairingOffer(
+      await taggedHmacHex(env, "pair-v2", offer.offer),
+      await sha256Hex("account-directory-test-claim"),
+    );
+    if (device.kind !== "ok") throw new Error("pairing claim failed");
+    const created = await directory().createMcpToken(user.userId, device.deviceId, "laptop");
     expect(created).not.toBeNull();
     if (created === null) return;
-    expect(created.token).toMatch(/^usk_v1_[0-9A-Za-z]{16}_[A-Za-z0-9_-]{43}$/);
+    expect(created.token).toMatch(/^usk_v2_[0-9A-Za-z]{16}_[A-Za-z0-9_-]{43}$/);
     expect(created.token).toContain(created.tokenId);
 
     const identity = await directory().verifyMcpToken(await sha256Hex(created.token));
@@ -409,7 +458,36 @@ describe("AccountDirectory MCP tokens", () => {
       userId: user.userId,
       tenantId: user.tenantId,
       tokenId: created.tokenId,
+      deviceId: device.deviceId,
+      authEpoch: 1,
     });
+    expect(
+      await directory().authorizeMcpIdentity({
+        userId: user.userId,
+        tenantId: user.tenantId,
+        deviceId: device.deviceId,
+        authEpoch: 1,
+        contractVersion: AUTH_CONTRACT_VERSION,
+      }),
+    ).toBe(true);
+    expect(
+      await directory().authorizeMcpIdentity({
+        userId: user.userId,
+        tenantId: user.tenantId,
+        deviceId: device.deviceId,
+        authEpoch: 0,
+        contractVersion: AUTH_CONTRACT_VERSION,
+      }),
+    ).toBe(false);
+    expect(
+      await directory().authorizeMcpIdentity({
+        userId: user.userId,
+        tenantId: user.tenantId,
+        deviceId: device.deviceId,
+        authEpoch: 1,
+        contractVersion: 1,
+      }),
+    ).toBe(false);
 
     const listed = await directory().listMcpTokens(user.userId);
     expect(listed).toHaveLength(1);
@@ -421,6 +499,31 @@ describe("AccountDirectory MCP tokens", () => {
     expect(await directory().revokeMcpToken(user.userId, created.tokenId)).toBe(true);
     expect(await directory().verifyMcpToken(await sha256Hex(created.token))).toBeNull();
     expect(await directory().listMcpTokens(user.userId)).toEqual([]);
+  });
+
+  it("applies the authentication hard cut only behind the explicit maintenance latch", async () => {
+    const user = await mintUser();
+    const offer = await directory().createPairingOffer(user.userId);
+    const device = await directory().claimPairingOffer(
+      await taggedHmacHex(env, "pair-v2", offer.offer),
+      await sha256Hex("hard-cut-test-claim"),
+    );
+    if (device.kind !== "ok") throw new Error("pairing claim failed");
+    const token = await directory().createMcpToken(user.userId, device.deviceId, "cutover");
+    if (token === null) throw new Error("token creation failed");
+    const digest = await sha256Hex(token.token);
+
+    await expect(directory().applyProtocol3AuthenticationCutover("wrong-marker")).resolves.toBe(0);
+    await expect(directory().verifyMcpToken(digest)).resolves.not.toBeNull();
+
+    await expect(
+      directory().applyProtocol3AuthenticationCutover(PROTOCOL_3_AUTH_CUTOVER),
+    ).resolves.toBeGreaterThan(0);
+    await expect(directory().verifyMcpToken(digest)).resolves.toBeNull();
+    await expect(directory().getUser(user.userId)).resolves.toMatchObject({ authEpoch: 2 });
+    await expect(
+      directory().applyProtocol3AuthenticationCutover(PROTOCOL_3_AUTH_CUTOVER),
+    ).resolves.toBe(0);
   });
 });
 
@@ -441,5 +544,31 @@ describe("AccountDirectory sweep", () => {
         .toArray() as { challenge_id: string }[];
       expect(rows.map((row) => row.challenge_id)).toEqual([fresh.challengeId]);
     });
+  });
+
+  it("retains revoked device tombstones for offline re-pairing", async () => {
+    const user = await mintUser();
+    const offer = await directory().createPairingOffer(user.userId);
+    const device = await claimOffer(offer.offer);
+    if (device.kind !== "ok") throw new Error("pairing claim failed");
+    expect(await directory().revokeDevice(user.userId, device.deviceId)).toBe("revoked");
+    await runInDurableObject(directory(), (instance: AccountDirectory) => {
+      (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql.exec(
+        "UPDATE devices SET revoked_at = ? WHERE device_id = ?",
+        Date.now() - 25 * 60 * 60 * 1000,
+        device.deviceId,
+      );
+    });
+
+    await runInDurableObject(directory(), (instance: AccountDirectory) => instance.alarm());
+    const replacementOffer = await directory().createPairingOffer(user.userId);
+    const replacement = await claimOffer(
+      replacementOffer.offer,
+      await sha256Hex(device.deviceCredential),
+    );
+
+    expect(replacement).toMatchObject({ kind: "ok" });
+    if (replacement.kind !== "ok") return;
+    expect(replacement.deviceId).not.toBe(device.deviceId);
   });
 });

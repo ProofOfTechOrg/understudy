@@ -1,6 +1,6 @@
 {
   "name": "@understudy/extension",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "zip:store": "wxt zip --mode store",
     "typecheck": "wxt prepare && tsc --noEmit",
     "test": "vitest run",
+    "test:e2e": "wxt build --mode store && wxt build --mode e2e && node scripts/e2e.mjs",
     "stub": "node scripts/stub-server.mjs",
     "postinstall": "wxt prepare"
   },

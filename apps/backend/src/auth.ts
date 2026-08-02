@@ -12,8 +12,9 @@
  * sent to (or trusted from) the browser extension.
  */
 import { base64urlDecode, base64urlEncode } from "./base64url";
-import { createPositiveCache } from "./cache";
 import { getDirectory } from "./account-directory";
+import { isCanonicalOrigin } from "./origin-policy";
+import { parseStaticDeviceTokens } from "./static-device-config.mjs";
 import type { Env } from "./types";
 
 export interface Actor {
@@ -26,6 +27,8 @@ export interface DeviceIdentity {
   deviceId: string;
   credentialVersion: number;
   credentialDigest: string;
+  allowedOrigins: string[];
+  policyVersion: number;
 }
 
 export interface WsTicketClaims {
@@ -34,6 +37,8 @@ export interface WsTicketClaims {
   tenantId: string;
   deviceId: string;
   credentialVersion?: number;
+  allowedOrigins?: string[];
+  policyVersion?: number;
   sessionId?: string;
   leaseId?: string;
   leaseEpoch: number;
@@ -78,13 +83,11 @@ export async function authenticate(req: Request, env: Env): Promise<Actor | null
 }
 
 /**
- * A tenantId must be a flat, non-empty slug. The credential vault namespaces
- * keys as `vault://<tenantId>/<name>` and SessionAgent.fillSecret isolates
- * tenants with a `vault://<tenantId>/` prefix check, so a tenantId that is
- * empty or contains `/` would let one tenant's prefix straddle another's
- * namespace (tenant "acme" reaching "acme/eu"'s keys). Enforced at mint
- * (fail-closed at session creation) and re-checked in tenantOf, so no signed
- * id can carry an unsafe tenant into that prefix check.
+ * A tenantId must be a flat, non-empty slug because it is embedded in signed
+ * session identifiers and reused as the isolation key for Durable Objects,
+ * device allocation, quota, and policy. Enforced at mint and re-checked in
+ * tenantOf so legacy or forged identifiers cannot introduce a second path
+ * segment with ambiguous ownership.
  */
 export function isValidTenantId(tenantId: string): boolean {
   return tenantId.length > 0 && !tenantId.includes("/");
@@ -138,9 +141,8 @@ export async function mintSessionId(
  * or null for any malformed / forged / undecodable id. This is a session's
  * AUTHORITATIVE tenant - it comes from the signed id itself, never a
  * caller-supplied claim - so a Durable Object can trust `tenantOf(this.name)`
- * to scope a resource it owns (e.g. the credential vault) to that session's
- * owner. scopeSession is the boolean "does this id belong to tenantId?"
- * wrapper over it.
+ * to scope session state to its owner. scopeSession is the boolean "does this
+ * id belong to tenantId?" wrapper over it.
  */
 export async function tenantOf(sessionId: string, env: Env): Promise<string | null> {
   try {
@@ -157,9 +159,8 @@ export async function tenantOf(sessionId: string, env: Env): Promise<string | nu
     if (!verified) return null;
 
     const payload = JSON.parse(new TextDecoder().decode(payloadBytes)) as { t?: unknown };
-    // Re-check the shape a valid mint enforces: a signed id must never carry an
-    // empty or slash-bearing tenant into fillSecret's vault-namespace prefix
-    // check (defense in depth against a token minted before this rule existed).
+    // Re-check the shape a valid mint enforces so a legacy signed id cannot
+    // introduce an ambiguous tenant path segment.
     return typeof payload.t === "string" && isValidTenantId(payload.t) ? payload.t : null;
   } catch {
     return null;
@@ -206,42 +207,64 @@ export async function verifyExtensionToken(
 }
 
 /**
- * Positive-only cache for directory device credentials, keyed by sha256
- * digest. Bounds AccountDirectory RPCs to one per device per minute; never
- * caches misses, so a credential minted by a pairing claim works on the very
- * next request. Revocation therefore takes up to 60 s beyond the row flip —
- * the same window the connect-ticket and heartbeat paths already accept. That
- * window now bounds only the lazy backstop: a dashboard revoke bypasses this
- * cache entirely via the DeviceAgent's persisted revoked marker, which refuses
- * ticket authorization and connections however warm the cached credential is.
- */
-const deviceCredentialCache = createPositiveCache<DeviceIdentity>(60_000, 1024);
-
-/** Test seam: the cache is module state, shared across a pool-worker run. */
-export function clearDeviceCredentialCache(): void {
-  deviceCredentialCache.clear();
-}
-
-/**
- * Resolves a `udt_` directory credential to its identity, cache-first. Shared
- * by connect-ticket auth and the heartbeat revocation check so both classes
- * see one consistent view (and one cache) of a paired device's liveness.
+ * Resolves a `udt_v2` directory credential to its current identity. Shared by
+ * connect-ticket auth and the heartbeat revocation check.
  */
 async function resolveDirectoryDevice(
   digest: string,
   env: Env,
 ): Promise<DeviceIdentity | null> {
-  const cached = deviceCredentialCache.get(digest);
-  if (cached !== undefined) return cached;
-  const identity = await getDirectory(env).verifyDeviceCredential(digest);
-  if (identity !== null) deviceCredentialCache.put(digest, identity);
-  return identity;
+  return getDirectory(env).verifyDeviceCredential(digest);
+}
+
+function resolveStaticDevice(digest: string, env: Env): DeviceIdentity | null {
+  if (!env.DEVICE_TOKENS) return null;
+  let entries: ReturnType<typeof parseStaticDeviceTokens>;
+  try {
+    entries = parseStaticDeviceTokens(JSON.parse(env.DEVICE_TOKENS) as unknown);
+  } catch {
+    return null;
+  }
+  const entry = entries[digest];
+  if (entry === undefined) return null;
+  return {
+    tenantId: entry.tenantId,
+    deviceId: entry.deviceId.toLowerCase(),
+    credentialVersion: entry.credentialVersion,
+    credentialDigest: digest,
+    allowedOrigins: entry.allowedOrigins,
+    policyVersion: entry.policyVersion,
+  };
+}
+
+/** Re-resolves the policy and credential fence used by an already-minted ticket. */
+export type CurrentDeviceAuthority =
+  | { kind: "live"; source: "static" | "directory"; identity: DeviceIdentity }
+  | { kind: "not_directory" }
+  | { kind: "invalid" };
+
+export async function currentDeviceAuthority(
+  digest: string,
+  expected: Pick<DeviceIdentity, "tenantId" | "deviceId" | "credentialVersion">,
+  env: Env,
+): Promise<CurrentDeviceAuthority> {
+  const current = resolveStaticDevice(digest, env);
+  if (current !== null) {
+    return current.tenantId === expected.tenantId &&
+      current.deviceId === expected.deviceId &&
+      current.credentialVersion === expected.credentialVersion
+      ? { kind: "live", source: "static", identity: current }
+      : { kind: "invalid" };
+  }
+  const directory = await getDirectory(env).inspectDeviceAuthority(digest, expected);
+  return directory.kind === "live"
+    ? { ...directory, source: "directory" }
+    : directory;
 }
 
 /**
- * Device auth for both device classes: the legacy DEVICE_TOKENS blob first
- * (zero new I/O, byte-identical for the canary), then AccountDirectory-
- * minted `udt_` credentials. Only a `udt_`-prefixed bearer ever pays the
+ * Device auth for both device classes: the static DEVICE_TOKENS blob first,
+ * then AccountDirectory-minted `udt_v2` credentials. Only a matching bearer pays the
  * directory RPC, so an unknown non-directory credential costs no I/O.
  */
 export async function authenticateDeviceComposite(
@@ -253,32 +276,20 @@ export async function authenticateDeviceComposite(
   const header = req.headers.get("Authorization");
   if (!header?.startsWith(BEARER_PREFIX)) return null;
   const credential = header.slice(BEARER_PREFIX.length).trim();
-  if (!credential.startsWith("udt_")) return null;
+  if (!credential.startsWith("udt_v2_")) return null;
   return resolveDirectoryDevice(await sha256Hex(credential), env);
 }
 
-/**
- * Continuous-liveness check for a still-connected device's heartbeat, across
- * BOTH device classes. The blob path (deviceCredentialExists) reads
- * DEVICE_TOKENS live, so a revoked canary drops instantly; a `udt_` device
- * (never in the blob) is resolved through the directory, matching tenant +
- * deviceId + credentialVersion. Without this second class the heartbeat
- * revokes every paired browser on its first beat — a `udt_` credential is
- * never in DEVICE_TOKENS.
- */
-export async function deviceCredentialLive(
+export type DeviceCredentialStatus = "live" | "superseded" | "revoked";
+
+/** Resolves heartbeat liveness across static and directory-backed devices. */
+export async function deviceCredentialStatus(
   digest: string,
   identity: Pick<DeviceIdentity, "tenantId" | "deviceId" | "credentialVersion">,
   env: Env,
-): Promise<boolean> {
-  if (await deviceCredentialExists(digest, identity, env)) return true;
-  const directory = await resolveDirectoryDevice(digest, env);
-  return (
-    directory !== null &&
-    directory.tenantId === identity.tenantId &&
-    directory.deviceId.toLowerCase() === identity.deviceId.toLowerCase() &&
-    directory.credentialVersion === identity.credentialVersion
-  );
+): Promise<DeviceCredentialStatus> {
+  if (await deviceCredentialExists(digest, identity, env)) return "live";
+  return getDirectory(env).deviceCredentialStatus(digest, identity);
 }
 
 export async function authenticateDevice(
@@ -291,34 +302,7 @@ export async function authenticateDevice(
   if (!credential || !env.DEVICE_TOKENS) return null;
   const credentialDigest = await sha256Hex(credential);
 
-  let entries: Record<
-    string,
-    { tenantId?: unknown; deviceId?: unknown; credentialVersion?: unknown }
-  >;
-  try {
-    entries = JSON.parse(env.DEVICE_TOKENS) as typeof entries;
-  } catch {
-    return null;
-  }
-  const entry = entries[credentialDigest];
-  if (
-    entry === undefined ||
-    typeof entry.tenantId !== "string" ||
-    !isValidTenantId(entry.tenantId) ||
-    typeof entry.deviceId !== "string" ||
-    !isUuid(entry.deviceId) ||
-    typeof entry.credentialVersion !== "number" ||
-    !Number.isInteger(entry.credentialVersion) ||
-    entry.credentialVersion < 1
-  ) {
-    return null;
-  }
-  return {
-    tenantId: entry.tenantId,
-    deviceId: entry.deviceId.toLowerCase(),
-    credentialVersion: entry.credentialVersion,
-    credentialDigest,
-  };
+  return resolveStaticDevice(credentialDigest, env);
 }
 
 export async function deviceCredentialExists(
@@ -328,14 +312,10 @@ export async function deviceCredentialExists(
 ): Promise<boolean> {
   if (!env.DEVICE_TOKENS) return false;
   try {
-    const entries = JSON.parse(env.DEVICE_TOKENS) as Record<
-      string,
-      { tenantId?: unknown; deviceId?: unknown; credentialVersion?: unknown }
-    >;
+    const entries = parseStaticDeviceTokens(JSON.parse(env.DEVICE_TOKENS) as unknown);
     const entry = entries[digest];
     return (
       entry?.tenantId === identity.tenantId &&
-      typeof entry.deviceId === "string" &&
       entry.deviceId.toLowerCase() === identity.deviceId.toLowerCase() &&
       entry.credentialVersion === identity.credentialVersion
     );
@@ -405,6 +385,8 @@ export async function verifyWsTicket(
       "tenantId",
       "deviceId",
       "credentialVersion",
+      "allowedOrigins",
+      "policyVersion",
       "sessionId",
       "leaseId",
       "leaseEpoch",
@@ -452,13 +434,32 @@ export async function verifyWsTicket(
       return null;
     }
     if (
+      claims.allowedOrigins !== undefined &&
+      (!Array.isArray(claims.allowedOrigins) ||
+        claims.allowedOrigins.length > 32 ||
+        !claims.allowedOrigins.every(isCanonicalOrigin) ||
+        !sameStrings(claims.allowedOrigins, [...new Set(claims.allowedOrigins)].sort()))
+    ) {
+      return null;
+    }
+    if (
+      claims.policyVersion !== undefined &&
+      (!Number.isInteger(claims.policyVersion) || claims.policyVersion < 1)
+    ) {
+      return null;
+    }
+    if (
       (claims.aud === "device-control" &&
         (claims.credentialVersion === undefined ||
+          claims.allowedOrigins === undefined ||
+          claims.policyVersion === undefined ||
           claims.sessionId !== undefined ||
           claims.leaseId !== undefined ||
           claims.leaseEpoch !== 0)) ||
       (claims.aud === "session" &&
         (claims.credentialVersion !== undefined ||
+          claims.allowedOrigins !== undefined ||
+          claims.policyVersion !== undefined ||
           typeof claims.sessionId !== "string" ||
           claims.sessionId.length < 1 ||
           typeof claims.leaseId !== "string" ||
@@ -471,6 +472,10 @@ export async function verifyWsTicket(
   } catch {
     return null;
   }
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 export async function hashProfileStateKey(
@@ -489,10 +494,10 @@ export async function hashProfileStateKey(
 
 /**
  * Domain-separated HMAC over AUTH_HMAC_SECRET (D8): `<tag>|<value>`, hex.
- * Tags in use: otp-v1, pair-v1, csrf-v1, consent-v1. Reuses the one existing
- * secret rather than adding rotation surface inside the same trust boundary;
- * the tag prefix keeps every use uncorrelatable with the others and with
- * telemetryPseudonym (which uses NUL-separated framing).
+ * Tags in use: otp-v1, pair-v2, pair-device-v2, csrf-v1, and consent-v1.
+ * Reuses the one existing secret rather than adding rotation surface inside
+ * the same trust boundary; the tag prefix keeps every use uncorrelatable with
+ * the others and with telemetryPseudonym (which uses NUL-separated framing).
  */
 export async function taggedHmacHex(env: Env, tag: string, value: string): Promise<string> {
   const signature = await crypto.subtle.sign(

@@ -1,9 +1,7 @@
 /**
  * Server-rendered account pages (D7): forms via hono/html (auto-escaping), one
  * style block, plain POST/redirect, and three client-side behaviors under a
- * per-response CSP nonce — copy buttons, the
- * pairing-code countdown, and the vault-upload sealer (whose derivation must
- * stay in lockstep with vault-upload.ts).
+ * per-response CSP nonce: copy buttons and the pairing-offer countdown.
  */
 
 import { html, raw } from "hono/html";
@@ -22,7 +20,7 @@ h1 { font-size: 22px; margin: 18px 0; }
 h2 { font-size: 16px; margin: 0 0 10px; }
 .card { border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas); border-radius: 10px; padding: 16px; margin: 14px 0; }
 label { display: block; margin: 8px 0 4px; font-weight: 600; font-size: 13px; }
-input, textarea { width: 100%; padding: 8px; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); border-radius: 6px; background: Canvas; color: CanvasText; font: inherit; }
+input, textarea, select { width: 100%; padding: 8px; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); border-radius: 6px; background: Canvas; color: CanvasText; font: inherit; }
 textarea { font-family: ui-monospace, monospace; font-size: 13px; }
 button { padding: 8px 14px; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 30%, Canvas); background: color-mix(in srgb, CanvasText 8%, Canvas); color: CanvasText; font: inherit; cursor: pointer; margin-top: 8px; }
 button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
@@ -34,7 +32,6 @@ code, pre { font-family: ui-monospace, monospace; font-size: 13px; }
 pre { background: color-mix(in srgb, CanvasText 6%, Canvas); padding: 10px; border-radius: 6px; overflow-x: auto; }
 .muted { color: color-mix(in srgb, CanvasText 60%, Canvas); font-size: 13px; }
 .error { color: #b91c1c; font-weight: 600; }
-.bigcode { font-size: 30px; letter-spacing: 6px; font-weight: 700; font-family: ui-monospace, monospace; }
 .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas); }
 .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 form.inline-form { display: inline; }
@@ -61,51 +58,31 @@ if (countdown) {
     const left = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
     countdown.textContent = left > 0
       ? "Expires in " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0")
-      : "Expired — generate a new code.";
+      : "Expired — generate a new offer.";
     if (left > 0) setTimeout(tick, 1000);
   };
   tick();
 }
-`;
-
-/**
- * Client half of the vault upload. The visible secret input deliberately has
- * NO name attribute: with JavaScript disabled the form posts only empty
- * hidden fields, so plaintext can never ride the wire by accident.
- * Derivation mirrors vault-upload.ts exactly (ECDH P-256 → HKDF-SHA256,
- * empty salt, info "understudy-vault-upload-v1" → AES-256-GCM).
- */
-export const VAULT_UPLOAD_JS = `
-const vaultForm = document.getElementById("vault-form");
-if (vaultForm) {
-  const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
-    .replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
-  vaultForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const secretInput = document.getElementById("vault-plaintext");
-    const jwk = JSON.parse(vaultForm.getAttribute("data-upload-key"));
-    const value = secretInput.value;
-    if (value.length === 0) return;
-    const serverKey = await crypto.subtle.importKey(
-      "jwk", jwk, { name: "ECDH", namedCurve: "P-256" }, false, []);
-    const ephemeral = await crypto.subtle.generateKey(
-      { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
-    const shared = await crypto.subtle.deriveBits(
-      { name: "ECDH", public: serverKey }, ephemeral.privateKey, 256);
-    const hkdf = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
-    const aes = await crypto.subtle.deriveKey(
-      { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0),
-        info: new TextEncoder().encode("understudy-vault-upload-v1") },
-      hkdf, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv }, aes, new TextEncoder().encode(value));
-    vaultForm.elements.epk.value = b64u(await crypto.subtle.exportKey("raw", ephemeral.publicKey));
-    vaultForm.elements.iv.value = b64u(iv);
-    vaultForm.elements.ct.value = b64u(ciphertext);
-    secretInput.value = "";
-    vaultForm.submit();
-  });
+const pairing = document.getElementById("pairing-offer");
+if (pairing) {
+  const offer = pairing.getAttribute("data-offer");
+  const extensionId = pairing.getAttribute("data-extension-id");
+  const status = document.getElementById("pairing-status");
+  pairing.removeAttribute("data-offer");
+  if (offer && extensionId && globalThis.chrome?.runtime?.sendMessage) {
+    chrome.runtime.sendMessage(
+      extensionId,
+      { type: "understudy_pair_offer", offer },
+      (reply) => {
+        if (!status) return;
+        status.textContent = chrome.runtime.lastError || reply?.ok !== true
+          ? "The extension did not accept the offer. Confirm it is installed, then generate a new offer."
+          : "This browser is paired. You can close this page.";
+      },
+    );
+  } else if (status) {
+    status.textContent = "The Understudy extension is not installed. Install it, then generate a new offer.";
+  }
 }
 `;
 
@@ -113,7 +90,6 @@ export function layout(
   title: string,
   nonce: string,
   body: Fragment,
-  extraJs = "",
 ): Fragment {
   return html`<!doctype html>
 <html lang="en">
@@ -127,7 +103,7 @@ export function layout(
 <body>
 <main>${body}</main>
 <footer><a href="/privacy">Privacy</a> · <a href="https://github.com/ProofOfTechOrg/understudy/issues">Support</a></footer>
-<script nonce="${nonce}">${raw(BASE_JS + extraJs)}</script>
+<script nonce="${nonce}">${raw(BASE_JS)}</script>
 </body>
 </html>`;
 }
@@ -148,14 +124,14 @@ export function privacyPage(): Fragment {
     <li>Page URLs and titles, website content, accessibility trees, screenshots, and dialog text</li>
     <li>Requested form, input, click, keyboard, scrolling, and navigation actions</li>
     <li>Browser and extension metadata, allowed origins, device and session identifiers, hosting status, errors, and command results</li>
-    <li>Account email, session and device credentials, API credentials, pairing codes, and encrypted vault values used to authenticate or complete requested actions</li>
+    <li>Account email, session and device credentials, API credentials, and one-time pairing offers used to authenticate requested actions</li>
   </ul>
   <p>Command payloads and results may remain in per-session service state for execution, retry, acknowledgement, and recovery. They are not necessarily transient.</p>
 </div>
 
 <div class="card">
   <h2>Local extension storage</h2>
-  <p>The extension stores device credentials and profile configuration in extension storage restricted to trusted extension contexts. Browser-session storage may contain lease assignments, tab identifiers, recovery state, write-journal status, and pending dialog records.</p>
+  <p>The extension stores device credentials, profile configuration, and locally encrypted payment-card records in extension-owned storage. Card plaintext, ciphertext, and encryption keys are not sent to the service. Browser-session storage may contain lease assignments, owned-window identifiers, recovery state, write-journal status, and pending dialog records.</p>
   <p>The extension does not persist command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, or general navigation history in local extension storage. A pending dialog record includes the page URL where the dialog appeared until the service acknowledges that record.</p>
 </div>
 
@@ -179,7 +155,7 @@ export function privacyPage(): Fragment {
 
 <div class="card">
   <h2>Support and privacy requests</h2>
-  <p>Use the <a href="https://github.com/ProofOfTechOrg/understudy/issues">public support tracker</a> for product bugs. Do not post credentials, pairing codes, page content, screenshots, personal data, or other sensitive information in a public GitHub issue.</p>
+  <p>Use the <a href="https://github.com/ProofOfTechOrg/understudy/issues">public support tracker</a> for product bugs. Do not post credentials, pairing offers, page content, screenshots, personal data, or other sensitive information in a public GitHub issue.</p>
 </div>`;
 }
 
@@ -230,13 +206,16 @@ export interface HomeDevice {
 
 export interface HomeData {
   email: string;
-  tenantId: string;
   csrf: string;
   origins: string[];
   devices: HomeDevice[];
   tokens: McpTokenRecord[];
-  secretNames: string[];
-  uploadKeyJson: string;
+  grants: Array<{
+    grantId: string;
+    clientId: string;
+    label: string;
+    deviceId: string | null;
+  }>;
   notice?: string;
 }
 
@@ -252,6 +231,13 @@ function connectCard(): Fragment {
            "--header", "Authorization: Bearer <YOUR-TOKEN>"] } } }`;
   return html`<div class="card">
   <h2>Connect your AI client</h2>
+  <p><strong>ChatGPT</strong>: copy <code id="mcp-chatgpt">${MCP_URL}</code>
+    <button class="inline" type="button" data-copy="mcp-chatgpt">Copy</button>, then
+    <a href="https://chatgpt.com/plugins" target="_blank" rel="noreferrer">open ChatGPT Plugins</a>.</p>
+  <p><strong>Claude</strong>: copy <code id="mcp-claude">${MCP_URL}</code>
+    <button class="inline" type="button" data-copy="mcp-claude">Copy</button>, then
+    <a href="https://claude.ai/new" target="_blank" rel="noreferrer">open Claude</a> and choose
+    <strong>Customize</strong> → <strong>Connectors</strong>.</p>
   <p class="muted">Replace <code>&lt;YOUR-TOKEN&gt;</code> with an API token from the card below.</p>
   <p><strong>Claude Code</strong> <button class="inline" type="button" data-copy="connect-cli">Copy</button></p>
   <pre id="connect-cli">${cli}</pre>
@@ -259,7 +245,7 @@ function connectCard(): Fragment {
   <pre id="connect-json">${json}</pre>
   <p><strong>Clients without native remote MCP</strong> <button class="inline" type="button" data-copy="connect-remote">Copy</button></p>
   <pre id="connect-remote">${remote}</pre>
-  <p class="muted">claude.ai and ChatGPT connectors: paste the URL alone — you'll sign in via OAuth.</p>
+  <p class="muted">Hosted clients use OAuth and require selecting one paired browser during consent.</p>
 </div>`;
 }
 
@@ -288,7 +274,7 @@ export function homePage(data: HomeData): Fragment {
       ? html`<tr><td colspan="3" class="muted">No API tokens yet.</td></tr>`
       : data.tokens.map(
           (token) => html`<tr>
-  <td><code>${token.tokenId}</code> ${token.label === null ? "" : html`— ${token.label}`}</td>
+  <td><code>${token.tokenId}</code> ${token.label === null ? "" : html`— ${token.label}`}<br /><span class="muted">${token.deviceLabel ?? token.deviceId.slice(0, 8)}</span></td>
   <td class="muted">${token.lastUsedAt === null ? "never used" : new Date(token.lastUsedAt).toISOString()}</td>
   <td><form class="inline-form" method="post" action="/dashboard/tokens/revoke">
     <input type="hidden" name="csrf" value="${data.csrf}" />
@@ -298,15 +284,20 @@ export function homePage(data: HomeData): Fragment {
 </tr>`,
         );
 
-  // Advisory only — it disables the pairing button and shows a hint. The
-  // refusal that matters is createPairingCode's (see account-directory.ts);
-  // curl or a stale tab reaches that directly. Its purpose is to explain the
-  // prerequisite before the click, not to enforce it: a user reported the
-  // disabled button as simply broken when the hint was out of sight.
-  //
-  // Both hints anchor (#origins, #browsers) instead of naming a direction, so
-  // card order carries no correctness weight and the cards may be reordered.
-  const canPair = data.origins.length > 0;
+  const grantRows =
+    data.grants.length === 0
+      ? html`<tr><td colspan="3" class="muted">No OAuth connections yet.</td></tr>`
+      : data.grants.map(
+          (grant) => html`<tr>
+  <td>${grant.label}<br /><code>${grant.clientId}</code></td>
+  <td class="muted">${grant.deviceId === null ? "legacy unbound" : grant.deviceId.slice(0, 8)}</td>
+  <td><form class="inline-form" method="post" action="/dashboard/oauth/revoke">
+    <input type="hidden" name="csrf" value="${data.csrf}" />
+    <input type="hidden" name="grantId" value="${grant.grantId}" />
+    <button class="danger" type="submit">Revoke</button>
+  </form></td>
+</tr>`,
+        );
 
   return html`<div class="topbar">
   <h1>Understudy</h1>
@@ -323,12 +314,12 @@ ${data.notice === undefined ? "" : html`<p class="muted">${data.notice}</p>`}
 <div class="card" id="browsers">
   <h2>Paired browsers</h2>
   <table><tr><th>Browser</th><th>Status</th><th>Last seen</th><th></th></tr>${deviceRows}</table>
-  <p class="muted">Revoking takes effect within about two minutes; the extension shows why it stopped.</p>
+  <p class="muted">Revoking immediately invalidates this browser and every API or OAuth credential bound to it; the extension shows why it stopped.</p>
 </div>
 
 <div class="card" id="origins">
   <h2>Allowed origins</h2>
-  <p class="muted">The sites a paired browser may be driven on, one https origin per line (up to 32). A new pairing snapshots this list. Editing it afterwards does NOT change what an already-paired browser may drive — including removals: to withdraw an origin from a paired browser, <a href="#browsers">revoke that browser</a> and pair it again.</p>
+  <p class="muted">The sites paired browsers may be driven on, one exact HTTPS origin per line (up to 32). Changes apply to every paired browser. Removed origins are fenced immediately; added origins become usable after the extension acknowledges the new policy.</p>
   <form method="post" action="/dashboard/origins">
     <input type="hidden" name="csrf" value="${data.csrf}" />
     <textarea name="origins" rows="4" placeholder="https://example.com">${data.origins.join("\n")}</textarea>
@@ -338,17 +329,19 @@ ${data.notice === undefined ? "" : html`<p class="muted">${data.notice}</p>`}
 
 <div class="card">
   <h2>Pair a browser</h2>
-  <p class="muted">Install the Understudy extension in Chrome, then paste a one-time code into its side panel.</p>
+  <p class="muted">Install the Understudy extension in Chrome, then send it a one-time pairing offer. An empty origin policy is allowed, but the browser cannot open sessions until you add an origin.</p>
   <form method="post" action="/dashboard/pair">
     <input type="hidden" name="csrf" value="${data.csrf}" />
-    <button class="primary" type="submit" ${canPair ? "" : raw("disabled")}>Generate pairing code</button>
+    <button class="primary" type="submit">Pair this browser</button>
   </form>
-  ${canPair
-    ? ""
-    : html`<p class="muted">Add at least one <a href="#origins">allowed origin</a> before pairing a browser — the pairing snapshot tells the extension which sites it may drive.</p>`}
 </div>
 
 ${connectCard()}
+
+<div class="card">
+  <h2>OAuth connections</h2>
+  <table><tr><th>Client</th><th>Browser</th><th></th></tr>${grantRows}</table>
+</div>
 
 <div class="card">
   <h2>API tokens</h2>
@@ -357,51 +350,33 @@ ${connectCard()}
     <input type="hidden" name="csrf" value="${data.csrf}" />
     <label for="token-label">Label</label>
     <input id="token-label" name="label" maxlength="128" placeholder="laptop" />
+    <label for="token-device">Browser</label>
+    <select id="token-device" name="deviceId" required>
+      ${data.devices.map(
+        (device) => html`<option value="${device.deviceId}">${device.label ?? device.deviceId.slice(0, 8)}</option>`,
+      )}
+    </select>
     <button class="primary" type="submit">Create token</button>
   </form>
   <p class="muted">Tokens are shown once at creation and stored only as digests.</p>
-</div>
-
-<div class="card">
-  <h2>Vault secrets</h2>
-  <p class="muted">
-    Named secrets your AI client can ask the browser to type without ever seeing the value
-    (the <code>browser_fill_secret</code> tool).
-    Stored: ${data.secretNames.length === 0 ? html`<em>none</em>` : data.secretNames.map((name) => html`<code>${name}</code> `)}
-  </p>
-  <form id="vault-form" method="post" action="/dashboard/vault/put" data-upload-key="${data.uploadKeyJson}">
-    <input type="hidden" name="csrf" value="${data.csrf}" />
-    <input type="hidden" name="epk" value="" />
-    <input type="hidden" name="iv" value="" />
-    <input type="hidden" name="ct" value="" />
-    <label for="vault-name">Name</label>
-    <input id="vault-name" name="name" required maxlength="200" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="github-password" />
-    <label for="vault-plaintext">Value</label>
-    <input id="vault-plaintext" type="password" autocomplete="off" required />
-    <button class="primary" type="submit">Encrypt &amp; save</button>
-  </form>
-  <p class="muted">
-    Encrypted in your browser to the service's upload key before it is sent, so the plaintext
-    never appears in a request body or log. The service still decrypts it server-side to type it
-    into pages — this protects against accidental exposure, not against the service itself.
-    Prefer sealing offline? <code>GET /dashboard/vault/pubkey</code> serves the same public key.
-  </p>
 </div>`;
 }
 
-export function pairingCodePage(csrf: string, code: string, expiresAt: number): Fragment {
-  const display = `${code.slice(0, 4)}-${code.slice(4)}`;
+export function pairingOfferPage(
+  csrf: string,
+  offer: string,
+  expiresAt: number,
+  extensionId: string,
+): Fragment {
   return html`<h1>Understudy</h1>
-<div class="card">
-  <h2>Pairing code</h2>
-  <p><span class="bigcode" id="pairing-code">${display}</span>
-     <button class="inline" type="button" data-copy="pairing-code">Copy</button></p>
+<div class="card" id="pairing-offer" data-offer="${offer}" data-extension-id="${extensionId}">
+  <h2>Pair this browser</h2>
+  <p id="pairing-status">Sending a one-time offer to the installed extension…</p>
   <p class="muted" data-expires="${String(expiresAt)}">Expires in 10:00</p>
-  <p>Paste it into the Understudy extension's side panel ("Pair with your account").
-     The code works once; the browser appears above within one heartbeat of pairing.</p>
+  <p class="muted">The offer is delivered directly to the extension and never placed in a URL, browser history, or referrer.</p>
   <form method="post" action="/dashboard/pair">
     <input type="hidden" name="csrf" value="${csrf}" />
-    <button type="submit">Generate a new code</button>
+    <button type="submit">Send a new offer</button>
   </form>
   <p><a href="/dashboard">Back to dashboard</a></p>
 </div>`;
@@ -434,6 +409,7 @@ export function consentPage(options: {
   csrf: string;
   authreq: string;
   sig: string;
+  devices: Array<{ deviceId: string; label: string | null }>;
 }): Fragment {
   return html`<h1>Understudy</h1>
 <div class="card">
@@ -445,6 +421,12 @@ export function consentPage(options: {
     <input type="hidden" name="csrf" value="${options.csrf}" />
     <input type="hidden" name="authreq" value="${options.authreq}" />
     <input type="hidden" name="sig" value="${options.sig}" />
+    <label for="oauth-device">Browser</label>
+    <select id="oauth-device" name="deviceId" required>
+      ${options.devices.map(
+        (device) => html`<option value="${device.deviceId}">${device.label ?? device.deviceId.slice(0, 8)}</option>`,
+      )}
+    </select>
     <button class="primary" name="decision" value="approve" type="submit">Authorize</button>
     <button name="decision" value="deny" type="submit">Deny</button>
   </form>

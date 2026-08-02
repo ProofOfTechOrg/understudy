@@ -18,7 +18,7 @@
  *      Chromium and connect it to that printed WS URL.
  *   4. Press Enter in this terminal once the extension shows connected.
  *   5. Confirm the snapshot's tabId and URL before the script uses its refs.
- *   6. Watch snapshot -> type -> click -> fill_secret drive the page; each
+ *   6. Watch snapshot -> type -> click drive the page; each
  *      returned Event is printed as it comes back.
  *
  * Without an authoritative extension connected, every command below fails
@@ -28,13 +28,8 @@
  *
  * `type` and `click` target the first ref found in the snapshot's a11y tree
  * (a naive "first element" heuristic - fine for a demo/runbook, not real
- * ref-targeting logic). `fill_secret` deliberately uses a fake, tenant-scoped
- * secretRef (`vault://dev-tenant/…`) the vault has no value for, so it is
- * expected to return ok:false - demonstrating the scrubbed-error path, not a
- * broken script. (fillSecret enforces `vault://<tenantId>/…` scoping: a ref
- * outside the caller's own tenant is refused with the same scrubbed ok:false.)
- * A stale/unresolvable ref for any command is likewise expected to return
- * ok:false, not to fail the run.
+ * ref-targeting logic). A stale/unresolvable ref for either command is
+ * expected to return ok:false, not to fail the run.
  *
  * Env vars / flags (all optional; flags win, then env vars, then defaults):
  *   BASE_URL / --base-url             HTTP origin of the service.
@@ -149,7 +144,7 @@ async function main() {
   await rl.question("Press Enter once the extension shows connected... ");
   rl.close();
 
-  console.log("\ndriving the session: snapshot -> type -> click -> fill_secret\n");
+  console.log("\ndriving the session: snapshot -> type -> click\n");
 
   const snapshotEvent = await sendCommand(sessionId, {
     type: "snapshot",
@@ -170,16 +165,6 @@ async function main() {
     text: "hello from the stub consumer",
   });
   await sendCommand(sessionId, { type: "click", commandId: "stub-3", ref: targetRef });
-  await sendCommand(sessionId, {
-    type: "fill_secret",
-    commandId: "stub-4",
-    ref: targetRef,
-    // Deliberately fake and unresolvable - see the header comment. Scoped to
-    // the default dev tenant so it exercises the vault-miss path; a ref outside
-    // the caller's tenant is refused with the same scrubbed ok:false.
-    secretRef: "vault://dev-tenant/stub-consumer-fake-secret",
-  });
-
   console.log("\ndone.");
 }
 

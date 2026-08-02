@@ -222,6 +222,63 @@ h2 {
     rgb(23 26 23 / 97%);
 }
 
+.vault-card {
+  border-color: #6c763d;
+  background:
+    linear-gradient(145deg, rgb(239 178 78 / 8%), transparent 42%),
+    rgb(23 26 23 / 97%);
+}
+
+.vault-local {
+  padding: 3px 6px;
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.vault-field-row {
+  display: grid;
+  grid-template-columns: 0.7fr 1fr 0.7fr;
+  gap: 7px;
+}
+
+.vault-field-row label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.vault-aliases,
+.vault-origins {
+  margin-top: 16px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
+
+.vault-aliases ul {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vault-aliases li {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.button-compact {
+  min-height: 24px;
+  padding: 3px 7px;
+}
+
 .section-heading {
   margin-bottom: 13px;
 }

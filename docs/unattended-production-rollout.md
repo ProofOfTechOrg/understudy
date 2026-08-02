@@ -1,1523 +1,335 @@
 <!-- Content type: How-to -->
 
-# Finish the unattended production rollout
+# Finish the protocol-3 production rollout
 
-This runbook is the canonical operator record for Understudy’s unattended production rollout. Keep it current in every implementation, deployment, canary, and ramp pull request until the final 24-hour operational soak passes.
+This handoff tells the release operator exactly what remains after the local protocol-3 implementation. The source and automated checks are complete. Network disruption tests, publishing, production changes, destructive cleanup, canary acceptance, and the HTTPS Strict Transport Security (HSTS) apex rollout still require operator action.
 
-## Define the finish line
+## Handoff baseline
 
-The rollout is complete only when every condition below holds:
+Use this table to establish the source and environment before you act:
 
-- Understudy’s additive Durable Object migration `v2` and dual-protocol backend are live
-- The production Chromium acceptance suite passes
-- The read-only 24-hour soak passes
-- Metamind proves an unattended workflow governed by FlowSafe approvals and Breakwater connectors
-- Correlated audit evidence proves durable session cleanup and no write before approval
-- Allowlisted production traffic completes the `1 → 5 → all` ramp
-- The final 24-hour operational soak passes
-- This runbook records full release SHAs, deployment and version IDs, proof artifacts, metrics evidence, and the rollback baseline
+| Field | Recorded value |
+| --- | --- |
+| Release branch | `feat/protocol-3-local-card-vault` |
+| Branch point | `3d7ddeedafa90c6b28cbe7204ae411cda93bffa4` |
+| Fetched `origin/dev` on 2026-08-03 | `857e0e3ebb8312be3e260e7339968f602703afdf` |
+| Release source | The commit containing this handoff; resolve it with `git rev-parse HEAD` |
+| Node.js | 24.16.0; repository minimum is 22 |
+| pnpm | 11.5.2; the root manifest pins this version |
+| Production state last inspected | 2026-08-02; refresh every external value before acting |
 
-Do not declare the project finished from a code merge, package release, Worker deployment, or single proof run.
+The branch includes the pre-existing local commit `3d7ddee` plus the protocol-3 implementation commit. Do not deploy a dirty tree or a later unreviewed commit.
 
-## Update the status ledger
+The baseline named `docs/.local-card-vault-security-requirements.md.swp` as user-owned state. The final preservation check found no file at that path or with that exact name in accessible workspace and `/tmp` locations. No replacement was created.
 
-Update this table in the pull request that changes a gate. Use only `Not started`, `In progress`, `Blocked`, `Passed`, or `Rolled back` as the state.
+## Implemented release
 
-| Field | Required evidence |
-|---|---|
-| Gate | Named phase and acceptance gate |
-| State | `Not started`, `In progress`, `Blocked`, `Passed`, or `Rolled back` |
-| Approved SHA | Full Git commit, never a branch name |
-| Deployment | Cloudflare deployment and version IDs, or an explicit reason that no deployment applies |
-| Evidence | Continuous integration (CI) run, proof artifact, query result, or operator record |
-| Completed | Coordinated Universal Time (UTC) timestamp |
-| Owner | Engineering, release operator, or canary operator |
+The coordinated release contains these versions:
 
-Never mark a gate `Passed` without its approved SHA, deployment disposition, evidence, completion timestamp, and owner. Use `Pending` for evidence that does not exist yet. Do not use a branch name as temporary SHA evidence.
+| Artifact | Target |
+| --- | --- |
+| `@understudy/protocol` | 0.9.0; wire protocol 3 |
+| `@understudy/connector` | 0.6.0 |
+| Extension | 0.2.0 |
+| Backend | 0.2.0 |
 
-| Gate | State | Approved SHA | Deployment | Evidence | Completed | Owner |
-|---|---|---|---|---|---|---|
-| Phase 0a: release-flow baseline | Passed | `4843b6bccd8e1028c8fb6dba7812d643a4106778` | Not applicable: package and branch-flow gate | [PR #20](https://github.com/ProofOfTechOrg/understudy/pull/20), [PR #21](https://github.com/ProofOfTechOrg/understudy/pull/21), [master CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565127), [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255262164), [Release](https://github.com/ProofOfTechOrg/understudy/actions/runs/30255565196) | `2026-07-27T09:51:30Z` | Release operator |
-| Phase 0b: rollout runbook merged | Passed | `464763bd6c39b86f6154fcb7c95ed3edfe75ef4e` | Not applicable: documentation gate | [PR #22](https://github.com/ProofOfTechOrg/understudy/pull/22) merged; [CI](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913062) and [Version](https://github.com/ProofOfTechOrg/understudy/actions/runs/30323913036) passing. Release workflow is a no-op: no pending changesets, no published-package code changed | `2026-07-28T02:51:30Z` | Engineering |
-| Phase 1a: Metamind implementation | Passed | Metamind `fb6a7b706106306d95861ebe4a7abf0f5c65c6b8` (merged to `dev`) | Not applicable: implementation gate; production still on the baseline | [PR #17](https://github.com/ProofOfTechOrg/metamind/pull/17) merged, [CI passing](https://github.com/ProofOfTechOrg/metamind/actions/runs/30325493776) (app, worker, preflight). Worker lane covers typecheck, 716 tests, Biome, proof-runner self-test in both modes, `pnpm build` + `validate-build.sh`. Both migration copies apply to SQLite with identical schemas; the additive file is idempotent | `2026-07-28T03:21:33Z` | Engineering |
-| Phase 1b: Metamind attended deployment and proof | Passed | Metamind `434c1a7f5c368d4910c78c59997623762185fda8` (merged to `master`) | Version `3f1ba280-6cbe-480c-89fd-47b4daf2f731` at `2026-07-28T06:18:01Z`, message `release 434c1a7f5c368d4910c78c59997623762185fda8`. Superseded at `2026-07-28T16:29:30Z` by version `56fb278f-15f3-40f1-ab3b-a0276d123bfa` (`b70c40e39b74a98f79199634a5390d32610b180e`), which repointed `UNDERSTUDY_URL` at the routed domain | D1 lease migration applied BEFORE the first promotion: `changes: 1, changed_db: true, num_tables: 34`; `browser_session_leases` present with both indexes and queryable post-deploy. `/health.commit` confirmed by consecutive matching reads at each deploy. [PR #18](https://github.com/ProofOfTechOrg/metamind/pull/18), [PR #19](https://github.com/ProofOfTechOrg/metamind/pull/19), [PR #20](https://github.com/ProofOfTechOrg/metamind/pull/20). Smoke: `/` 302 to `/app/`, `/app/` 200, `/v1` 401 unauthenticated. **Attended production proof PASSED** on run `metamind_efefdb2e-2aed-441a-af6b-527e640c816f` — all eight gates in the table below, including a datum read from behind a portal login and a lease `released` on a confirmed 204. Three attempts were needed; the first two failed on consumer defects, all fixed. **Phase 1's durable-cleanup guarantee is met on the attended path**: the `16:30Z` sweep cleared four real orphans (three `minting`, one `cleanup_pending` carrying the 404) to `released` with null errors. All six leases are `mode=attended`, so the unattended replay remains unproven until Phase 4 — see the scope limit under the resolution | `2026-07-28T16:30:22Z` | Release operator |
-| Phase 2: Understudy `v2`, flags-off rollback baseline | Passed | `5cc969024b32380f1a3e14ff6f72e8d0c808b086` (deployed; approved at `dd7c100343cfc15e02802d93831600e0535670ed`) | Deployment `1c32a8e9-bf87-49eb-89a5-253ea4e47d1a`, version **`7eff2d11-2ba5-420b-b1f2-113faf0d6f73`** at `2026-07-28T04:29:57Z`, message `release dd7c100343cfc15e02802d93831600e0535670ed`. Previous baseline was version `41434382-ecdd-4f95-a27c-811c4337b6bd` | Verified at the approved SHA on a detached checkout: `pnpm install --frozen-lockfile`, `build`, `typecheck`, `test` (408 tests: 194 backend, 139 extension, 43 protocol, 32 connector), `wrangler deploy --dry-run`. All six secret names confirmed present — `DEVICE_TOKENS` and `WS_TICKET_SECRET` were MISSING and were provisioned first (see below). Active version exports `SessionAgent`, `DeviceAgent`, `TenantDeviceCoordinator`; binds `SESSION`, `DEVICE`, `TENANT_CONTROL`, `ANALYTICS`, `RATE_LIMITER`, `VAULT`, all six secrets, `QUOTA_POLICY`, and both rollout variables at `"[]"`. `/health` returns `{"ok":true}`; an unmapped token gets `401`; a well-formed unattended request gets `503 unattended sessions are disabled`, proving the flags-off baseline. Caller token rotated on both sides (Metamind confirmed as the only caller). The attended `curl` smoke test returns `200` with a `sessionId` after Understudy `e0351f6` (version `8ec9be79-76bb-4140-9530-402b4a46a40e`) fixed the empty-body discrimination — it had answered `400` for every over-the-wire caller. Baseline then advanced to `5cc969024b32380f1a3e14ff6f72e8d0c808b086` (version `fd67173d-e402-420d-9437-77dbc1e6be4a` at `2026-07-28T09:43:59Z`), which serves Understudy at `understudy.proofof.tech` while keeping `workers.dev` explicitly enabled; both hostnames return `200` on `/health`. The Metamind attended proof PASSED against this version | `2026-07-28T11:03:08Z` | Release operator |
-| Phase 3a: canary device acceptance | In progress | `3493b243c0aa61fb06ec19ad5dcb4eb197a2d670` | Allowlist deployment: version **`e0673967-0ca5-4cca-81ee-50d4088cec33`** at `2026-07-29T03:12Z`, message `release 3493b243c0aa61fb06ec19ad5dcb4eb197a2d670 - enable unattended for metamind`. Uploaded bindings confirm `UNATTENDED_ENABLED_TENANTS` and `SAFE_WRITE_REQUIRED_TENANTS` both `["metamind"]`. Previous flags-off baseline was version `fd67173d-e402-420d-9437-77dbc1e6be4a` | Device `aaf119f2-a85f-46b4-8b53-8e92196d6275` enrolled and `GET /v1/devices` reports `status: "online"`, `capacity: 2`, `used: 0`, `Chrome/150.0.0.0`, extension `0.1.1`, heartbeat 41s against the 75s offline threshold. Protocol 2 is ENFORCED, not merely reported: `src/device.ts` closes the control socket on a `protocolVersion` mismatch, and `listDevices` reports `incompatible` without the `safe-write-v2` capability, so `online` is unreachable below protocol 2. Device stayed `online` across the allowlist deploy (heartbeat 6s after). Both hostnames return `200`. **Remaining: the 13-scenario Chromium acceptance suite**, which needs an operator at the browser | Pending | Canary operator |
-| Phase 3b: 24-hour read-only soak | In progress | Understudy `3493b243c0aa61fb06ec19ad5dcb4eb197a2d670` | Version `e0673967-0ca5-4cca-81ee-50d4088cec33` (unchanged for the duration) | **Run 1 FAILED at 40 minutes** (device went offline with Chrome running — see below). **Run 2** in progress: read-only session on `https://example.com`, tab `2134211768`, started `2026-07-29T18:10:33Z`, hard expiry due `2026-07-30T18:10:33Z`. Driven by `~/.understudy-canary/soak-driver.sh` — one `get_tabs` every 20 minutes, inside the 2h idle window with margin — appending a JSONL sample per read to `~/.understudy-canary/soak.jsonl`. First sample clean: `tabs_result`, `connected`, one tab, `deviceUsed: 1`, no anomalies; `idleExpiresAt` advanced on the read, confirming the refresh mechanism. **Remaining: 24 hours of elapsed time, then the closeout audit** | Pending | Canary operator |
-| Phase 4: governed Metamind unattended proof | Not started | Pending | Pending | Pending | Pending | Canary operator |
-| Phase 5a: one-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
-| Phase 5b: five-record production gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
-| Phase 5c: all-allowlisted 24-hour gate | Not started | Pending | Pending | Pending | Pending | Canary operator |
-| Phase 6: rollout closeout | Not started | Pending | Pending | Pending | Pending | Release operator |
-| Side surface: authed MCP server + account/pairing dashboard | In progress | `mcp-4-dashboard-pairing` HEAD `00a6cf1` (local branch, not yet pushed/merged) | **Deployed `2026-07-31`, version `f334a2c8-c158-458f-a230-26bab95e79ea`** on account `056cbaa6…`. Applied migrations `v3` (`AccountDirectory`) + `v4` (`UnderstudyMcp`, `AccountAgent`); bound `MCP_AGENT`/`ACCOUNT`/`ACCOUNT_DIRECTORY`/`OAUTH_KV` (`920a2498…`)/`EMAIL`; secret `VAULT_UPLOAD_PRIVATE_KEY` set (sha256 prefix `150c0c6a…`). Both allowlists `["metamind", "prefix:acct-"]`. **This deploy reset the Phase 3b soak clock** (see the soak section) | Built green pre-deploy: backend 307 tests + extension 145 + build + `wrangler deploy --dry-run`; all three quality-gate lanes + `/security-review` passed (twice). Post-deploy live smoke against `understudy.proofof.tech`: `/health` → `{"ok":true}`; RFC 8414 + RFC 9728 metadata correct (S256, scopes `["mcp"]`, resource `.../mcp`); `POST /mcp` initialize with no bearer → `401` with the `resource_metadata` WWW-Authenticate pointer (the OAuth handshake's first exchange); DCR `/oauth/register` → `201` client_id; `/dashboard` → `200` sign-in page, `no-store` + nonce CSP. The full **authed** handshake (DCR→consent→PKCE→`tools/list` of 14 tools, and the `usk_` path) is proven in the workers-pool suite against identical code; live it needs a human to complete the emailed OTP, so only the unauthenticated discovery handshake was exercised live. Additive only — per-command path, `/v1` API, and soak-owned device/lease behavior unchanged. **Superseded: this version's dashboard was write-dead — every POST, sign-in included, returned `403 cross-origin request refused`. See "The dashboard refused its own POSTs (2026-07-31)". The smoke recorded here missed it because its only dashboard-plane request was `GET /dashboard`. **Fixed and deployed `2026-07-31`, version `dc9c378e-6e6b-416b-b7ef-038411bc4ae5`** (commit `56ed00a` on `dev`); post-deploy smoke: `/health` ok, admit probe `200` with the code page, refuse probe `403` (the discriminator — pre-fix answers `200`), `Referrer-Policy: same-origin` served, plaintext well-known now `308`s, and a real Chrome 150 form POST captured over CDP returns `200` with `origin: https://understudy.proofof.tech` + `sec-fetch-site: same-origin`** | `2026-07-31` | Engineering |
-| Side surface: Chrome Web Store beta privacy prerequisite | Passed | `76f1ec9cbae3d0c0ce6f2430175a6efb9e9ca239` | Deployment `b69d9a87-72f1-4175-8237-9dc062f61cad`, version `13159f32-e3a2-4370-902d-68a6d5347786` at 100%, message `release 76f1ec9cbae3d0c0ce6f2430175a6efb9e9ca239 - add Understudy Beta privacy page` | Reviewed store ZIP SHA-256 `1a1bf97744fa24ca00e8b31b722d18e291f383dc8d174c98d888a67fd1a4cabe`; full typecheck and 560-test suite passed; all three independent review lanes clean. Wrangler dry run passed. Live custom-domain smoke: `/health`, `/dashboard`, and `/privacy` returned `200`; privacy served `Cache-Control: no-store` and nonce CSP; admitted same-origin auth POST returned `200`; equivalent cross-site POST returned `403` | `2026-07-31T09:33:01Z` | Engineering |
+The implementation removes the cloud vault, `fill_secret`, both MCP secret tools, legacy `usk_v1` acceptance, and OAuth grants without current device binding. It adds browser-bound authentication, direct extension pairing, versioned origin policy, suspended lease adoption, physical-window convergence, attended `idle`, provenance reporting, HSTS response headers, and the extension-local payment-card vault.
 
-## Unplanned Phase 1b deployment (2026-07-28)
+No cloud-vault values migrate into the local card vault. Users must enroll cards again in the extension.
 
-Pushing the Metamind Phase 1a branch `feat/unattended-phase-1` deployed it to **production**. Nothing was merged; the push alone was sufficient.
+## Verified local gates
 
-A built branch does not preview here, it deploys. Non-production branch builds normally produce a preview version because Cloudflare runs `wrangler versions upload` for them — the preview behavior comes from the COMMAND, not the branch. Metamind's configured deploy command is `npx wrangler deploy`, which creates a deployment at 100% traffic on whatever branch it runs. Deployment `0b7c23c4-8c32-41ac-ac68-92cca84d255c` records exactly that: version `998ca9c2` at 100%, not a version upload.
+These results apply to the source code in this branch. A code or configuration change invalidates the relevant result.
 
-| Fact | Value |
-|---|---|
-| Deployed version | `998ca9c2-95cb-4731-a2a0-29bf94163acd` at `2026-07-28T02:46:04Z` |
-| Displaced baseline | version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a` |
-| `/health.commit` | `e602b3b32426e35490d8f1df6bdc3f7ebebbd9de` — an unmerged pull-request branch |
-| D1 state | `browser_session_leases` absent; the deployed code queries it |
+| Gate | Evidence | State |
+| --- | --- | --- |
+| Unit tests | 2026-08-02: 685 tests; protocol 47, connector 29, extension 248, backend 361 | Passed |
+| Typecheck and build | `pnpm typecheck` and `pnpm build` after all review fixes | Passed |
+| Local Chrome end-to-end | Vault restart, Chrome DevTools Protocol submission, worker-eviction recovery, deletion, and synthetic-marker non-egress | Passed |
+| Store package | 127,365 bytes; local SHA-256 `3b492a1608131088c607e5254317708165e8785c67ee73c393c40578fff9b54f` | Passed |
+| Wrangler | Generated types current; deployment dry run completed without upload | Passed |
+| Review lanes | Independent clean-code, architecture, and quality-assurance reviews returned clean after fixes | Passed |
+| Network baseline | Test A 10s and 30s passed; Test A 60s and 120s plus Test B 30s remain | Partial |
+| Production HSTS | Last probe found no HTTP upgrade, no HTTPS HSTS header, and no apex address record | Pending |
+| Cloud-vault cleanup | No values, namespace, or production secrets were deleted | Pending |
 
-Impact is confined to browser enrichment: `POST /v1/intake/records/:id/enrich-website` fails because the lease table is missing, and the 15-minute sweep logs `browser-lease-sweep-error` each tick. The primary lead-intake workflow, authentication, CRM commit, and Gmail draft paths are untouched, and the approval-resume lease release is internally contained, so approval decisions still land.
+The store ZIP is ignored build output. Rebuild it from the merged release commit and record its new size and SHA-256 before submission.
 
-This inverts the ordering Phase 1b requires — the additive D1 migration must be applied **before** deploying code that queries the table — and the deployment carries no `/health` verification and no attended proof, so it is not a passed gate.
+## Pending work overview
 
-### Resolution
+Complete the remaining work in this order:
 
-Rolled back at `2026-07-28T02:54:56Z`. Deployment `09d99cf6-6ef7-404b-81dd-99d36319ac77` restored version `b7890ecc-b4c4-489f-a67f-3cafbca67b6a`, and `/health.commit` reads `local` again — the documented baseline. Production D1 was never modified, which is the correct state for the restored code. Rolling back rather than applying the migration was chosen because the displaced version had no `/health` verification and no attended proof behind it, so it was an unrecorded state rather than a passed gate; returning to a known baseline lets Phase 1b run in the order this runbook specifies.
+| Step | Pending action | Required authority or input | Completion evidence |
+| ---: | --- | --- | --- |
+| 1 | Run the remaining pre-fix network baseline | No active soak; caller credential; exact device and origin; approval immediately before firewall or Tailscale mutation | Mode-0600 JSONL evidence outside Git |
+| 2 | Apply the deterministic reconnect result | Baseline evidence from step 1 | Selected branch recorded; any required code change reviewed and verified |
+| 3 | Push, review, and merge the release branch | Repository write authority | Pull request and merge SHA |
+| 4 | Publish protocol 0.9.0 and connector 0.6.0 | Package-registry release authority | Registry versions and package integrity values |
+| 5 | Submit extension 0.2.0 | Chrome Web Store authority | Submitted artifact SHA-256, review status, and published extension ID |
+| 6 | Deploy the protocol-3 compatibility backend | Production Cloudflare authority; validated mode-0600 inputs | Deployment evidence with matching source SHA and three matching health reads |
+| 7 | Upgrade the Metamind canary consumer and extension | Canary host and browser access | Version inventory and healthy control connection |
+| 8 | Execute the authentication and cloud-vault hard cut | Declared maintenance window and fresh destructive confirmation | Epoch evidence, revoked credentials, deleted vault inventory, removed secrets |
+| 9 | Re-pair browsers and reconnect MCP clients | Account owners and active browser profiles | New device-bound credentials and successful `tools/list` |
+| 10 | Run canary security and lifecycle acceptance | Synthetic card only; approved test origin | Sanitized canary evidence with no marker egress |
+| 11 | Run the post-fix network matrix | Same authority as step 1 | Recovery and lease evidence for all three cases |
+| 12 | Complete expiry, soak, and traffic ramps | Production monitoring and rollback owner | 15-minute expiry, governed proof, soak, and ramp ledgers |
+| 13 | Finish apex HTTPS and HSTS preload | DNS, TLS, Cloudflare zone, and preload submission authority | HTTPS inventory, staged headers, preload eligibility, and pending or preloaded status |
 
-Metamind pull request #17 (Phase 1a) is held open and green, unmerged, because merging it would trigger another branch build and redeploy production.
+Do not combine steps 6 and 8 into one unobserved change. First prove that the compatibility deployment is healthy. Then start the separately confirmed hard-cut window.
 
-Before any further Metamind deployment:
+## Run the remaining network baseline
 
-1. **Done `2026-07-28T03:1xZ`.** Non-production branch builds are Disabled in the Metamind Workers Builds configuration (production branch `master`). Verified by pushing to the branch afterwards: no new deployment record, `/health.commit` unchanged at `local`, and the `Workers Builds: metamind` check no longer appears on the pull request — it was present on the push that caused this incident. If branch builds are ever wanted back, their deploy command must be `wrangler versions upload`; and even a correct preview binds production D1, KV, and Durable Objects here, because there is one wrangler environment with top-level bindings.
-2. **Done.** Metamind's `docs/deploy.md` corrected in `8173ddd`, merged with [PR #17](https://github.com/ProofOfTechOrg/metamind/pull/17).
+Read `docs/network-blip-rollout-handoff.md` before running the harness. Confirm that no production soak is active. Ask for approval immediately before each firewall or Tailscale change.
 
-Phase 1a is merged. Phase 1b remains, and its ordering is below.
-
-### Phase 1b ordering, with the auto-deploy in the picture
-
-The promotion to Metamind's default branch **is** the production deploy. `pnpm deploy:prod` is not what ships production in the normal flow — the merge is. That removes the window this runbook's Phase 1 sequence assumes between deploying code and applying its schema, so:
-
-Apply `packages/worker/sql/add-browser-session-leases.sql` to production D1 **before** promoting to `master`, not after. The deployed code queries that table on the enrichment path; promoting first repeats the failure this section records.
-
-**Chosen and in force:** the default-branch auto-deploy stays enabled, and its Workers Builds commands were changed so that it runs the source-controlled deploy script rather than a bare `wrangler deploy`:
-
-| Setting | Value |
-|---|---|
-| Production branch | `master` |
-| Build command | `pnpm build` |
-| Deploy command | `bash scripts/deploy.sh --skip-build` |
-| Non-production branch builds | Disabled |
-
-Every production deploy therefore carries a SHA-stamped `--var COMMIT` and deployment message plus a `/health.commit` verification, with the logic reviewable in the repository and only a one-line reference in the dashboard. Confirmed working on the Phase 1b deployment: deployment `906afcb2` records the message `release 5fb1e118…`, which only `scripts/deploy.sh` produces.
-
-State what this does and does not gate. The clean-tree checks are genuine pre-deploy gates but apply only to local `pnpm deploy:prod` runs, since a CI checkout is clean by construction. The `/health.commit` check runs AFTER `wrangler deploy` has landed, so it detects a mismatch and fails the run loudly — it cannot reject a deployment that already happened. Treat a red verification as "roll back", not "nothing shipped".
-
-### Verifying `/health.commit` after a deployment
-
-A deployment propagates across the edge over seconds to minutes, and during that window `/health` legitimately answers with EITHER version depending on which isolate serves the request — observed mixed for roughly two minutes after the rollback below. A single `curl` is therefore not a verification: it can read an un-propagated isolate and reject a good deployment, and one matching read only proves one isolate updated while traffic may still run the old code.
-
-Poll for at least three minutes and require several CONSECUTIVE matching reads before accepting the gate. Metamind's `scripts/deploy.sh` does this (`8173ddd`); a hand-run check must do the same.
-
-The deployment was only detectable because Phase 1's build-time provenance stamp was already in place. Under the previous `COMMIT=local` placeholder, `/health` would have reported `local` both before and after, and this would have been invisible.
-
-## The dashboard refused its own POSTs (2026-07-31)
-
-Version `f334a2c8-…` shipped a dashboard that returned `403 cross-origin request refused` to **every** state-changing request, sign-in included. The self-serve surface was unusable from the moment it deployed: no account could sign in, so no account could add an origin, pair a browser, or mint an MCP token.
-
-`src/dashboard/app.ts` set `Referrer-Policy: no-referrer` on every response. Fetch's *append a request `Origin` header* serializes a non-CORS non-`GET` request's origin as the literal `null` under that policy, so Chrome posted `Origin: null` to the dashboard's own sign-in form — and `originAllowed` required `Origin` to equal the request URL's origin. The app's privacy header disabled the app's CSRF check.
-
-Captured off the wire in Chrome 150 via CDP (`Network.requestWillBeSentExtraInfo`; the plain `requestWillBeSent` view omits browser-added headers and shows no `Sec-Fetch-*` at all):
-
-```
-origin: null
-sec-fetch-site: same-origin
-sec-fetch-mode: navigate
-sec-fetch-dest: document
-```
-
-Confirmed server-side: `Origin: null` → `403`, `Origin: https://understudy.proofof.tech` → `200`, absent → `403`.
-
-**This is the same failure class as "An empty request body was not treated as attended" above, and that is the finding that matters.** Both shipped green because the suite builds requests in-process with `new Request(...)`, and an in-process `Request` does not carry what the wire carries — a null body there, a browser's computed header shape here. Twice now that gap has reached production. The deploy smoke did not close it either: it checked `GET /dashboard` → `200`, which never exercises a POST.
-
-**Every dashboard deploy smoke must now include a state-changing probe.** A `GET` cannot detect this class, and the two commands below pin both gate branches over the wire. Note the deliberately malformed address: `requestOtp` sends to ANY pattern-valid address whether or not the user exists, so a plausible-looking one would hard-bounce against `sign-in@proofof.tech`'s reputation and leave a junk challenge row on every deploy. Without an `@` it fails validation before the send, while the response — address-independent by design — is byte-identical:
+Keep credentials and raw evidence outside Git. Both files must use mode `0600`.
 
 ```bash
-# admit: expect 200 containing "6-digit code"
-curl -sS -X POST https://understudy.proofof.tech/dashboard/auth/request-code \
-  -H 'Origin: https://understudy.proofof.tech' \
-  -H 'Sec-Fetch-Site: same-origin' \
-  --data 'email=postdeploy-smoke' | grep -c '6-digit code'
+export UNDERSTUDY_DEVICE_ID="00000000-0000-4000-8000-000000000001"
+export UNDERSTUDY_TEST_ORIGIN="https://allowed.example"
+export UNDERSTUDY_SOAK_CONFIRMED_INACTIVE=yes
 
-# refuse: expect 403
-curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
-  https://understudy.proofof.tech/dashboard/auth/request-code \
-  -H 'Origin: https://understudy.proofof.tech' \
-  -H 'Sec-Fetch-Site: cross-site' \
-  --data 'email=postdeploy-smoke'
+scripts/network-blip-harness.sh a 60 \
+  /absolute/private/caller-token.json \
+  /absolute/private/network-blip.jsonl
+scripts/network-blip-harness.sh a 120 \
+  /absolute/private/caller-token.json \
+  /absolute/private/network-blip.jsonl
+scripts/network-blip-harness.sh b 30 \
+  /absolute/private/caller-token.json \
+  /absolute/private/network-blip.jsonl
 ```
 
-The refuse probe doubles as a deployment discriminator: the pre-fix code reads `Origin` only, so it answers `200` to that request (measured against `f334a2c8-…`). A `403` therefore proves the new gate is the one serving traffic, not a cached or partially-rolled version. Not a browser-exploitable hole in the old code — `Origin` is a forbidden header name, so no page could have forged it — but it is exactly the signal that distinguishes the two versions over the wire.
+Apply exactly one result:
 
-Fixed by making the check independent of any header this app can suppress. `sameOriginRequest` now keys on `Sec-Fetch-Site`, which is computed from the initiator and takes no referrer-policy input, keeping `Origin` only as a fallback for browsers that predate Fetch Metadata; the policy relaxes to `same-origin`, which sends nothing cross-origin (identical privacy) while leaving `Origin` intact for that fallback. The check also moves into the `dashboardApp` middleware, because it is the **only** CSRF control on the two pre-session sign-in routes and a new POST route must not be able to omit it silently.
+1. If any Test A recovery exceeds 30 seconds or loses its lease, make `chrome.alarms` authoritative for both WebSocket retry paths. Persist desired state, retry deadline, and bounded backoff. Retain `setTimeout` only for acceleration below 30 seconds.
+2. If every Test A case recovers within 30 seconds but Test B exceeds 30 seconds or has a worse lease outcome, keep only `https://understudy.proofof.tech`. Request a fresh connect ticket on every durable alarm, discard stale socket attempts, and treat the ticket request as the connectivity and Domain Name System (DNS) probe.
+3. If every baseline case recovers within 30 seconds, run sustained backgrounding with Chrome occluded and no local interaction. Fix the first failed layer shown by evidence.
 
-That scheme pin has a local-dev consequence worth knowing before you touch it. `wrangler.jsonc` declares a `custom_domain` route, and with one present `wrangler dev` serves the Worker the canonical host over `http` no matter what the client asked for — so the guard fires on every dev request and 308s the whole account plane to `https` on a plaintext listener. `wrangler.jsonc` pins `dev.host` to `localhost` to restore the loopback exemption. **Verify local dev by curling it, never by running vitest:** `curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/dashboard` must be `200`, not `308`. An in-process `new Request("http://localhost:8787/...")` is exactly the URL `wrangler dev` does not produce, which is why the suite cannot see this.
+Do not add a secondary control origin. If step 2 requires code changes, or step 3 exposes a defect, rerun the full repository gate and all three independent review lanes before merge.
 
-One consumer-facing note: a client calling the canonical host over plain `http` on `/mcp` now receives a 308 it must follow. MCP clients use https, so this is low risk.
+## Merge and publish the source artifacts
 
-Also closed while here: `src/index.ts` gated the account plane on host but not scheme, and browsers send Fetch Metadata only to trustworthy URLs — so a plain-`http` request reached the dashboard with no `Sec-Fetch-*` and fell to the suppressible `Origin` fallback. Not exploitable (producing a matching `Origin` over plaintext needs an active MITM, which defeats everything anyway), but it was the one path by which a browser could reach this app without the primary signal.
-
-## Attended mode was broken (2026-07-28)
-
-The first attended proof attempt failed at `POST /records/:id/enrich-website` with a bare `502`. Two independent production bugs, both of which made attended enrichment impossible, and neither of which any test suite caught.
-
-### 1. An empty request body was not treated as attended
-
-Attended creation is defined as "no body" and was checked as `c.req.raw.body === null`. That holds only for a Request constructed in-process. Over the wire a bodiless POST is not bodiless: every client sends `Content-Length: 0`, which arrives as an empty but non-null stream — curl, Node's fetch, and a Worker subrequest to a public hostname alike. So the request fell through to the unattended branch and failed schema validation with `400 invalid body`.
-
-Understudy's own suite stayed green because its tests call `exports.default.fetch(new Request(url, { method: "POST" }))` in-process, which is the one path that does produce a null body.
-
-Fixed in Understudy `e0351f6`, deployed as version `8ec9be79-76bb-4140-9530-402b4a46a40e`. The body is read once, bounded, and an empty result takes the attended branch; a non-empty one is validated exactly as before, so a malformed body still cannot open an attended session. The regression test builds the request the way the wire delivers it.
-
-### 2. Provisioning and workflow start were a single call
-
-With the body fixed, the run reached the workflow and failed with `understudy service 503`. The workflow's first step dry-runs two navigations, and `SessionAgent.dispatchV2` checks `hasAuthorizedConnection()` BEFORE it considers `dryRun` — so a dry run needs an attached browser like any other dispatch.
-
-That made the attended sequence impossible. `enrich-website` minted the session and started the workflow in one call, and an operator can only attach once a `sessionId` exists, so the preview always ran against an unattached session. The preview cannot simply move after the approval either: the approval payload embeds it, which is what the reviewer approves against.
-
-Fixed in Metamind `7f92720` by splitting the two: `POST /records/:id/browser-session` provisions the leased session and returns it — with the `webSocketUrl` in attended mode — without touching the workflow. The operator attaches, then POSTs `enrich-website`, which adopts the same session rather than minting a second. Unattended keeps the single call, since the enrolled device attaches itself. The proof runner is reordered to provision → attach → start.
-
-### Why diagnosis was slow
-
-The route caught every unmapped error and returned `502` without logging it, so Workers request logs showed a clean `ok` outcome with no exception and no clue. The 502 fallback now logs the error before returning. An error path that discards its own cause is not a failure mode worth preserving.
-
-## The lease sweep cannot reach Understudy from cron (2026-07-28, RESOLVED)
-
-The SWEEP_CRON recovery pass — the durable backstop for browser-session cleanup — could not call Understudy. Three orphaned `minting` leases retried every 15 minutes and failed identically:
-
-```json
-{"type":"browser-lease-recovery-error","state":"minting","transient":false,
- "error":"Error: understudy session mint failed (404)"}
-```
-
-### Resolution: the custom domain, proven by the first tick after deploy
-
-Fixed by candidate (2) below — Understudy moved to `understudy.proofof.tech` and `UNDERSTUDY_URL` repointed at it. Metamind `b70c40e3` went live at `16:29:49Z`; the `*/15` tick at `16:30` cleared **every** stale lease in the table:
-
-| Lease | State before | Stuck since | Released at |
-|---|---|---|---|
-| `a4c27723` | `minting` | 05:34:36Z | 16:30:14Z |
-| `7c1e2b90` | `minting` | 05:36:05Z | 16:30:17Z |
-| `3b8d1f22` | `minting` | 05:38:48Z | 16:30:21Z |
-| `ea5acce7` | `cleanup_pending`, `last_error: "cleanup failed (404)"` | 10:45:36Z | 16:30:22Z |
-
-All four are `released` with `last_error` null, and the already-`released` attended-proof lease was left untouched.
-
-**This is conclusive without needing a tail.** `released` is reachable only through a CONFIRMED 204 from Understudy — the sweep's own contract — so a request that never arrives cannot produce it. The four transitions prove the subrequest now arrives, is authorized, and is answered. `ea5acce7` is the strongest single datum: it carried the 404 in its durable `last_error` for six hours and cleared seconds after the deploy.
-
-The `minting` rows exercised the full recovery path rather than a shortcut. `recoverMintingLease` replays only when the lease has no session id — `lease.sessionId ? {kind:"session", …} : await replayMint(…)` — so the recorded `understudy session mint failed (404)` is itself proof those three had none. The sweep therefore had to replay the create under each lease's original idempotency key, learn the session id, then release it: **mint and delete both reached Understudy.**
-
-**Scope limit — read this before treating the sweep as proven.** All six leases are `mode=attended`; Metamind is deployed `UNDERSTUDY_SESSION_MODE=attended`, so every row stores the literal four-character string `null` in `request_json` (the column is `NOT NULL` in `migrations/0001_init.sql`, so a SQL NULL is impossible — a `d1 execute` readout showing `null` is that string). `replayMint` routes an attended lease to `createAttendedSession`, and Understudy answers an absent body from the attended branch and **returns before** the `UNATTENDED_ENABLED_TENANTS` gate:
-
-```ts
-// apps/backend/src/index.ts — attended returns at the c.json({ sessionId }) above
-if (!enabledForTenant(c.env.UNATTENDED_ENABLED_TENANTS, actor.tenantId)) {
-  return c.json({ error: "unattended sessions are disabled" }, 503);
-}
-```
-
-So what is proven is routing plus the attended replay path. The **unattended** replay is untested in production and cannot be tested while the flags are `"[]"` — it would draw the `503`, which `REFUSAL_STATUSES` reads as a refusal. Phase 4 is its first real exercise.
-
-**The flags MUST be flipped at Understudy before Metamind's mode, never the reverse.** This is not a preference. With the allowlist empty, an unattended create returns `503` inside Understudy's strict single-key `{"error":…}` envelope, so Metamind mints an `UnderstudySessionRejectedError` — and on the *request* path `mintLeasedSession` abandons the lease immediately. `listRecoverableBrowserLeases` excludes `abandoned`, so the sweep can never pick it back up. Flipping Metamind first would irreversibly abandon one lease per enrichment request, synchronously. The rollback order in "Roll back safely" is the correct mirror: Metamind to attended first, then Understudy.
-
-### Carry into Phase 4: the quarantine gate is wider than `REFUSAL_STATUSES`
-
-The sweep's 24-hour quarantine keys on `understudyAnswered(error)`, which is true for **any** response carrying Understudy's error envelope — not only the refusal statuses. That includes `404 device not found` and `426 extension lacks safe-write-v2`, neither of which is in `REFUSAL_STATUSES`.
-
-The consequence is delayed and therefore easy to misread: a persistent misconfiguration — an unenrolled or renamed device, a downgraded connector — produces those statuses on every tick, writes `last_error`, and changes no state for 24 hours. It looks benign. At the 24-hour boundary the sweep begins abandoning leases instead. **Treat a repeating `browser-lease-recovery-error` with a 404 or 426 as urgent even though nothing has transitioned yet**; the absence of a state change is not the absence of a problem. This predates the rollout and is not introduced by any change in it.
-
-Confidence: **high** that the routing fault is gone. Still **unknown**: Cloudflare's precise reason for 404-ing the cron-context subrequest to `*.workers.dev` while the identical fetch-context request succeeded. The fix routes around it rather than explaining it, and that distinction is left in the record deliberately — if a future service ever needs a `*.workers.dev` hop from a scheduled handler, this is unexplained, not solved.
-
-## The attended production proof PASSED (2026-07-28)
-
-Run `metamind_efefdb2e-2aed-441a-af6b-527e640c816f`, record `rec_nDHTDg3Z9UbzyyG7`, against Metamind `434c1a7f` and Understudy `5cc96902`.
-
-| Gate | Evidence |
-|---|---|
-| Extension connected, tab attached | Chrome 150, extension `0.1.1`, `https://example.com/` |
-| Approval by a present human | `decidedByPresent: true`, `decision: approve` |
-| Workflow run | `status: "success"` |
-| Public page datum | matched `Example Domain` |
-| **Authenticated datum** | matched `Secure Area` — behind the portal login, filled from the vault |
-| Context line | non-empty, 77 characters |
-| Audit trail | 13 `connector.execute` entries correlated on `targetId == runId` |
-| Lease cleanup | `released` — a CONFIRMED 204, `last_error` null |
-
-Real Chromium, real CDP, human-in-the-loop approval, a vaulted credential, and a datum read from behind a login — with the audit trail and the durable lease both closing correctly. **Phases 1b and 2 are closed.**
-
-The run needed three attempts, and the first two failed on defects in this repo's consumer rather than on anything the operator did.
-
-### The sweep tore down a session mid-attach
-
-Provisioning and starting are two calls with a human between them, so between them the lease has NO run. `recoverActiveLease` read a missing run as a finished one and queued cleanup five minutes after provisioning — while the operator was still loading an extension. The attach took twenty minutes; the enrichment then failed with `lease_conflict`.
-
-**Only the cron routing fault prevented data loss.** The sweep's DELETE hit the same unreachable-host 404 as everything else, so Understudy never received it and the session survived. Fixing the routing without fixing this would have destroyed live sessions.
-
-Fixed in Metamind: a missing run counts as finished only past a 30-minute attach window. The test that asserted the old behaviour had encoded the bug, which is why it looked deliberate.
-
-### The step-up expired mid-proof
-
-The admin step-up lives fifteen minutes and the attended flow spends most of that waiting for a human, so the credential was dead by the audit read — discarding a proof whose browser writes had all succeeded. The audit read now re-reads the file and asks the operator to re-stage. The trailing audit for the passing run was completed by hand.
-
-### Correction: the first evidence chain rested on a dead instrument
-
-An earlier revision of this section concluded the same thing from a `wrangler tail` that had **silently failed to start**. Run from `apps/backend` without an account, it exits immediately with:
-
-```
-✘ [ERROR] More than one account available but unable to select one in non-interactive mode.
-```
-
-It writes nothing to stdout, so "zero requests during the tick" was indistinguishable from "the tail never ran". Understudy's Worker lives on account `056cbaa6f5c3d8ff5584f1aa84bbe050`, so the tail must be started as:
+Before merge, require continuous integration or rerun this exact gate at the release head:
 
 ```bash
-CLOUDFLARE_ACCOUNT_ID=056cbaa6f5c3d8ff5584f1aa84bbe050 npx wrangler tail --format json
-```
-
-**Always validate a tail before drawing a negative conclusion from it** — issue a known request (`curl .../health`) and confirm it appears. Every observation below was taken on a tail validated that way.
-
-### Evidence, in the order it rules things out
-
-| Observation | Rules out |
-|---|---|
-| `POST /v1/sessions` replaying the leases' **original** idempotency keys returns `200` from curl | The keys, the route, the payload, idempotent-replay state |
-| Missing or garbage bearer tokens return `401`, never `404`; a valid token returns `200` with or without an idempotency key | The caller token — no auth failure can present as `404` |
-| The deployed bindings of Metamind version `3f1ba280` carry `UNDERSTUDY_URL=https://understudy-backend.gcharang.workers.dev` and `UNDERSTUDY_TENANT_ID=metamind` | Configuration drift (see the two-config trap below) |
-| Breakwater's `egressFetch` **throws** `EgressDeniedError` on denial and never synthesizes a `Response` | The egress guard manufacturing the `404` |
-| The Metamind fetch-context mint at `05:46:42Z` succeeded and minted a real session | Metamind's caller token and `UNDERSTUDY_URL` at runtime |
-| Across the `07:45:31Z` tick Metamind logged 3 × `404` while Understudy received **zero** sweep requests — the only requests in that window were my own probes, identifiable by `user-agent: curl/8.5.0` and `cf-connecting-ip` | Understudy rejecting it — the request never arrives |
-
-Because `createAttendedSession` fails on `!response.ok`, the fetch **resolved with a real 404 Response**; it did not throw. Something between Metamind's scheduled handler and Understudy answers it.
-
-Confidence: **high** that the sweep's subrequest does not reach Understudy; **unknown** as to Cloudflare's precise reason — do not guess it into the record.
-
-### The two-config trap
-
-Metamind has **two** Wrangler configs, and reading the wrong one sends you chasing a phantom:
-
-| File | Purpose | `UNDERSTUDY_URL` |
-|---|---|---|
-| `wrangler.jsonc` (repo root) | **Production.** `scripts/deploy.sh` runs from the root, so this is what deploys | `https://understudy-backend.gcharang.workers.dev` |
-| `packages/worker/wrangler.jsonc` | Local dev | `http://localhost:8790` |
-
-`wrangler deploy --dry-run` run from `packages/worker` prints the **dev** bindings and looks alarming. Verify what is actually live with `wrangler versions view <id>` instead.
-
-### Impact (while it held)
-
-Phase 1's durable cleanup guarantee was not met in production. The synchronous release on the resume path still worked — that is what released the one successful run's lease — but the crash backstop did not, so a lease orphaned by a crash stayed orphaned and its device slot was held until Understudy's own idle expiry. The Phase 5 ramp gate "no stale `minting`, `active`, or `cleanup_pending` lease after a terminal workflow" could not pass while this held. It can now: the 16:30 tick is that gate passing against real orphans.
-
-### Reading the 404's body
-
-The bare status is why this cost hours. Metamind now reports the response's content type and a bounded body snippet on a failed mint (`describeFailure` in `packages/worker/src/intake/browser-session.ts`), which separates the two possibilities without further guesswork:
-
-- a JSON body (`{"error":…}`) means **Understudy answered** — fix the call;
-- an HTML body means **the edge synthesized it** — fix the routing.
-
-### Two candidate fixes; (2) was applied
-
-1. **Service binding.** The correct Worker-to-Worker mechanism for two Workers on one account: no DNS, no public hop, no egress. But session management deliberately routes through breakwater's egress pin — `browser-session.ts` states it "must not be the one hole in the egress pin" — and a service binding bypasses that guard entirely. It is therefore not a drop-in: it needs `egressFetch` to gain a service-binding transport, or it weakens a deliberate security boundary.
-2. **Custom domain for Understudy.** Point `UNDERSTUDY_URL` at a routed domain instead of `*.workers.dev`. This keeps the egress guard intact and only changes a hostname, and it retires a personal `gcharang.workers.dev` subdomain as the production address of a service other repos consume. It needs a hostname decision from the owner.
-
-Given the egress-pin constraint, (2) was preferred on architecture as well as speed — the reverse of this document's earlier recommendation. **(2) shipped**, at `understudy.proofof.tech`, and the resolution above is its verification.
-
-One trap it carried: declaring a route makes Wrangler disable `workers.dev` **by default**, which silently retires the old hostname. Consumers hold a URL, so anything still pointed at `understudy-backend.gcharang.workers.dev` breaks the moment that deploys — as it did here, briefly. `apps/backend/wrangler.jsonc` now pins `"workers_dev": true` explicitly, with a comment saying why. Both hostnames serve; the old one stays up until every consumer is confirmed migrated.
-
-### What the diagnostic cost, and what it found on the way
-
-The observability change is Metamind PR #20, merged as `b70c40e3` and live since `16:29:49Z`. It grew well past a logging fix, because the "who answered?" question turns out to gate an irreversible action: `mintLeasedSession` abandons a durable lease on a refusal, on the premise that a refusal proves nothing was created. Four review rounds each found that premise applied wrongly, and the last two found defects that predate this investigation:
-
-| Defect | Why it mattered |
-|---|---|
-| Any non-2xx raised the refusal type in unattended mode | An edge-synthesized 404 retired a lease whose session may exist |
-| Ambiguity resolved toward "Understudy answered" | Any JSON-speaking proxy in front of Understudy could strand a session |
-| Understudy's own `{"error":"internal error"}` at **500** passed the envelope check | That 500 is raised while waiting for the extension — *after* the session exists |
-| The sweep replayed permanently-failing mints forever | A rotated token or disabled tenant crowds out recoverable leases, since the sweep pages oldest-attempt-first |
-
-Only the statuses Understudy declines with — 409, 429, 503 — are now read as refusals, and a lease that never learned a session id is retired after 24 hours under its own `browser-lease-quarantined` log type.
-
-Six review rounds ran in total; the last two found the defects above. The order mattered more than it looks: PR #20 also carried the fix for the sweep tearing a session down mid-attach. Had the routing fix merged first, the sweep would have started reaching Understudy while still holding that defect — and the first tick would have destroyed live sessions instead of cleaning up dead ones. The 404 was, accidentally, the only thing preventing data loss.
-
-Relevant to the ramp gates: the Phase 5 gate forbidding stale leases assumed the sweep could clear them. It now does — see the resolution above — so the gate measures the lease machinery again rather than the routing fault.
-
-## Start from the verified baseline
-
-The following state was verified on 2026-07-27. Recheck it before operational work because deployments and remote refs can change.
-
-### Repository and release baseline
-
-| Repository state | Verified value |
-|---|---|
-| Understudy working baseline | `dev@e4b98e6824b2dbee078a7c57da37a11f389010b9` |
-| Understudy release baseline | `origin/master@4843b6bccd8e1028c8fb6dba7812d643a4106778` |
-| Understudy local `master` | Stale at `46b210f745793cbc3d57fb06c96b28a627552429`; never deploy it without refreshing remote refs |
-| Metamind release baseline | Clean `master@ee94790ddf92b8fabebba10a502e76005a57e17d` |
-| Metamind baseline CI | [Passing run](https://github.com/ProofOfTechOrg/metamind/actions/runs/30179532157) |
-| Published packages | `@understudy/protocol@0.8.0`, `@understudy/connector@0.5.1` |
-
-The package release is complete. Do not create another package release unless later work changes a published package.
-
-### Production deployment baseline
-
-| Service | Deployment | Version | Known state |
-|---|---|---|---|
-| Understudy | `b73220f0-8035-40d2-9987-243770d96306` | `41434382-ecdd-4f95-a27c-811c4337b6bd` | Migration `v1`; no unattended Durable Object bindings, telemetry binding, rate limiter, or rollout variables |
-| Metamind | `f85a53c6-7b90-4b6f-a427-2e8cef7df637` | `b7890ecc-b4c4-489f-a67f-3cafbca67b6a` | `COMMIT=local`; deployment provenance is not verifiable |
-
-### Operator prerequisites
-
-Real-Chromium verification works only under these conditions:
-
-- Chrome 125 or newer
-- One tenant-dedicated Chrome profile
-- Chrome startup set to **New Tab**
-- The production extension build, not WXT development mode
-- No DevTools attached to a controlled tab
-- An awake machine, browser, and network for each soak
-- Access to both GitHub repositories, both Cloudflare Workers, production D1, Worker secrets, and the canary profile
-
-## Phase 0: Freeze the release baseline
-
-Freeze branch and evidence state before implementation begins. Merge this runbook before any operational deployment.
-
-1. Refresh remote refs in each repository:
-
-   ```bash
-   git fetch --prune
-   git status --short
-   git rev-parse HEAD
-   git rev-parse origin/dev
-   git rev-parse origin/master
-   ```
-
-2. Confirm each working tree is clean. Resolve any output from `git status --short` before deployment.
-3. Merge feature work into `dev` through reviewed pull requests.
-4. Promote reviewed `dev` commits to `master` through a `dev → master` pull request.
-5. Never merge `master` back into `dev`.
-6. Merge the rollout-document pull request before Phase 1.
-7. Update this runbook in every later implementation and deployment pull request.
-
-Record the merged SHA for this runbook in Phase 0b. Do not copy the pre-merge `dev` SHA into that field.
-
-## Phase 1: Make Metamind compatible and recoverable
-
-Complete and deploy this phase while production remains in attended mode. Understudy’s current backend must continue to serve the attended proof during this phase.
-
-### Upgrade the Understudy client packages
-
-In Metamind, change `packages/worker/package.json` to:
-
-```json
-{
-  "@understudy/connector": "^0.5.1",
-  "@understudy/protocol": "^0.8.0"
-}
-```
-
-Run `pnpm install` to update `pnpm-lock.yaml`, then review the dependency diff. Do not publish new Understudy package versions unless their package code changes.
-
-### Add the mode configuration
-
-Add these non-secret bindings to both `wrangler.jsonc` files, `packages/worker/src/env.ts`, and generated Worker types:
-
-| Binding | Contract |
-|---|---|
-| `UNDERSTUDY_SESSION_MODE` | `attended` or `unattended`; default and initial production value is `attended` |
-| `UNDERSTUDY_DEVICE_ID` | Required UUID in unattended mode |
-| `UNDERSTUDY_ALLOWED_ORIGINS` | JSON array of canonical exact origins; maximum 32 |
-| `UNDERSTUDY_PROFILE_STATE_KEY` | Required non-secret account-state identifier in unattended mode |
-
-Set the synthetic canary origins to exactly:
-
-```json
-["https://example.com", "https://practice.expandtesting.com"]
-```
-
-Reject a record origin that is absent from this list before creating an Understudy session. Expanding production scope requires one reviewed change that updates both Metamind’s source-controlled allowlist and the extension’s local origin policy.
-
-The list binds BOTH modes whenever it is set, covers every origin the workflow visits (the record’s own and the portal it authenticates against), and is re-checked at each approved side-effect boundary so a run suspended across a policy narrowing cannot resume against origins the list no longer permits. Note the operational consequence: once Phase 1b deploys these canary origins while the mode is still `attended`, attended enrichment of any other origin is refused with `403 origin_not_allowed` until that origin is added by reviewed change. That is the intended fail-closed behavior, not a regression.
-
-### Create attended and unattended sessions correctly
-
-Attended creation must omit both `body` and `Content-Type`. Understudy treats any body, including `"{}"`, as an unattended request.
-
-Unattended creation must send the JSON request with:
-
-- `mode: "unattended"`
-- The configured device UUID
-- The exact allowed origins required by the record
-- The configured profile-state key
-
-If unattended creation returns `202`, poll its status URL every 2s for at most 30s. Accept only a connected `200` or `201`. Treat `410` as terminal. Treat a timeout or any other failure as an operational error.
-
-### Return a mode-discriminated enrichment response
-
-Change `POST /v1/intake/records/:id/enrich-website` to return these fields in both modes:
-
-- `workflowId`
-- `runId`
-- `sessionId`
-- `mode`
-- `status`
-- `approvalIds`
-
-Attended responses also return `webSocketUrl`. Unattended responses must never expose or require a session WebSocket URL.
-
-The response contract must discriminate on `mode`:
-
-```typescript
-type EnrichmentStartResponse = {
-  workflowId: string;
-  runId: string;
-  sessionId: string;
-  status: string;
-  approvalIds: string[];
-} & (
-  | { mode: "attended"; webSocketUrl: string }
-  | { mode: "unattended" }
-);
-```
-
-### Centralize connector outcome handling
-
-Handle protocol-2 outcomes in one shared path:
-
-| Outcome | Required handling |
-|---|---|
-| `pending` | Poll the same command ID |
-| `not_started` | Retry the same logical command and business idempotency key |
-| `timed_out` | Retry reads and dry runs only |
-| `unknown` | Never retry; fail the workflow and preserve audit evidence |
-
-Do not infer retry safety from an HTTP status alone. Use the connector’s typed outcome and `safeToRetry` contract.
-
-### Add durable browser-session leases
-
-Add `browser_session_leases` to `packages/worker/migrations/0001_init.sql` for new databases. Add the same schema as `packages/worker/sql/add-browser-session-leases.sql` for the existing production database. Keep Metamind’s single consolidated baseline migration; do not add a second file to `packages/worker/migrations/`.
-
-The table must contain:
-
-- `run_id`
-- `record_id`
-- `idempotency_key`
-- `mode`
-- `request_json`
-- Nullable `session_id`
-- `state`
-- Nullable `last_error`
-- `created_at`
-- `updated_at`
-
-Use this state machine:
-
-```text
-minting → active → cleanup_pending → released
-                                   ↘ abandoned
-```
-
-`released` means Understudy CONFIRMED cleanup with `204`. `abandoned` is a separate terminal state for a lease that provably owns nothing — Understudy refused the creation outright, or had already disposed of the session. The two are deliberately distinct: an operator auditing confirmed cleanups must not silently get rows where nothing was ever confirmed, and a lease left in `cleanup_pending` for a session that never existed would retry and alert forever, failing the ramp gate on what is ordinary, self-clearing device contention.
-
-Persist the mint intent before calling Understudy, and the session id before waiting for it to connect. A crash must not lose the business idempotency key or request needed to recover the mint; recording the id before the connect wait is what lets an interrupted creation be resolved with a `DELETE` instead of another creation.
-
-Classify a failed mint before cleaning up after it. A refusal (`409`, `429`, `503`) means nothing was created, so the lease is abandoned. Any other failure means the outcome is unknown and something may exist, so the lease is LEFT in `minting` for the sweep to replay and discover — moving it out disables the only path that can find that orphan.
-
-Never re-mint under a terminal lease that held a session. Flowsafe can forget a completed run once its retention window passes, so "no run found" is not proof that none ever ran; re-minting would silently re-execute the workflow's browser writes. Refuse with a conflict and require a fresh idempotency key.
-
-On workflow-start failure or a terminal FlowSafe status, move the lease to `cleanup_pending`. Terminal statuses are `success`, `failed`, `tripwire`, `canceled`, `bailed`, and `skipped`.
-
-Preserve leases for the nonterminal statuses `pending`, `running`, `waiting`, `suspended`, and `paused`.
-
-Extend the existing 15-minute maintenance cron to recover `minting` rows and retry `DELETE` for `cleanup_pending` rows:
-
-- Treat `204` as released
-- Treat `202` as cleanup still pending
-- Retain and alert on persistent `401`, `403`, `404`, or `5xx`
-- Never mark an unresolved cleanup as released
-- Use compare-and-clear updates so a stale sweep cannot overwrite newer state
-
-Apply the production D1 migration before deploying code that queries the table:
-
-```bash
-pnpm exec wrangler d1 execute metamind --remote \
-  --file packages/worker/sql/add-browser-session-leases.sql
-pnpm exec wrangler d1 execute metamind --remote \
-  --command "SELECT name FROM sqlite_schema WHERE name='browser_session_leases'"
-```
-
-Apply the additive file once. Save both command results as Phase 1 evidence.
-
-### Update the production proof runner
-
-Update `packages/worker/scripts/enrich-browser-runbook.mjs` to support attended and unattended modes. Its self-test must cover both.
-
-The unattended path must:
-
-- Verify the configured device is online and has capacity
-- Create or replay the unattended lease
-- Poll creation until the session is connected
-- Avoid extension-token input
-- Avoid manual tab attachment
-- Verify cleanup and device usage after terminal workflow completion
-
-Keep the existing attended path and extension-token handling for attended proof only.
-
-### Stamp Metamind deployment provenance
-
-Replace the static `COMMIT=local` deployment path with an automated clean-tree deploy. The source-controlled deployment command must calculate the full SHA, reject a dirty tree, pass the SHA through Wrangler’s `COMMIT` variable, and include it in the deployment message.
-
-A deploy-time `--var` alone is not sufficient, because it stamps only the path that passes it. Metamind also auto-deploys its default branch through Cloudflare Workers Builds, whose deploy command is a bare `wrangler deploy` — that path would ship the `COMMIT` placeholder from `wrangler.jsonc` and silently un-stamp a previously stamped deployment, invalidating recorded evidence after the fact and with no signal. The commit is therefore ALSO baked into the bundle at build time (`packages/worker/vite.config.ts`, from `WORKERS_CI_COMMIT_SHA` or `git rev-parse HEAD`) and preferred by `/health`. Both deploy paths then report a real SHA.
-
-Confirm before Phase 1b that a merge to Metamind’s default branch cannot land an unstamped deployment over a stamped one — either the auto-deploy is disabled for the rollout, or it is running a build that carries the SHA.
-
-The automated command must implement this sequence:
-
-```bash
-metamind_release_sha="$(git rev-parse HEAD)"
-test -z "$(git status --short)"
-pnpm build
-test -z "$(git status --short)"
-pnpm exec wrangler deploy \
-  --var "COMMIT:$metamind_release_sha" \
-  --message "release $metamind_release_sha"
-```
-
-After deployment, verify provenance:
-
-```bash
-metamind_release_sha="$(git rev-parse HEAD)"
-curl --fail-with-body --silent \
-  https://metamind.proofof.tech/health |
-  jq -e --arg sha "$metamind_release_sha" \
-    '.status == "ok" and .commit == $sha'
-pnpm exec wrangler deployments status --json
-```
-
-Reject the deployment if `/health.commit` differs from the approved SHA.
-
-### Verify and deploy Phase 1
-
-Run the Metamind Worker lane from the Metamind repository:
-
-```bash
-pnpm --filter @repo/worker typecheck
-pnpm --filter @repo/worker test
-pnpm exec biome check packages/worker
-node packages/worker/scripts/enrich-browser-runbook.mjs --self-test
-pnpm build
-bash scripts/validate-build.sh
-git diff --check
-```
-
-Promote the reviewed Metamind change to `master`, deploy it with `UNDERSTUDY_SESSION_MODE=attended`, and rerun the existing attended production proof. Record:
-
-- The full Metamind SHA
-- CI URL
-- D1 migration result
-- Deployment and version IDs
-- `/health` result
-- Attended proof artifact and UTC completion time
-
-Do not begin Phase 2 until the attended proof passes.
-
-## Phase 2: Deploy the Understudy migration-v2 baseline
-
-Deploy migration `v2` with all unattended tenant flags off. This deployment becomes the rollback baseline for every later Understudy configuration deployment.
-
-### Verify the exact release source
-
-Refresh refs and check out the approved full SHA. Do not deploy the stale local `master`.
-
-Set `understudy_release_sha` to the full SHA approved in the ledger:
-
-```bash
-understudy_release_sha="full_approved_sha_here"
-git fetch --prune
-test -z "$(git status --short)"
-git cat-file -e "$understudy_release_sha^{commit}"
-git switch --detach "$understudy_release_sha"
-test "$(git rev-parse HEAD)" = "$understudy_release_sha"
-```
-
-Run from the Understudy repository:
-
-```bash
-pnpm install --frozen-lockfile
-pnpm build
 pnpm typecheck
 pnpm test
-pnpm --filter @understudy/backend exec wrangler deploy --dry-run \
-  --outdir /tmp/understudy-unattended-worker
-pnpm --filter @understudy/backend exec wrangler secret list
+pnpm build
+pnpm --filter @understudy/extension test:e2e
+pnpm --filter @understudy/extension build:store
+pnpm --filter @understudy/extension zip:store
+cd apps/backend
+pnpm exec wrangler types --check
+pnpm exec wrangler deploy --dry-run
 ```
 
-Confirm these six secret names exist:
+Use `.changeset/protocol-three-hard-cut.md` with the repository’s Changesets release flow. Confirm that the registry contains protocol 0.9.0 and connector 0.6.0 before upgrading consumers.
 
-- `AUTH_HMAC_SECRET`
-- `CALLER_TOKENS`
-- `EXTENSION_TOKENS`
-- `DEVICE_TOKENS`
-- `WS_TICKET_SECRET`
+Rebuild the Chrome Web Store package from the merged commit. Record its SHA-256, submit extension 0.2.0, and record the published extension ID. Do not invent or use a development extension ID for production pairing.
+
+## Deploy the compatibility backend
+
+Prepare four absolute paths outside the repository:
+
+- A new evidence path that does not exist
+- A mode-0600 protocol-3 `DEVICE_TOKENS` JSON file
+- A mode-0600 file containing the published extension ID
+- A mode-0600 file containing the current canary device credential
+
+Every static device entry must contain authoritative `allowedOrigins` and `policyVersion`. The deploy script validates the schema, source cleanliness, pnpm version, lockfile, canary credential digest, and immutable worktree before it asks for confirmation.
+
+Run the guarded deployment from the repository root:
+
+```bash
+pnpm --filter @understudy/backend deploy:production -- \
+  /absolute/private/deployment-evidence.json \
+  /absolute/private/device-tokens.json \
+  /absolute/private/extension-id.txt \
+  /absolute/private/canary-device-credential.txt
+```
+
+Type `DEPLOY` only after the script identifies the intended full source SHA. The script uploads validated `DEVICE_TOKENS` and `EXTENSION_ID`, deploys with a full-SHA tag and message, then requires three consecutive `/health` responses that match the source commit.
+
+Preserve the generated mode-0600 evidence outside Git. It separates the source release, compatibility-secret version, active Worker version, active deployment, dependency snapshot, and any secret-derived version.
+
+## Upgrade and verify the canary
+
+Upgrade the canary consumer to the published connector and protocol versions. Install the submitted or published extension 0.2.0 in the canary browser profile.
+
+Verify these compatibility-deployment properties before the hard cut:
+
+- `/health` reports the deployed source SHA, Worker version ID, and deployment timestamp
+- `fill_secret`, cloud-vault routes, and retired MCP tools fail closed
+- Existing non-secret attended reads continue where temporary protocol compatibility allows them
+- The canary device connects only to `https://understudy.proofof.tech`
+- Device inventory reconciles before the backend allocates new work
+
+Stop here if the source SHA, active deployment, or canary inventory differs from the recorded evidence.
+
+## Execute the authentication and vault hard cut
+
+Declare a maintenance window. Resolve the exact affected account, OAuth grant, token, secret, and KV namespace inventory before requesting destructive confirmation. Never include credential or vault values in the evidence.
+
+Set the one-time authentication latch from `apps/backend`:
+
+```bash
+printf '%s' 'protocol-3-auth-hard-cut' | \
+  pnpm exec wrangler secret put AUTH_EPOCH_CUTOVER
+```
+
+Trigger an authenticated account-directory request. Verify that the durable cutover marker exists through behavior: every old `usk_v1`, old-epoch `usk_v2`, and pre-cutover OAuth grant must fail. A secret-version creation alone does not prove the Durable Object migration ran.
+
+List provider grants through the dashboard, revoke the pre-cutover grants, and revoke old API tokens. Confirm that device revocation invalidates bound access immediately even if OAuth KV cleanup has not completed.
+
+Remove the latch only after cutover evidence is complete:
+
+```bash
+pnpm exec wrangler secret delete AUTH_EPOCH_CUTOVER
+```
+
+Inventory the retired vault namespace before deletion:
+
+```bash
+pnpm exec wrangler kv namespace list
+pnpm exec wrangler kv key list \
+  --namespace-id retired_vault_namespace_id \
+  --remote
+```
+
+Replace `retired_vault_namespace_id` with the exact ID returned by the namespace inventory.
+
+Request fresh destructive confirmation that names the exact namespace ID, key count, and these two production secrets:
+
 - `VAULT_MASTER_KEY`
+- `VAULT_UPLOAD_PRIVATE_KEY`
 
-Do not print or record secret values.
+Delete only the inventoried vault keys. Delete the namespace only if the read-only inventory proves it serves no other binding or application. Do not use a wildcard or reuse the OAuth KV namespace.
 
-### Deploy with flags off
-
-Confirm the source-controlled configuration contains:
-
-```json
-{
-  "UNATTENDED_ENABLED_TENANTS": "[]",
-  "SAFE_WRITE_REQUIRED_TENANTS": "[]"
-}
-```
-
-Deploy with a message containing the full approved SHA:
+After the confirmed deletion, remove the retired secrets:
 
 ```bash
-understudy_release_sha="$(git rev-parse HEAD)"
-test -z "$(git status --short)"
-pnpm --filter @understudy/backend exec wrangler deploy \
-  --message "release $understudy_release_sha"
-pnpm --filter @understudy/backend exec wrangler deployments status --json
+pnpm exec wrangler secret delete VAULT_MASTER_KEY
+pnpm exec wrangler secret delete VAULT_UPLOAD_PRIVATE_KEY
 ```
 
-Read the active version ID from the status result, then inspect it:
+Record secret-derived Worker version IDs separately from the source deployment. Confirm that no dashboard vault route, upload key, vault KV binding, or server secret resolver is reachable after cleanup.
+
+## Re-pair browsers and reconnect MCP clients
+
+Re-pair each intended browser profile through the dashboard’s one-time external-messaging flow. A re-paired existing installation must rotate its device row and credential. A genuinely new Chrome profile must create a separate device.
+
+For every browser:
+
+- Set its authoritative general origins and wait for the exact policy acknowledgement
+- Set payment origins locally in the extension; never copy them to the backend
+- Create API tokens only after selecting that active browser
+- Complete new OAuth consent with S256 Proof Key for Code Exchange (PKCE) and the selected browser
+- Confirm device label and revocation state in API-token and OAuth-connection lists
+
+For ChatGPT, copy the canonical `/mcp` URL and open [ChatGPT Plugins](https://chatgpt.com/plugins). For Claude, copy `/mcp` and follow [Claude’s custom connector flow](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp). Keep command-line and JSON client configuration available for other clients.
+
+Exercise signed-out login, consent, cancellation, expired state, unsupported-client rejection, metadata refresh, and `tools/list` in the real clients. Do not treat backend unit tests as evidence that the external client user interface completed these flows.
+
+## Run canary acceptance
+
+Use a synthetic card marker and an approved test payment origin. Never use a real payment card for release acceptance.
+
+The canary must pass:
+
+- Pairing replay, expiry, concurrent redemption, credential rotation, and empty default origins
+- Online and offline policy changes, stale acknowledgement rejection, and policy widening only after acknowledgement
+- Known and ambiguous provisioning failures, close retry, late provision, orphan redelivery, and physical divergence
+- Same-epoch recovery, new-epoch adoption, capacity conflict, 15-minute expiry, worker eviction, and full Chrome restart
+- Attended deliberate detach, debugger detach, stale attachment rejection, and `idle` artifact clearing
+- Vault enrollment, restart persistence, key loss, corruption, deletion, exact-origin intersection, and split or combined expiry mapping
+- Pre-fill `not_started`, post-fill `outcome_unknown`, and tab closure on every sensitive completion path
+- Revoked browser, old epoch, old OAuth props, legacy token, retired route, retired command, and retired MCP-tool rejection
+
+After the first synthetic card byte enters the page, attempt every documented egress path: accessibility, screenshot, dialogs, URL and title, tab metadata, console, exception, network capture, runtime evaluation, clipboard, download, crash report, WebSocket frame, command journal, analytics, and logs. The marker may appear only inside the executor and approved page.
+
+Stop on any marker egress, page-derived sensitive result, automatic retry after insertion, duplicate window or lease, stale detach acceptance, or credential surviving device revocation.
+
+## Run post-fix network and soak acceptance
+
+After the selected reconnect change and canary upgrade, run:
 
 ```bash
-understudy_version_id="active_version_uuid_here"
-pnpm --filter @understudy/backend exec wrangler versions view \
-  "$understudy_version_id" --json
+scripts/network-blip-harness.sh a 30 \
+  /absolute/private/caller-token.json \
+  /absolute/private/network-blip-post-fix.jsonl
+scripts/network-blip-harness.sh a 120 \
+  /absolute/private/caller-token.json \
+  /absolute/private/network-blip-post-fix.jsonl
+scripts/network-blip-harness.sh b 30 \
+  /absolute/private/caller-token.json \
+  /absolute/private/network-blip-post-fix.jsonl
 ```
 
-Verify the active version contains:
+Each case must recover within 30 seconds, produce a newer heartbeat, preserve or recover the exact lease without duplication, reach terminal cleanup, restore capacity, and send no credential to a secondary origin.
 
-- Migration tag `v2`
-- Exports for `SessionAgent`, `DeviceAgent`, and `TenantDeviceCoordinator`
-- Durable Object bindings `SESSION`, `DEVICE`, and `TENANT_CONTROL`
-- `ANALYTICS`
-- `RATE_LIMITER`
-- `VAULT`
-- All six required secrets
-- Quota configuration
-- Both rollout variables
+Then complete these production proofs:
 
-Then verify:
+1. Let a suspended lease reach the exact 15-minute adoption expiry and verify terminal `lost` plus exact orphan cleanup.
+2. Run the declared unattended soak with Chrome occluded and no local interaction.
+3. Complete the governed unattended proof with the release monitoring active.
+4. Ramp 1 record, then 5 records, then the full approved origin set.
+
+Record start and end times, source SHA, Worker version, extension version, device ID, policy version, lease outcomes, and stop-condition checks. Keep raw evidence outside Git.
+
+## Finish HTTPS, HSTS, and preload
+
+The last read-only inventory on 2026-08-02 found MX and TXT records at the apex, mail-related subdomains, and proxied hosts for Understudy, Metamind, Momo, and Dubai Parking. The apex had no A, AAAA, or CNAME record. Treat this as stale evidence and refresh the complete zone before changing HSTS.
+
+Complete the apex rollout in stages:
+
+1. Inventory every apex and subdomain record, including DNS-only, internal, mail, redirect, and delegated names.
+2. Give `proofof.tech` valid DNS, TLS, and an HTTP-to-HTTPS redirect.
+3. Make every hostname serve valid HTTPS for its intended route.
+4. Enable Cloudflare zone-wide Always Use HTTPS for proxied hosts.
+5. Ramp apex HSTS through 5 minutes, 1 day, 1 week, and 1 year. Record the start, end, and probe results for each stage.
+6. Add `includeSubDomains; preload` only after every hostname passes.
+7. Submit `proofof.tech` to [HSTS Preload](https://hstspreload.org/).
+
+Run these probes after each relevant stage:
 
 ```bash
-curl --fail-with-body \
-  https://understudy-backend.gcharang.workers.dev/health
+curl -sSI http://understudy.proofof.tech/health
+curl -sSI https://understudy.proofof.tech/health
+curl -fsS https://understudy.proofof.tech/health
+curl -fsS \
+  'https://hstspreload.org/api/v2/preloadable?domain=proofof.tech'
+curl -fsS \
+  'https://hstspreload.org/api/v2/status?domain=proofof.tech'
 ```
 
-Send one attended session request with no body and no `Content-Type`:
+Done means HTTP upgrades at the edge, every HTTPS response carries the intended HSTS policy, health matches the deployed SHA, preload eligibility reports no errors, and preload status becomes pending or preloaded.
 
-```bash
-curl --fail-with-body \
-  --request POST \
-  --header "Authorization: Bearer caller_token_here" \
-  --header "Idempotency-Key: 00000000-0000-4000-8000-000000000021" \
-  https://understudy-backend.gcharang.workers.dev/v1/sessions
-```
+An `includeSubDomains` header on `understudy.proofof.tech` does not affect sibling hosts. Preload submission requires the registrable apex and every descendant to meet the HTTPS contract.
 
-Confirm it succeeds, then rerun the Metamind attended proof.
+## Record final evidence
 
-**Correction (2026-07-28).** An earlier revision of this file recorded that this command "cannot pass and should be replaced", on the reasoning that no external HTTP client can produce a request workerd surfaces as `body === null`. The observation was right; the conclusion was wrong. The command was correct and the SERVICE was wrong.
+Close the handoff only after the operator records:
 
-Attended creation is defined as "no body" and was checked as `c.req.raw.body === null`, which only holds for a Request constructed in-process. Over the wire every client sends `Content-Length: 0`, arriving as an empty but non-null stream — curl, Node's fetch, and a Worker subrequest to a public hostname alike. So attended creation answered `400 invalid body` for every real caller, including Metamind's own `createAttendedSession`, while the backend suite stayed green because its tests build the Request in-process.
+- Pull request URL and merge SHA
+- Published protocol and connector versions plus integrity values
+- Extension artifact SHA-256, submitted version, review state, and published ID
+- Pre-fix and post-fix network JSONL evidence paths and sanitized verdicts
+- Deployment source SHA, Worker version ID, active deployment, secret-derived versions, pnpm version, and lockfile SHA-256
+- Authentication epoch cutover evidence and old-credential rejection results
+- Exact vault namespace and key counts before and after deletion; never record values
+- Re-paired device IDs, labels, policy versions, and revoked predecessor state
+- Real-client OAuth and `tools/list` results
+- Canary, 15-minute expiry, soak, governed proof, and traffic-ramp verdicts
+- DNS inventory, HTTPS probes, HSTS stage dates, preload eligibility, and final preload status
 
-That was not a smoke-test problem. Attended mode is the consumer-side rollback path this rollout depends on, and it did not work at all.
+## Stop and rollback safely
 
-Fixed in Understudy `e0351f6` (deployed as version `8ec9be79-76bb-4140-9530-402b4a46a40e`): the body is read once, bounded, and an empty result takes the attended branch; a non-empty one is validated exactly as before. The regression test builds the request the way the wire delivers it. **The command above now returns `200` with a `sessionId`** — verified against production.
+Stop the rollout on any credential surviving revocation, policy widening before acknowledgement, duplicate lease or window, card marker outside the local executor and approved page, non-fixed sensitive result, unmatched health SHA, failed HSTS probe, or substantive review finding.
 
-### Caller token rotated
+Rollback must not restore `fill_secret`, cloud-vault routes, `usk_v1`, pre-cutover OAuth props, or a secondary credential-bearing origin. Disable new leases, terminalize or suspend active assignments with exact fences, preserve external evidence, and fix the failing release layer.
 
-Production `CALLER_TOKENS` could not be read back and the local `packages/worker/.dev.vars` value is the `dev-tenant` token, so the credential was rotated on both sides after confirming Metamind is the only production caller:
+## Keep deferred features out of this release
 
-- Understudy `CALLER_TOKENS` = `{"<token>": {"actor": "metamind", "tenantId": "metamind"}}`
-- Metamind `UNDERSTUDY_TOKEN` = the same value
+`DEFERRED.md` records a future API-credential vault. It requires separate records, reviewed service adapters, and its own security review. It is not a protocol-3 release blocker and must not reuse the card-vault plaintext interfaces.
 
-The token is at `~/.understudy-canary/caller-token.json`, mode `0600`. Metamind's `/health.commit` still reports `5fb1e118…` afterwards, confirming a secret update does not disturb the build-time provenance stamp.
-
-Record the exact active version ID as `UNDERSTUDY_V2_FLAGS_OFF_VERSION` in the Phase 2 ledger row and operator record. Also record the deployment ID, approved SHA, status JSON, health result, and attended proof.
-
-**`UNDERSTUDY_V2_FLAGS_OFF_VERSION` = `7eff2d11-2ba5-420b-b1f2-113faf0d6f73`** (deployment `1c32a8e9-bf87-49eb-89a5-253ea4e47d1a`, `2026-07-28T04:29:57Z`). This is the rollback target for every later Understudy configuration deployment.
-
-### Two required secrets were missing
-
-`wrangler secret list` returned only four of the six names: `DEVICE_TOKENS` and `WS_TICKET_SECRET` did not exist. This is exactly what the Phase 2 secret check is for — with `UNATTENDED_ENABLED_TENANTS` at `"[]"` the gap would not have surfaced until Phase 3 tried to enroll a device.
-
-Both were provisioned before the deploy. `wrangler secret put` refuses while an undeployed version exists ("the latest version of your Worker isn't currently deployed"), so `wrangler versions secret put` was used instead, which stages a secret onto a new version without deploying it.
-
-`WS_TICKET_SECRET` is opaque HMAC key material — 32 random bytes, base64url, same treatment as `AUTH_HMAC_SECRET`.
-
-`DEVICE_TOKENS` was populated with the Phase 3 canary identity, since provisioning it needs no physical device:
-
-```json
-{ "<sha256hex(credential)>": { "tenantId": "metamind", "deviceId": "<uuid>", "credentialVersion": 1 } }
-```
-
-Device UUID `aaf119f2-a85f-46b4-8b53-8e92196d6275`. Only the credential's SHA-256 digest is stored in Cloudflare; the raw credential is at `~/.understudy-canary/device-credential.json`, mode `0600`, for the operator to enter during extension enrollment. Rotating it means generating a new credential, bumping `credentialVersion`, and re-putting the secret.
-
-#### …and then were never written down (2026-07-28)
-
-Provisioning them fixed the worker but not the record. `apps/backend/.secrets.production.env` — the operator-local backup, and the ONLY readable copy, since Cloudflare never shows a secret again after it is set — still listed four of six. Both new secrets existed live and nowhere else.
-
-That is worse than it sounds for `DEVICE_TOKENS`: overwriting it revokes every enrolled device, and the mapping could not have been reconstructed from anything except the operator's own credential file. Closed as follows, with the live worker and the backup now byte-identical for all six:
-
-| Secret | Action | Why that action |
-|---|---|---|
-| `DEVICE_TOKENS` | Reconstructed from `~/.understudy-canary/device-credential.json`, recorded, then re-put | Reconstructable because the raw credential was retained. Verified BEFORE re-putting: `POST /v1/device/connect-ticket` with that credential and an empty body answered `400`, not `401` — auth runs before body parsing, so a `400` proves the digest is enrolled without minting a ticket or spending quota |
-| `WS_TICKET_SECRET` | Rotated to a fresh value, recorded | Unrecoverable by anyone, so rotating is the only way to ever hold a backup. It signs 60-second single-use tickets and an established socket is authenticated at connect, so rotation fences nothing already connected — the cost is zero while no device is online, and it is not zero later |
-
-**Provision and record in one step.** A secret that exists only on the worker is a single point of unrecoverable loss, and the gap is invisible to `wrangler secret list`, which shows names and never values — the same instrument that caught the first gap cannot catch this one.
-
-The initial `v1 → v2` migration is a stop-and-forward-fix boundary. Do not attempt to remove `v2` or roll back to the current `v1` version.
-
-## Phase 3: Provision and accept the canary device
-
-Use one enrolled, tenant-dedicated production profile for acceptance. Build the extension from the same approved Understudy SHA deployed in Phase 2.
-
-### Build and load the extension
-
-Run:
-
-```bash
-pnpm --filter @understudy/protocol build
-pnpm --filter @understudy/extension typecheck
-pnpm --filter @understudy/extension test
-pnpm --filter @understudy/extension build
-```
-
-Load `apps/extension/.output/chrome-mv3/` through `chrome://extensions`. Do not use a development build.
-
-### Enroll the canary
-
-Provision one device UUID and one raw credential. Store only the credential’s SHA-256 digest in `DEVICE_TOKENS`.
-
-Enroll the dedicated profile with exactly:
-
-- `https://example.com`
-- `https://practice.expandtesting.com`
-
-Confirm the device reports:
-
-- Protocol 2
-- Expected extension and browser versions
-- Capacity 2
-- Usage 0
-- A recent heartbeat
-
-Once the upgraded Metamind connector is live **and the device above reports protocol 2 with a recent heartbeat**, deploy this Understudy configuration:
-
-```json
-{
-  "UNATTENDED_ENABLED_TENANTS": "[\"metamind\"]",
-  "SAFE_WRITE_REQUIRED_TENANTS": "[\"metamind\"]"
-}
-```
-
-Do not use `"*"`. `enabledForTenant` honours it, so a wildcard admits every tenant holding a caller token.
-
-The device confirmation comes first because the allowlist deployment is recorded as an evidence gate — recording it against a device that has never connected proves nothing. Nothing about either flag touches the device, so the order costs nothing.
-
-The acceptance suite below creates unattended sessions, so it **cannot** run before this flip: every create would draw the `503`. This is why the flip precedes acceptance rather than following it.
-
-These are `vars` in `apps/backend/wrangler.jsonc`, which is deliberate — `wrangler rollback` restores a version *including* its vars, so the rollback in "Roll back safely" disables unattended creation atomically with the code. A runtime-mutable flag store would break that, and would let production diverge from reviewed source with no pull-request trail.
-
-Understudy's `/health` returns only `{"ok":true}` — there is **no commit stamp on this service**, unlike Metamind. Deploying from a working tree therefore leaves the recorded version ID mapping to no SHA at all. Commit first and deploy from a committed SHA.
-
-Record the allowlist deployment and version IDs before running acceptance.
-
-**`SAFE_WRITE_REQUIRED_TENANTS` will not fire for Metamind — but it is not redundant, so set it.** Its check sits on the legacy command path, reached only when all of: the caller omits `understudy-command-contract: 2`, the session is attended, and the extension is protocol-1. `@understudy/connector` has sent that header unconditionally since 0.5.0 and Metamind routes every command through the connector, so Metamind never reaches it.
-
-On that path, however, this flag is the **only** refusal: `dispatch()` in `apps/backend/src/session.ts` does not check the protocol version, so with the tenant unlisted a protocol-1 write executes against a logged-in profile. `dispatchV2` refuses the same write with an identical 426, but only for callers that reach it — and the legacy path is by definition the one that does not.
-
-Record it as an armed guard that this tenant's traffic never exercises. Do not record its silence as evidence that it works, and do not omit it for a future tenant on the grounds that `dispatchV2` covers the case: it does not cover this one.
-
-### Run the Chromium acceptance suite
-
-Execute every scenario in [`apps/extension/RUNBOOK.md`](../apps/extension/RUNBOOK.md):
-
-- Two-tab routing isolation
-- Capacity failure
-- Origin collision failure
-- Profile-state collision failure
-- Redirect containment
-- Paused-popup containment
-- One-slot cleanup
-- Extension service-worker eviction
-- Chrome restart
-- Unknown write outcome
-- Device credential rotation
-- Hard and idle expiry
-- Attended compatibility
-
-Stop the rollout on any cross-tab routing, duplicate tab, capacity leak, unexpected recovery, origin escape, expiry mismatch, or granted write replay.
-
-#### Results: the API-driven scenarios PASSED (2026-07-29)
-
-Run against Understudy version `e0673967-0ca5-4cca-81ee-50d4088cec33` on device `aaf119f2-a85f-46b4-8b53-8e92196d6275`, with two sessions on the enrolled origins — `https://example.com` / `account_one` and `https://practice.expandtesting.com` / `account_two_b`.
-
-| Scenario | Evidence |
-|---|---|
-| Two-tab routing isolation | Both `201 connected`. Each status reports exactly one tab, with **distinct** ids (`2048900216`, `2048900218`) |
-| Command routing, reads | Concurrent `get_tabs` to both sessions returned only each session's own tab |
-| Command routing, writes | `type` landed in its own session (`value: "canary-acceptance"`); the other session unchanged — same tab id, same URL |
-| **Cross-session ref isolation** | The identical ref that succeeds in one session is refused in the other: `stale or unknown ref`. Refs embed the session id, so a write cannot be aimed across sessions |
-| Capacity failure | Third session → `429 device capacity exhausted` |
-| Origin collision failure | Overlapping origin, new profile key → `409` |
-| Profile-state collision failure | Disjoint origin, reused profile key → `409`. **Control:** disjoint origin + new profile key → `201`, so the refusals are the collision and nothing else |
-| Redirect containment | Same-origin `302` followed to `/status-codes` with `ok: true` — containment does not break legitimate redirects |
-| **Exact-origin boundary** | A session scoped to `practice.expandtesting.com` is refused `expandtesting.com` — the parent domain is a different origin. A suffix-matching implementation would have passed this and must not |
-| Paused-popup containment | Clicking `/windows`' new-window link left the session at **one** tab, still on `/windows` |
-| Cross-origin subresources | `/iframe` rendered 60 nodes — containment is top-level navigation only, as intended |
-| One-slot cleanup | `DELETE` → `202`, status `closed` on the first poll, device usage `2 → 1` |
-
-Origin containment is enforced **per session**, not merely per device: session one was refused `practice.expandtesting.com` even though the device's own policy allows it.
-
-#### Service-worker eviction PASSED (2026-07-29)
-
-The worker was stopped from its DevTools while two sessions were live. Understudy saw the control socket drop — device `recovering`, heartbeat ageing 10s → 21s — and the extension's own 30-second `ws-backstop` alarm revived it without operator action.
-
-| Criterion | Evidence |
-|---|---|
-| Same-epoch restore, not recreate | Tab ids **unchanged** across the eviction (`2048900216`, `2048900221`) |
-| No duplicate tabs | One tab per session throughout |
-| No capacity leak | Device usage held `2/2` |
-| Live afterwards | Both sessions answered a real `get_tabs` |
-
-URLs survived as well, which is correct here and is exactly what must NOT happen on a restart — `chrome.storage.session` persists across eviction and clears across restart. That difference is the discriminator between the two tests.
-
-Not covered: "a completed unacknowledged result replays" needs a command that finishes while its ack is lost, which this run did not produce.
-
-#### Chrome restart PASSED (2026-07-29)
-
-Run as the phase specifies — a **graceful** quit, reopened inside the 90-second grace.
-
-| Criterion | Evidence |
-|---|---|
-| Fresh blank tab per live lease | Both tabs `about:blank` |
-| Attachments and refs rotate | Tab ids `2134210334 → 2134210476`, `2134210336 → 2134210478` |
-| No prior URL restored | `https://example.com/` and `/login` both gone |
-| Session reports reconciliation | Both `connected`, `needsReconciliation: false` |
-| New writes blocked | Reads still `200`; every write `409 command_outcome_unknown`, `safeToRetry: false` |
-| Until DELETE and a new session | After `DELETE` (usage `2 → 0`) a fresh session accepted a write, `ok: true` |
-
-The device also reconnected **on its own** — `recovering → online` in about thirteen seconds, usage held at `2/2`.
-
-#### A device lost its enrolment once, cause UNKNOWN (2026-07-29)
-
-**Observed once. Not reproducible. An earlier revision of this section blamed `SIGKILL`; that explanation is retracted — the second run disproved it.**
-
-What happened. The first attempt at the restart test used `pkill -9 chrome`, to combine it with the unknown-write scenario. On reopen the device never returned, and not because of a control block or a revoked credential: the extension's **entire enrolment was gone from `chrome.storage.local`** — service origin, device id, credential and origin policy all showing placeholder text, unattended hosting unticked. `ProfileClient` loaded `config === null` and reported status `disabled`.
-
-A graceful quit immediately afterwards preserved the enrolment, which looked like clean isolation: `SIGKILL` discards writes a clean shutdown flushes. It was written up that way.
-
-Then the unknown-write test ran a **second** `pkill -9 chrome` on the same profile, and the enrolment survived intact — the panel came back `connected` with no operator action. Same command, same machine, same profile, opposite result.
-
-The timing argues against the flush theory too. The enrolment that vanished was about 82 minutes old; the one that survived was about 8. An unflushed-write explanation predicts the opposite.
-
-So the cause is unknown. Candidates, none verified:
-
-- the first reopen landed on a **different Chrome profile** — unpacked extensions and their storage are per-profile, which would explain empty storage completely, and is the cheapest thing to rule out next time by checking the profile before drawing any conclusion;
-- a one-off loss or corruption of that profile's extension storage;
-- something left over from the service-worker eviction test that immediately preceded the first kill.
-
-What to do with this: **do not treat enrolment loss as an expected consequence of an unclean shutdown, and do not treat it as impossible either.** If it recurs, capture the Chrome profile path and `chrome://version` before reopening. What is worth carrying regardless is the failure signature — a de-enrolled extension reports `disabled`, which is indistinguishable from an operator having switched hosting off. The dependable signal is server-side: the device stops heart-beating and `GET /v1/devices` reports it `offline`. Alert on that, never on extension status.
-
-Method note: combining the restart and unknown-write scenarios into a single kill was a mistake — it ran the restart test under a termination it was never specified for, produced a finding that took a second run to falsify, and cost a re-enrolment. Run them separately.
-
-#### Unknown write outcome: PASSED, with a better answer than the gate asks for
-
-The gate expects a write killed in flight to poll back `command_outcome_unknown` with `safeToRetry: false`. What happens is more precise than that, and the distinction is worth understanding before anyone "fixes" it.
-
-Writes are two-phase — `write_prepare` → `write_ready` → `write_grant` → execute → result. The extension journals each transition, so the backend knows which phase a dead attempt died in. Killing Chrome under a continuous stream of `key` writes produced:
-
-| Command | Sent | Durable status |
-|---|---|---|
-| ten writes | `200` | `completed`, `safeToRetry: false` |
-| the one killed in flight | `504` | **`not_started`, `safeToRetry: true`** |
-| the next one | `503` | no record — refused before one existed |
-
-The killed write is reported `not_started` **and safe to retry**, because the journal proves it never reached execution. That is strictly better than `unknown`: the caller can retry it without risking a double write. Reporting `unknown` there would be a needless loss of information.
-
-`command_outcome_unknown` with `safeToRetry: false` is reached on the restart path instead, and was confirmed under "Chrome restart" above — after the browser epoch changes, every write for the session answers exactly that until the caller deletes it.
-
-Both halves of the safety property therefore hold: the service says `unknown` when it genuinely cannot know, and refuses to say `unknown` when it *can* prove nothing executed. The truly ambiguous window is only the CDP execution itself, which for a `key` command is milliseconds — by design, and why a kill lands in the safe window nearly every time.
-
-Not reproduced: a kill landing *inside* execution, which needs a long-running write (`navigate` is the only command that waits on page load). Every candidate slow page on the practice site returned in under a second, so the window was never wide enough to aim at. Recorded as un-run rather than passed.
-
-#### Device credential rotation PASSED, with zero downtime (2026-07-29)
-
-Rotated by overlap — the new digest is added beside the old, the extension switches, then the old digest is removed. The device never left `online`.
-
-| Stage | v1 credential | v2 credential |
-|---|---|---|
-| Both digests in `DEVICE_TOKENS` | `400` — authenticates | `400` — authenticates |
-| Extension re-enrolled on v2 | **`404 device not found`** | active, device `online` |
-| v1 digest removed | **`401`** | `400` |
-
-The two refusals are at different layers, and the difference is the point. While its digest was still present, v1 **authenticated** (`authenticateDevice` found it) but was **not authorized**: `authorizeCredential` in `src/device.ts` rejects `credentialVersion 1` against an authority advanced to `2`. Only after the digest was deleted did it fail authentication outright. Rotation is therefore enforced by the recorded authority, not merely by removing the secret — deleting the digest is cleanup, not the control.
-
-Against the phase's four conditions:
-
-- **New credential reconnects** — confirmed, device `online` on v2 unaided.
-- **Old control socket closes** — by construction: a version advance closes every open connection with `1008 device credential rotated`, which is not one of the blocking close codes, so the extension reconnects rather than latching to `error`. Not observed directly; the extension had already reconnected before the first poll. The authority advance is proven independently by v1's `404`.
-- **Old tickets fail** — v1 cannot mint one at all (`404`). For an *already-minted* ticket, `src/device.ts` requires `claims.credentialVersion === authority.credential_version` — exact equality — and checks it **twice**, re-reading the authority after `consumeTicket` so a rotation racing an in-flight accept still closes as `1008 stale device ticket`. Tickets are single-use besides.
-- **No replayed ticket replaces the authoritative socket** — verified by code inspection only. It could not be executed: rotation fences minting first, so no valid unexpired v1 ticket can exist afterwards to replay. That is a stronger guarantee than the condition contemplates, but it is inspection rather than execution and is recorded as such.
-
-Two operational notes:
-
-- **`wrangler secret put` is not immediately visible.** A freshly added digest answered `401` for roughly eight seconds before answering `400`. Checking straight after the put yields a false negative; poll until it flips.
-- **Keep the canonical credential file canonical.** `~/.understudy-canary/device-credential.json` now holds the live v2 credential; the superseded one is `device-credential-v1-REVOKED.json`. Leaving a dead credential under the name every runbook step references is a trap for the next re-enrolment, which — see the enrolment-loss entry above — may be needed without warning.
-
-#### Attended compatibility PASSED, run concurrently with unattended (2026-07-29)
-
-Run as a **coexistence** test rather than the minimum the scenario describes: an unattended session was left hosting a controlled tab while the operator attached an attended session to a tab of their own. "Reports only that tab" is only meaningful when there is another controlled tab in the same profile for it to fail to report.
-
-| Criterion | Evidence |
-|---|---|
-| Attaches to the user's own tab | Attended session bound tab `2134210639` (`https://www.google.com/`), operator-opened |
-| Reports only that tab | `get_tabs` returned exactly it; the unattended tab `2134210638` was invisible to it |
-| **Negotiates protocol 2 after attachment** | A **write sent with no `understudy-command-contract` header** was accepted. With `SAFE_WRITE_REQUIRED_TENANTS` naming this tenant, a protocol-1 extension would have drawn `426` on that exact request. It did not, so the extension negotiated v2 itself rather than the caller's header carrying it |
-| Snapshot and an approved action | a11y snapshot returned 25 nodes on the correct `tabId`; `key` write `ok: true` |
-| Coexistence | Throughout, the unattended session still reported only tab `2134210638` and device usage held at `1/2` |
-| Detach leaves the tab open | Operator-confirmed: the tab survived `Detach tab` |
-
-The protocol-2 check is worth reusing. Sending a write **without** the contract header turns `SAFE_WRITE_REQUIRED_TENANTS` into a live probe of what the *extension* negotiated — the only way to test it from the caller side, since supplying the header would satisfy the v2 branch regardless of the extension.
-
-**Observation — `Detach tab` does not change the reported status.** After detaching, the session still reads `status: "connected"` with `browser` present, while every command answers:
-
-```json
-{"type":"action_result","ok":false,"error":"no active CDP session"}
-```
-
-`detached` is set only when the WebSocket itself closes, or on an epoch change, device revocation, or terminal close. Detaching the debugger keeps the socket open and reports nothing to the backend, and the attended status enum — `pending | connected | detached` — has no state for "socket up, nothing attached".
-
-Not a silent failure: the consumer gets an explicit per-command error rather than a false success, and Metamind's flow surfaces it. But a consumer that gates on status alone would see `connected` and be wrong.
-
-**Ruled a defect, and deferred rather than dismissed** — see [`DEFERRED.md`](../DEFERRED.md), "Attended session status cannot express *connected but not attached*". It is deferred because the fix adds a value to `AttendedSessionStatusSchema`, which consumers parse with, so it is a breaking protocol change needing a connector release and a coordinated consumer upgrade — not something to land mid-acceptance. It does not block Phase 3a: execution is correct, only the reported status is wrong.
-
-The wider case matters more than the button. `chrome.debugger.onDetach` fires when the controlled tab is **closed**, or when the operator clicks **Cancel** on Chrome's debugger banner, and neither notifies the backend either. That is the mechanical reason the extension runbook says not to touch that banner.
-
-#### The two visual confirmations, re-run properly (2026-07-29)
-
-Both had been asserted server-side earlier but never seen, so they were re-run with an operator watching rather than signed off on inference. Two sessions were provisioned — each lands in its **own extension-created window** (`windows.create` in the extension's provisioner), so the observable unit is windows, not tabs.
-
-| Check | Operator observation |
-|---|---|
-| Baseline | 2 extension windows |
-| Popup containment | Clicked `/windows`' new-window link. **Still 2** — no third window survived. Server-side the session stayed at one tab on `/windows` and usage held `2/2` |
-| One-slot cleanup | `DELETE` of one session left **exactly 1** window, the surviving session's, still showing its own page. Server-side: deleted session `closed`, usage `2 → 1`, survivor answered a live command on its original tab id |
-
-Both now rest on what was seen, not on what was inferred from a tab count in a status response.
-
-### Phase 3a is complete except expiry
-
-Fifteen of the suite's scenarios pass. The one remaining — **hard and idle expiry** — cannot be compressed from the caller side: idle is two hours and hard is twenty-four. It is evidenced by the Phase 3b soak rather than waited on separately, since that run exercises both bounds by construction: continuous reads must keep idle from ever firing, and hard expiry must fire at the 24-hour mark regardless.
-
-### Run the read-only soak
-
-Run the complete 24-hour read-only soak. Do not proceed if any event remains unexplained:
-
-- `command_unknown`
-- Duplicate controlled tab
-- Capacity leak
-- Unexpected browser recovery
-- Origin escape
-- Hard-expiry or idle-expiry mismatch
-
-Record the device acceptance operator record, extension SHA, Understudy deployment and version IDs, start and end timestamps, telemetry, and final device usage.
-
-#### Soak in progress — started 2026-07-29T05:28:35Z
-
-| Field | Value |
-|---|---|
-| Session | read-only, `https://example.com`, tab `2134210655` |
-| Understudy | `3493b243c0aa61fb06ec19ad5dcb4eb197a2d670`, version `e0673967-0ca5-4cca-81ee-50d4088cec33` |
-| Extension | `0.1.1`, built from `5cc969024b32380f1a3e14ff6f72e8d0c808b086` |
-| Device | `aaf119f2-a85f-46b4-8b53-8e92196d6275`, credential **version 2** after the rotation above |
-| Hard expiry due | `2026-07-30T05:28:35Z` |
-| Driver | `~/.understudy-canary/soak-driver.sh`, one `get_tabs` every 20 minutes |
-| Evidence | `~/.understudy-canary/soak.jsonl`, one JSON line per read |
-
-**The driver runs detached on purpose.** A schedule living inside an assistant session dies with that session; idle expiry would then fire at the two-hour mark and fail the soak for a reason that has nothing to do with the service. It is started with `setsid nohup` so it outlives whatever started it, and stops on `touch ~/.understudy-canary/soak.stop` or when the session answers `410`.
-
-Each sample records session status, tab count and id, current URL, both expiry stamps, device status and usage, and an `anomalies` array keyed to exactly the six events listed above — plus `needs_reconciliation`, which is the earliest visible sign of several of them. Audit at the end with:
-
-```bash
-node -e 'const l=require("fs").readFileSync(process.env.HOME+"/.understudy-canary/soak.jsonl","utf8").trim().split("\n").map(JSON.parse);
-console.log("samples:",l.length,"| with anomalies:",l.filter(s=>s.anomalies&&s.anomalies.length).length);
-for(const s of l.filter(s=>s.anomalies&&s.anomalies.length)) console.log(s.at,s.anomalies.join(","));'
-```
-
-Operator prerequisite for the duration: the machine and Chrome stay awake, and the canary profile stays logged in. A laptop suspending mid-soak invalidates the run — it reads as an unexplained recovery rather than as the sleep it was.
-
-#### Run 1 FAILED at 40 minutes — the device went offline with Chrome running
-
-Started `2026-07-29T05:28:35Z`. Two clean samples, then:
-
-| Sample | Session | Device |
-|---|---|---|
-| `05:29:41Z` | `connected` | `online`, used 1 |
-| `05:49:44Z` | `connected` | `online`, used 1 — `idleExpiresAt` advanced `07:29 → 07:49`, refresh working |
-| `06:09:49Z` | **`lost`**, `needsReconciliation: true` | **`offline`, used 0** |
-
-The device stopped heart-beating somewhere in that twenty-minute gap. The lease aged out of its grace window and went `lost`, and the command answered `410`.
-
-**This was not the environment.** Ruled out with evidence, not assumption:
-
-- **No reboot** — `uptime` showed the machine up four weeks and change.
-- **No suspend** — zero suspend/sleep/resume records in `journalctl` for the whole day.
-- **No Chrome restart** — the running Chrome process started `2026-07-29T04:57:19Z`, **thirty-one minutes before the soak began**, and had been up continuously for over thirteen hours when this was checked. It never died.
-
-So Chrome was running normally, the machine was awake, and the extension's control socket dropped anyway. Whatever else this is, it is not the operator prerequisite being broken.
-
-The device was `online` again when checked twelve hours later, so it recovered unaided — but **the recovery time is unknown**, and that is the single fact worth having. See the driver note below.
-
-**Trigger identified: a local network reconfiguration.** `journalctl` for the window shows Tailscale activating its interface and **reconfiguring DNS** at `06:02:16Z` — between the last good sample (`05:49:44Z`) and the death (`06:09:49Z`):
-
-```
-06:02:16Z  tailscaled: magicsock: derp-23 connected; connGen=1
-06:02:16Z  device (tailscale0): unmanaged -> unavailable -> ... -> activated
-06:02:16Z  tailscaled: wgengine: Reconfig: configuring DNS
-06:03:00Z  1password: The B5 Notifier has disconnected
-06:03:06Z  1password: The B5 Notifier has connected
-```
-
-1Password's long-lived notifier socket is the control: it dropped on the same event and was **back in six seconds**.
-
-**The product finding is the recovery, not the trigger.** A six-second network interruption is unremarkable — a VPN connecting, a Wi-Fi roam, a DNS change. Understudy's device was still `offline` at `06:09:49Z`, nearly seven minutes later, and its lease was already `lost`. One brief blip destroyed every session on the device, terminally.
-
-**Likely mechanism, inferred from timing rather than proven.** `ReconnectingWs` schedules its reconnect backoff with `setTimeout` (500 ms doubling to a 30 s cap). A `setTimeout` does not survive service-worker eviction — and once the socket is gone the worker has no activity keeping it alive, so it is evicted with the pending retry still queued. Recovery then depends on the 30-second `chrome.alarms` backstop, and a failed attempt repeats the cycle. Against `DEVICE_LOST_MS = 90_000` there is no margin.
-
-**A competing hypothesis that remains UNTESTED — the attempt to test it was invalid.** The first explanation offered here was MV3 eviction under system idle or a backgrounded Chrome. An 18-minute run was set up to test it, sampling the device every 15 seconds, and all 70 samples came back `online` with the heartbeat age never exceeding 23 seconds — tracking the 22-second pong exactly.
-
-That result proves nothing about the hypothesis, because the operator was opening and switching windows throughout: **Chrome was never sustainedly backgrounded, so the condition under test never actually held.** The run establishes only that the device is stable under normal interactive use, which was not in doubt.
-
-To test it properly the machine must be left genuinely alone — no window activity, Chrome fully occluded — for longer than the eviction and alarm cycle, with the device sampled from another host. Until then, treat backgrounding as **an open question, neither supported nor excluded**. The network-event explanation above stands on its own evidence and does not depend on resolving this.
-
-#### The 90-second cliff, and what it costs
-
-`apps/backend/src/tenant-coordinator.ts`:
-
-```ts
-const DEVICE_OFFLINE_MS = 75_000;   // reported offline
-const DEVICE_LOST_MS    = 90_000;   // every lease on the device -> 'lost'
-```
-
-At ninety seconds without a heartbeat the coordinator sets `status = 'lost'` **and `release_at`** on every lease the device holds. That is terminal: the session answers `410`, and the consumer must mint a new one. Ninety seconds is roughly four missed heartbeats, against a recovery path gated on a thirty-second alarm.
-
-**And the lost lease leaks a browser window.** The closure list a device receives on sync is:
-
-```sql
-WHERE device_id = ? AND status IN ('closing','expired') AND release_at IS NULL
-```
-
-A `lost` lease has `release_at` set, so it is **excluded** — the extension is never told to close that tab. Confirmed on this incident: run 1's tab `2134210655` was still open in its own window hours later, with the server reporting `used 1/2` and the side panel reporting `1/2`. The server's accounting is correct; the window is simply orphaned, and only a human will ever close it.
-
-**This is invisible to the soak.** The `capacity_leak` check tests `deviceUsed > 1`, which is server-side, and the server is right. A leaked *browser window* cannot be detected through the API at all — this one surfaced only because the operator looked at their own screen. The "no capacity leak" gate has therefore been measuring something narrower than its name suggests.
-
-Operational aside from the same incident: Chrome's debugger banner appears on windows of **other profiles**, not just the controlled one. The extension runbook says not to click its detach control, but an operator seeing it on an unrelated profile may reasonably dismiss it there — detaching the canary's debugger without realising.
-
-**Driver defect, mine.** v1 exited the moment the session went terminal. That preserved the failure evidence and stopped watching the device in the same instant — so the recovery, the one thing that would discriminate between hypotheses, went unrecorded. v2 never stops: it samples the device every 60 seconds and logs each status transition, continuing after the session dies, since a dead session is the beginning of the interesting part rather than the end of it. Reads stop when there is nothing left to refresh; device sampling does not.
-
-Run 1's evidence is archived as `~/.understudy-canary/soak-run1-FAILED-*.jsonl`.
-
-#### Run 2 — HALTED DELIBERATELY after 61 clean minutes
-
-Started `2026-07-29T18:10:33Z` on the v2 driver, stopped `19:12:23Z`. Four reads, **zero anomalies**, one `device_change` event (`none -> online:1`) at start and nothing after — the device held `online:1` throughout.
-
-It was halted, not failed. It had already passed the 40-minute mark where run 1 died, which supports the network event as run 1's cause rather than anything periodic. Stopped because the diagnosis in `docs/plan-network-blip-resilience.md` deliberately breaks connectivity, which would destroy a running soak and confuse the two results. Evidence archived as `~/.understudy-canary/soak-run2-HALTED-*.jsonl`.
-
-**Phase 3b restarts from zero once the network-blip work concludes.** A soak that passes while that defect is live proves little, and one that fails on a random network transition costs another day.
-
-## The authed MCP surface was deployed, resetting the soak baseline (2026-07-31)
-
-The self-serve MCP work (branch `mcp-4-dashboard-pairing`, HEAD `00a6cf1`) is
-**deployed** — version `f334a2c8-c158-458f-a230-26bab95e79ea`. Per the explicit
-instruction it was not gated on the soak. It is additive — new routes, DOs
-(`AccountDirectory`, `UnderstudyMcp`, `AccountAgent`), bindings (`MCP_AGENT`,
-`ACCOUNT`, `ACCOUNT_DIRECTORY`, `OAUTH_KV`, `EMAIL`), and secret
-`VAULT_UPLOAD_PRIVATE_KEY` — and touches neither the per-command path nor the
-soak-owned device/lease code (`apps/extension/src/core/ws-client.ts` and
-`apps/backend/src/tenant-coordinator.ts` are byte-identical on the branch;
-`profile-client.ts` gained only a read-only accessor). It is therefore
-incapable of changing device or session behavior; the redeploy itself, not any
-logic in it, is what resets the soak.
-
-**Consequence for Phase 3b: the soak baseline is now this version.** The soak
-was already halted (run 2, for the network-blip diagnosis), so no running soak
-was interrupted — but when Phase 3b restarts it must run against
-`f334a2c8-…`, not the pre-MCP version. The migrations `v3`+`v4` are now applied
-to production; the flags-off `v2` rollback target no longer matches the live
-schema, so a rollback below `v3` is no longer clean (DO SQLite migrations are
-one-way). This deploy and the network-blip deploy no longer need to *share* a
-reset — this one already happened; sequence the network-blip fix on top of
-`f334a2c8-…`.
-
-Deploy steps performed: `wrangler secret put VAULT_UPLOAD_PRIVATE_KEY` (fresh
-P-256 PKCS#8, sha256 prefix `150c0c6a…`, not the dev placeholder) → `wrangler
-deploy` → live smoke on `understudy.proofof.tech` — which did NOT catch that this
-version's dashboard refused every POST, see `## The dashboard refused its own
-POSTs (2026-07-31)`: `/health` `{"ok":true}`, both
-well-known metadata docs correct, `POST /mcp` initialize (no bearer) → `401`
-with the `resource_metadata` pointer, DCR `201`, `/dashboard` `200`. The branch
-is **not yet pushed or merged** — the deployed SHA `00a6cf1` is local; push/merge
-to make it canonical.
-
-## Phase 4: Switch Metamind to unattended and prove governance
-
-Switch only the synthetic canary workflow. FlowSafe remains the approval authority, and Breakwater remains the connector governance and audit boundary.
-
-### Configure and deploy Metamind
-
-Set production Metamind to:
-
-```json
-{
-  "UNDERSTUDY_SESSION_MODE": "unattended",
-  "UNDERSTUDY_DEVICE_ID": "enrolled_canary_uuid_here",
-  "UNDERSTUDY_ALLOWED_ORIGINS":
-    "[\"https://example.com\",\"https://practice.expandtesting.com\"]",
-  "UNDERSTUDY_PROFILE_STATE_KEY": "metamind-practice-account"
-}
-```
-
-Verify the Phase 1 D1 lease migration before deploying. Do not rerun the additive SQL if the table exists:
-
-```bash
-pnpm exec wrangler d1 execute metamind --remote \
-  --command "SELECT name FROM sqlite_schema WHERE name='browser_session_leases'"
-```
-
-Deploy a clean, approved Metamind `master` SHA through the stamped deployment command. Confirm `/health.commit` equals that full SHA.
-
-### Run the governed unattended proof
-
-The proof must complete every step:
-
-1. Create or replay the unattended lease.
-2. Reach connected status without manual tab attachment.
-3. Produce both dry-run previews.
-4. Suspend at the FlowSafe approval.
-5. Prove no real write occurred before approval.
-6. Approve with the expected actor and suspension fingerprint.
-7. Read the public page.
-8. Type the non-secret username.
-9. Fill the vaulted password.
-10. Observe the authenticated marker.
-11. Persist enrichment evidence.
-12. Correlate FlowSafe, Breakwater, Metamind audit, Understudy session, and command IDs.
-13. Reach a terminal workflow state.
-14. Confirm `DELETE` reaches `204`.
-15. Confirm device usage returns to zero.
-16. Confirm the lease row reaches `released`.
-
-Fail the gate if the run retries an unknown outcome, writes before approval, loses audit correlation, or leaves a stale lease.
-
-### Store the proof evidence
-
-Store the proof artifact with mode `0600`. It must contain no raw credentials, tokens, secret values, password text, or credential-bearing URLs.
-
-Record:
-
-- Artifact path and SHA-256 hash
-- Proof start and end timestamps
-- Understudy and Metamind full release SHAs
-- Both deployment IDs
-- Both version IDs
-- D1 migration evidence
-- Session, command, workflow, run, approval, and audit correlation IDs
-- Final lease state and device usage
-
-Update the Phase 4 ledger row in the same evidence pull request.
-
-## Phase 5: Ramp allowlisted production traffic
-
-Add a real website only when its exact origin appears in both Metamind’s source-controlled allowlist and the extension enrollment. Do not use `"*"` or dashboard-only configuration.
-
-Keep execution sequential while all workflows use `metamind-practice-account`. The shared profile-state key is an intentional account-concurrency fence.
-
-### Stage 1: Run one record
-
-Run one operator-selected production record. Observe it for 2 hours.
-
-### Stage 2: Run five records
-
-After Stage 1 passes, run five production records sequentially. Observe them for 8 hours.
-
-### Stage 3: Enable all reviewed origins
-
-After Stage 2 passes, enable all traffic for the reviewed allowlisted origins. Observe it for 24 hours.
-
-### Apply every ramp gate
-
-Require all conditions at each stage:
-
-- No unexpected unknown write
-- No retry after an unknown outcome
-- No write before approval
-- No stale `minting`, `active`, or `cleanup_pending` lease after a terminal workflow
-- Device usage returns to zero
-- No origin-policy rejection for an approved origin
-- No cross-tab routing
-- No duplicate controlled tab
-- No unexpected browser recovery
-- Correct FlowSafe decision and Breakwater audit correlation
-- Expected session creation, provisioning, release, and expiry telemetry
-- No material increase in Worker error rate or handler duration
-
-Before each stage, record the comparison interval and numeric error-rate and handler-duration thresholds. Do not choose a threshold after observing the stage.
-
-Record the Analytics Engine result with this query:
-
-```sql
-SELECT
-  blob1 AS event,
-  blob2 AS outcome,
-  count() AS total
-FROM understudy_telemetry
-WHERE timestamp > NOW() - INTERVAL '1' DAY
-GROUP BY event, outcome
-ORDER BY event, outcome
-```
-
-Run the query through the [Analytics Engine SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/). Preserve the query, UTC interval, raw result, and operator interpretation with each stage’s evidence.
-
-Do not advance a stage on an unexplained anomaly. Set the current gate to `Blocked`, attach the evidence, and either fix forward or execute rollback.
-
-## Phase 6: Close the rollout
-
-Close the rollout only after the all-allowlisted 24-hour soak passes.
-
-1. Leave `UNATTENDED_ENABLED_TENANTS=["metamind"]`.
-2. Leave `SAFE_WRITE_REQUIRED_TENANTS=["metamind"]`, recording it as the downgrade guard it is — not as a safety control that was exercised. See Phase 3.
-3. Do not switch either flag to wildcard enablement.
-4. Fill every ledger field with full SHAs, CI URLs, deployment and version IDs, D1 evidence, device acceptance, telemetry, proof artifacts, and UTC timestamps.
-5. Verify the recorded rollback version still exists among Cloudflare’s available Worker versions.
-6. Mark Phase 6 `Passed`.
-7. Move optional future work into separate issues.
-
-Do not convert a failed release gate into a TODO.
-
-## Roll back safely
-
-Migration `v2` is additive and irreversible. Cloudflare blocks rollback when a Durable Object class lifecycle change separates the active and target versions. The current migration-`v1` production version is therefore not a valid rollback target after `v2` deploys. See [Cloudflare Worker rollback constraints](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
-
-Execute rollback in this order:
-
-1. Switch Metamind back to `UNDERSTUDY_SESSION_MODE=attended`.
-2. Roll Understudy back to `UNDERSTUDY_V2_FLAGS_OFF_VERSION`, or redeploy its exact approved source state.
-3. Confirm new unattended leases are disabled.
-4. `DELETE` every active unattended lease and poll each `202` until `204`.
-5. Let the durable sweeper retain and retry unresolved cleanup.
-6. Preserve migration `v2`, coordinator data, audit evidence, and unknown-outcome records.
-7. Never replay a command with an unknown external outcome.
-8. Rerun the attended production proof.
-9. Mark affected ledger gates `Rolled back` with deployment IDs, evidence, UTC time, and owner.
-
-Use the recorded version ID:
-
-```bash
-UNDERSTUDY_V2_FLAGS_OFF_VERSION="version_uuid_here"
-pnpm --filter @understudy/backend exec wrangler rollback \
-  "$UNDERSTUDY_V2_FLAGS_OFF_VERSION" \
-  --message "rollback to migration-v2 flags-off baseline"
-pnpm --filter @understudy/backend exec wrangler deployments status --json
-```
-
-If Cloudflare refuses the rollback, stop. Confirm the version’s exports, migrations, and bindings. Fix forward from migration `v2`; never remove its Durable Object classes.
-
-Rollback is complete only when attended proof passes, no new unattended lease can start, all resolvable leases reach `released`, and unresolved leases remain durable with alerts.
-
-## Verify implementation changes
-
-Run the full Understudy checks for any Understudy implementation or configuration change:
-
-```bash
-pnpm build
-pnpm typecheck
-pnpm test
-git diff --check
-```
-
-Run the Metamind Worker lane for every Metamind implementation or configuration change:
-
-```bash
-pnpm --filter @repo/worker typecheck
-pnpm --filter @repo/worker test
-pnpm exec biome check packages/worker
-node packages/worker/scripts/enrich-browser-runbook.mjs --self-test
-pnpm build
-bash scripts/validate-build.sh
-git diff --check
-```
-
-The required automated scenarios are:
-
-- Attended creation sends no request body and works with old and new Understudy backends
-- Unattended creation validates exact origins, device UUID, profile key, idempotent replay, `202` polling, terminal status, and timeout
-- Attended responses contain `webSocketUrl`; unattended responses omit it
-- Pending commands poll the same ID
-- Not-started retries reuse the logical key
-- Unknown outcomes never retry
-- Timed-out writes never retry automatically
-- Crashes after mint intent, Understudy creation, FlowSafe start, terminal cleanup, and compare-and-clear converge without losing or double-releasing a lease
-- Cleanup handles `DELETE 202 → 204`, transient `5xx`, and terminal workflow states
-- The proof-runner self-test covers both modes
-- `/health.commit` matches the deployed full SHA
-- Existing Metamind and Understudy tests remain green
-
-## Preserve rollout decisions
-
-These decisions remain in force until a reviewed change updates this runbook:
-
-- **Canonical runbook**: Keep execution details here so the technical plan remains a conceptual architecture document
-- **Metamind proof**: Require a real governed consumer to prove FlowSafe, Breakwater, audit correlation, and cleanup together
-- **Attended toggle**: Preserve it until rollout closes so consumer rollback does not depend on unattended recovery
-- **Exact origin allowlists**: Keep Metamind and extension policy reviewable and identical
-- **Durable D1 cleanup**: Use persisted leases and the existing maintenance cron so Worker crashes cannot lose cleanup work
-- **Staged ramp**: Use `1 → 5 → all` to constrain blast radius and require evidence between stages
-- **Source-controlled variables**: Make each production configuration reviewable and reproducible
-- **Migration-`v2` baseline**: Establish a flags-off version because Cloudflare cannot roll back across the class lifecycle change
-
-The rollout rejected:
-
-- **Immediate unattended-only cutover**: It removes the attended recovery path before unattended proof exists
-- **Best-effort cleanup**: Idle expiry cannot replace durable ownership and explicit release
-- **Arbitrary record origins**: Dynamic policy would bypass source review and extension enrollment
-- **Wildcard tenant enablement**: It expands the failure domain beyond the proven consumer
-- **Dashboard-only configuration**: It breaks reproducibility and review
-- **Direct rollback to migration `v1`**: Cloudflare blocks the incompatible Durable Object lifecycle rollback
-
-## Keep excluded work out of the rollout
-
-Do not add these features while executing this runbook:
-
-- Automated extension distribution or enrollment
-- Dynamic fleet or origin-policy administration
-- Cross-tenant profiles
-- Storage isolation between tabs in one profile
-- More than two controlled tabs per device
-- New browser providers
-- Local daemons
-- Automatic URL restoration
-- New package releases unless package code changes
-- Changes to Metamind’s primary intake workflow
-- Any Gmail send path
-
-These exclusions do not waive release gates or permit temporary unsafe behavior.
-
-## Appendix: current-state anchors
-
-These anchors pin the initial edit targets. Understudy snippets are from `e4b98e6824b2dbee078a7c57da37a11f389010b9`. Metamind snippets are from `ee94790ddf92b8fabebba10a502e76005a57e17d`. Re-read each file and symbol before editing because line numbers and surrounding code will drift.
-
-### Release flow is complete
-
-`README.md`, `Release published packages`:
-
-```markdown
-1. Merge `Version Packages` into `dev`.
-2. Verify the versioned `dev` commit.
-3. Open and merge a promotion pull request from `dev` to `master`.
-```
-
-This supports the Phase 0 decision to avoid another package release unless package code changes.
-
-### Understudy distinguishes attended creation by an absent body
-
-`apps/backend/src/index.ts`, `POST /v1/sessions`:
-
-```typescript
-if (c.req.raw.body === null) {
-```
-
-Metamind currently violates that contract in `packages/worker/src/intake/browser-connectors.ts`, `createBrowserSession`:
-
-```typescript
-headers: {
-  "content-type": "application/json",
-  authorization: `Bearer ${config.UNDERSTUDY_TOKEN}`,
-  "idempotency-key": idempotencyKey,
-},
-body: "{}",
-```
-
-Implement attended mode with no `body` property and no `content-type` header. Implement unattended mode with the JSON body and header.
-
-### Metamind uses older client packages
-
-`packages/worker/package.json`:
-
-```json
-		"@understudy/connector": "^0.4.0",
-		"@understudy/protocol": "^0.6.0",
-```
-
-Upgrade these dependencies to the Phase 1 versions and update the lockfile.
-
-### The enrichment route always exposes an attended socket
-
-`packages/worker/src/routes/intake.ts`, `POST /records/:id/enrich-website`:
-
-```typescript
-return c.json(
-  {
-    workflowId: LEAD_ENRICH_BROWSER_WORKFLOW_ID,
-    ...started,
-    webSocketUrl: browserWebSocketUrl(c.env, started.sessionId),
-  },
-  202,
-);
-```
-
-Replace this shape with the mode-discriminated response from Phase 1.
-
-### Durable recovery has a reusable pattern
-
-`packages/worker/src/intake/resume-recovery.ts`, resume sweep:
-
-```typescript
-		const parked = await listResumeRecoveries(env.DB);
-		for (const entry of parked) {
-			try {
-				await enqueueJobs(env, [
-					{
-						kind: "resume",
-						recordId: entry.recordId,
-						record: entry.record as ApprovalRecord,
-						attempt: 1,
-					},
-				]);
-				await clearResumeRecovery(env.DB, entry.recordId, entry.recordJson);
-```
-
-Reuse its durable marker, retry containment, and compare-and-clear pattern for browser-session leases.
-
-### Metamind deployment provenance is not stamped
-
-Both Metamind Wrangler configurations currently contain:
-
-```json
-		"VERSION": "0.0.0-dev",
-		"COMMIT": "local",
-```
-
-The live Worker also reports `COMMIT=local`. Phase 1 must replace this deployment path before unattended proof evidence is accepted.
-
-### Understudy source and production infrastructure differ
-
-`apps/backend/wrangler.jsonc` declares:
-
-```json
-{ "name": "DEVICE", "class_name": "DeviceAgent" },
-{ "name": "TENANT_CONTROL", "class_name": "TenantDeviceCoordinator" }
-```
-
-It also declares:
-
-```json
-{
-  "tag": "v2",
-  "new_sqlite_classes": ["DeviceAgent", "TenantDeviceCoordinator"]
-}
-```
-
-The production baseline remains on migration `v1` with only `SessionAgent`. This difference makes Phase 2 the first infrastructure deployment and makes the `v2`, flags-off version the first safe rollback target.
+The card-vault requirements record that persisted card verification values conflict with PCI SSC FAQ 1574. This handoff makes no compliance determination and adds no QSA or counsel rollout gate.

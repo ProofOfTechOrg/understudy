@@ -1,6 +1,6 @@
 /**
- * base64url codec shared by sessionId minting (auth.ts) and the vault
- * envelope format (vault.ts). Workers have btoa/atob but no Buffer, hence
+ * base64url codec shared by sessionId minting and signed authorization
+ * envelopes. Workers have btoa/atob but no Buffer, hence
  * the manual binary-string bridging.
  */
 

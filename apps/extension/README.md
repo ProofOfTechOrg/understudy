@@ -1,122 +1,89 @@
 <!-- Content type: Reference -->
 
-# Host Understudy sessions in Chromium
+# Host Understudy sessions in Chrome
 
-The Manifest V3 extension supports attended control of one selected tab and unattended control of at most two extension-owned tabs. Unattended hosting requires a tenant-dedicated Chrome profile because tabs share profile cookies and browser storage.
+The Manifest V3 extension controls one attended user tab or at most two extension-owned unattended windows. It also owns the local encrypted payment-card vault. Unattended profiles are tenant-dedicated because sessions share cookies, browser storage, installed extensions, and the extension update authority.
 
-## Understand the runtime
-
-The background service worker separates profile and session responsibilities:
+## Runtime modules
 
 | Module | Responsibility |
 |---|---|
-| `core/profile-client.ts` | Enrollment, browser epoch, device ticket, and control socket |
-| `core/session-manager.ts` | Runtime maps by session, lease, and tab |
-| `core/session-runtime.ts` | One tab, CDP session, command queue, session socket, journal, and dialog outbox |
-| `core/write-journal.ts` | Awaited `prepared`, `started`, `completed_unacked`, and `unknown` states |
-| `core/dialog-outbox.ts` | Browser-epoch-scoped dialog acknowledgement and replay |
-| `driver/cdp.ts` | CDP execution, aggregate deadlines, top-level origin interception, and popup containment |
-| `entrypoints/background.ts` | Profile host plus compatible attended session |
-| `entrypoints/sidepanel/` | Enrollment, capacity, emergency stop, and attended controls |
+| `core/profile-client.ts` | Pairing credential, browser epoch, control tickets, policy acknowledgement, and reconciliation |
+| `core/session-manager.ts` | Assignment maps, owned-window registry, closure outbox, and exact orphan cleanup |
+| `core/session-runtime.ts` | One controlled tab, CDP session, command queue, journal, dialog outbox, and sensitive payment boundary |
+| `payment/card-vault.ts` | AES-GCM envelope format and vault operations |
+| `payment/indexeddb-card-store.ts` | Extension-origin IndexedDB records, key, schema, and local payment origins |
+| `driver/cdp.ts` | CDP actions, refs, navigation containment, popups, and atomic card-field insertion |
+| `entrypoints/sidepanel/` | Pairing, hosting state, card enrollment, and local payment-origin editor |
 
-Each unattended lease creates a new `about:blank` tab in an unfocused automation window. The extension never adopts an existing tab for unattended work.
+Each unattended lease creates a new unfocused `about:blank` window. The extension never adopts an existing tab for unattended work.
 
-## Build the production extension
-
-Run:
+## Build and test
 
 ```bash
 pnpm --filter @understudy/protocol build
 pnpm --filter @understudy/extension typecheck
 pnpm --filter @understudy/extension test
-pnpm --filter @understudy/extension build
+pnpm --filter @understudy/extension test:e2e
 pnpm --filter @understudy/extension build:store
 pnpm --filter @understudy/extension zip:store
 ```
 
-Load `apps/extension/.output/chrome-mv3/` for internal testing or `apps/extension/.output/chrome-mv3-store/` for Web Store acceptance through `chrome://extensions`. WXT development mode creates a disposable profile and does not prove behavior against the operator’s login state.
+`test:e2e` launches local Chrome with the store build, enrolls a synthetic card through the extension messaging boundary, verifies a non-extractable persisted key and encrypted envelope, reloads the extension, deletes the vault, and checks that the synthetic marker did not appear in network, console, or exception events.
 
-The manifest requires Chrome 125 or newer and requests debugger, storage, alarms, side panel, and host permissions. The store build limits host access to `https://understudy.proofof.tech/*`; the internal build retains broad host access for operator-supplied service origins.
+Load `.output/chrome-mv3/` for internal testing or `.output/chrome-mv3-store/` for store acceptance. The store build connects only to `https://understudy.proofof.tech/*` and accepts external messages only from that origin.
 
-## Enroll a dedicated profile
+## Pair a browser
 
-Open the side panel and enter:
+Sign in at `https://understudy.proofof.tech/dashboard` and select **Pair this browser**. The CSRF-protected POST mints an opaque single-use offer. The dashboard sends it directly to the installed extension with `chrome.runtime.sendMessage`; the offer never enters a URL, browser history, or referrer.
 
-- HTTPS service origin
-- Device UUID
-- Raw device credential
-- One exact allowed origin per line
-- **Enable unattended hosting**
+The extension accepts only the exact sender page `https://understudy.proofof.tech/dashboard/pair`, an exact two-field schema, and a 43-character base64url offer. Re-pairing a live installation rotates the existing device credential without releasing its assignments. A locally detected revocation omits its dead credential. If a browser was revoked while offline and still submits that credential, pairing returns a fresh device identity and the extension durably fences and discards stale local ownership before activating it, including across service-worker restarts. A different Chrome profile creates a separate browser.
 
-The credential field is write-only and must be supplied on every save. Panel state and logs never read it back.
+An empty default origin policy is valid, but the device cannot accept a session until configured.
 
-The local origin policy is the maximum this profile will host. Each session request must be a subset.
+## General origin policy
 
-## Understand storage
+The dashboard owns the authoritative per-device policy. Removed origins immediately fence affected leases. Added origins are unusable until the extension persists and acknowledges the new version. The extension rejects a provision frame with a mismatched version or origins wider than its current policy.
 
-`chrome.storage.local` contains:
+Origins match exactly. `https://example.com` does not include `https://www.example.com`.
 
-- Service origin
-- Enabled state
-- Device ID
-- Raw device credential
-- Local origin policy
-- A staged replacement profile while old lease cleanup is incomplete
-- A credential-revocation marker that suppresses reconnects
+## Owned windows and recovery
 
-The extension restricts local-storage access to trusted extension contexts.
+Immediately after `chrome.windows.create`, the extension persists the new window ID, tab ID, browser epoch, session ID, lease ID, and lease epoch before installing a runtime. It writes both a fast `storage.session` checkpoint and a content-free `storage.local` recovery mirror so ownership survives a full Chrome restart. On worker wake it reconciles:
 
-`chrome.storage.session` contains browser epoch, versioned lease assignments, cleanup intent, queued closure fences, tab IDs, ref generations, write journal entries, and dialog outbox records. A closure fence remains queued until the backend returns an exact `closed_ack`. The extension resends queued closures after reconnects. It never contains command bodies, typed text, secret plaintext, secret references, screenshots, accessibility trees, or general navigation history. A pending dialog record includes the page URL where the dialog appeared until `dialog_ack`.
+- Stored owned windows
+- Managed assignments
+- The closure outbox
+- Server assignment and orphan inventory
 
-Browser restart clears execution authority. The extension creates fresh blank tabs for live recovering leases and never restores old URLs.
+Only a registered exact orphan can be closed. Ordinary restored tabs are never inferred to be owned.
 
-Changing the service origin, device ID, credential, or origin policy fences hosting immediately. The extension disables the old profile, closes its owned tabs, queues closure frames through the old control identity, then promotes the staged profile. If the old service is unavailable, the replacement stays inactive until cleanup can finish.
+After a full Chrome restart, exact closure records from the old browser epoch are delivered and acknowledged before the new epoch sends `device_hello`. A transient Chrome close failure keeps the connection in cleanup-only mode until physical removal succeeds. Pending closure records also take priority over reconnect hello and heartbeat inventory, so the backend cannot recover or reprovision a window that the extension has already closed locally.
 
-## Control tabs safely
+Same-epoch inventory can recover a suspended lease. A browser restart creates a new epoch; accepted adoption carries a bumped lease fence and always starts in a fresh blank window. Old URLs, refs, and tasks are not restored.
 
-One runtime can see only its own tab. `hello`, `get_tabs`, and `switch_tab` never report or activate another profile tab.
+## Card vault
 
-Top-level navigations must remain within `allowedOrigins`. Explicit navigate commands are checked before dispatch. CDP Fetch interception also blocks redirects and JavaScript navigation. Cross-origin subresources and iframes remain allowed; the origin policy is not an egress firewall.
+The vault uses extension-origin IndexedDB, one locally persisted non-extractable AES-256-GCM key, a fresh 96-bit IV per write, and AAD containing schema version, record UUID, and `payment-card`. It encrypts cardholder name, PAN, expiration, and CVV.
 
-Popup targets related to a controlled tab are paused and closed before execution. `tabs.onCreated` adds a second ownership check.
+The vault has no sync, export, backup, recovery, backend copy, analytics copy, or content-script API. Removing the extension or selecting **Delete vault** destroys recovery. There is no unlock prompt because unattended operation requires the persisted key to remain usable after worker and browser restart.
 
-## Recover command state
+Enrollment validates alias, Luhn checksum, PAN length, future expiration, and 3–4 digit CVV before encryption. Payment origins are exact HTTPS origins maintained only in the extension.
 
-Writes use protocol 2:
+`browser_submit_card` validates distinct current refs and the intersection of the server session policy with the local payment policy. It then enters sensitive mode before decryption, stops ordinary command and page-event ingress, and obtains a local authorization revision for the selected card and payment origin. It rechecks that revision and card expiration immediately before the first byte is inserted. A card edit, deletion, vault deletion, or payment-origin edit during preparation therefore fails before insertion. The operation fills every mapped field, invokes submit, closes the tab, and returns only a fixed result. It never reads a receipt or infers payment success.
 
-```text
-persist prepared
-  -> write_ready
-  -> persist started
-  -> execute once
-  -> persist completed_unacked
-  -> replay until result_ack
-```
+Alias, origin-policy, distinct-ref, and current-generation checks are a non-sensitive preflight. A rejected preflight returns a fixed `not_started` result without decrypting card data or tearing down the session. Once sensitive mode begins, every exit closes the controlled tab.
 
-A storage failure before `started` prevents the browser action. A same-epoch service-worker restart:
+See [local card-vault requirements](../../docs/local-card-vault-security-requirements.md) for the trust and risk contract.
 
-- Cancels an ungranted preparation unless the backend still recognizes it
-- Marks a started write without a durable result unknown
-- Replays a completed unacknowledged result
+## Sensitive-mode containment
 
-A browser epoch change blocks writes for recovering sessions. Delete the old session and create a new session to resume writes.
+After sensitive mode begins, suppress snapshots, screenshots, URLs, titles, dialogs, tab metadata, page errors, console/network artifacts, ordinary commands, and arbitrary logs. On success, failure, timeout, worker interruption, tab closure, or extension update, close the controlled tab and clear its runtime.
 
-## Deliver dialogs
+Once insertion may have begun, every outcome is `outcome_unknown`; never retry automatically.
 
-The extension persists each dialog before answering it. It accepts alerts and before-unload dialogs, dismisses confirms and prompts, then replays the record until `dialog_ack`.
+## Attended detach
 
-The outbox holds at most 256 records and 256 KiB. Overflow still answers the browser dialog and reports content-free health.
+Each attended attachment has a UUID incarnation. Deliberate or debugger-driven detach sends that UUID and tab ID. The backend ignores stale frames, clears browser-derived artifacts for the current attachment, and reports `idle`. Socket loss reports `detached`. Detaching never closes the user’s tab.
 
-## Stop automation
-
-**Stop all** invalidates the control socket, fences every session runtime, and stops every session socket before profile or assignment persistence. Profile disable, replacement, credential revocation, and terminal control failures use the same ordering. A rejected storage write therefore leaves every in-memory runtime non-accepting.
-
-Tab removal remains sequential and confirmation-based after the synchronous fence. The extension closes only tabs proven to belong to current leases and does not close unrelated tabs. If Chrome reports a failed removal and the tab still exists, the extension retains lease ownership and its heartbeat fence. The 30-second backstop alarm retries cleanup. Release cleanup queues a `closed` frame only after confirmed removal, while recovery cleanup omits the lease so the backend can provision a fresh blank tab.
-
-Cleanup-only control connections send device hello, heartbeat, and queued closure frames through the retired profile. They reject provision and session-ticket frames. They stop only after release cleanup finishes and the backend acknowledges every queued closure. A staged profile remains inactive until both conditions hold.
-
-Credential revocation persists a terminal local marker, discards backend-terminal lease ownership, and suppresses control-ticket reconnects across service-worker restarts.
-
-Attended **Detach tab** detaches CDP but never closes the selected user tab.
-
-Follow [`RUNBOOK.md`](RUNBOOK.md) for the real-Chromium acceptance and recovery procedure.
+Follow [`RUNBOOK.md`](RUNBOOK.md) for real-Chrome release acceptance.
