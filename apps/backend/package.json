@@ -7,8 +7,13 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "deploy:production": "bash scripts/deploy-production.sh",
+    "deploy:production:auto": "bash scripts/deploy-target.sh production-auto",
+    "deploy:staging": "bash scripts/deploy-target.sh staging-local",
+    "deploy:staging:ci": "bash scripts/deploy-target.sh staging-ci",
+    "provision:staging": "bash scripts/provision-staging.sh",
+    "verify:production-compatibility": "node scripts/verify-production-compatibility.mjs current",
     "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run && node --test scripts/deploy-target.integration.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "0.8.2",

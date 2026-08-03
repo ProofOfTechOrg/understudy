@@ -25,6 +25,9 @@ secret vault or generic credential-fill path.
 | `src/types.ts` | Worker bindings and cross-module state/outcome types |
 | `wrangler.jsonc` | Durable Object/KV bindings, migrations, required secrets, version metadata |
 | `worker-configuration.d.ts` | Generated runtime and binding types; refresh with `wrangler types` after config changes |
+| `scripts/deploy-target.sh` | Branch-gated staging/routine-production deployment, active-version verification, and attempt/failure evidence |
+| `scripts/deploy-production.sh` | Manual compatibility cutover from current `origin/master`, including guarded secret uploads and recovery evidence |
+| `production-compatibility.json` | Hash-locked contract that routine production deployment must preserve |
 
 Pairing offers use the internal `pairing_codes` table name for migration
 compatibility; the public interface is direct one-time external messaging, not
@@ -55,14 +58,22 @@ code transcription.
 
 ## Operations
 
+Pushes to `dev` deploy the isolated staging environment. `deploy:staging` may deploy a dirty local tree only to staging and records a content-derived source tag. Staging uses extension ID `ebpcldlibljfjhcfknagjcdmhggeknfc`; never copy production token maps, secrets, KV data, or Durable Object state into it.
+
 Use `scripts/deploy-production.sh` with four absolute out-of-repository paths:
 new evidence, protocol-3 `DEVICE_TOKENS` JSON, the published extension ID, and
 the canary device credential. The three inputs must be mode 0600. The script
 validates the static-device schema and canary digest, rejects a dirty tree,
+requires the published extension ID and current `origin/master` head,
 performs Wrangler dry-run, asks for explicit secret-upload and deployment
 confirmation, hash-locks the uploaded bytes to the validated source, tags the
 version with the full commit SHA, and requires three
-matching `/health` reads before recording provenance.
+matching `/health` reads before recording provenance. Attempt and failure
+evidence retain the prior deployment and version inventories plus each
+secret-derived version. The script also requires the generated store extension
+to match the recorded published artifact and validates the current production
+compatibility contract. After the manual protocol-3 cutover, compatible
+`master` pushes deploy without rewriting secrets.
 
 Never delete legacy vault values, rotate auth epochs, remove Cloudflare secrets,
 or alter HSTS/DNS configuration without a fresh maintenance-window confirmation.

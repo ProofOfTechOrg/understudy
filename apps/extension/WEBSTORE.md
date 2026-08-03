@@ -7,12 +7,26 @@ Build and inspect the store artifact before upload:
 ```bash
 pnpm --filter @understudy/extension build:store
 pnpm --filter @understudy/extension zip:store
+pnpm --filter @understudy/extension test:e2e
 zipinfo -1 apps/extension/.output/understudyextension-0.2.0-chrome-store.zip
 curl --fail --silent --show-error https://understudy.proofof.tech/privacy >/dev/null
 ```
 
 Confirm `manifest.json` is at the archive root. Distribution is unlisted, free,
 all regions, category Productivity → Tools.
+
+Submit the exact ZIP built from the final clean `dev` release commit. Record that commit and the raw ZIP SHA-256 outside Git while review is pending. Do not reuse an artifact built before the deployment and staging changes.
+
+After Chrome Web Store reports the item as published, return to the exact source commit and record the published artifact:
+
+```bash
+pnpm --filter @understudy/extension record:store-release -- \
+  --status published \
+  --source-commit source_commit_sha
+pnpm --filter @understudy/extension verify:store-release
+```
+
+Run the recorder from a clean checkout of the exact submitted commit and replace `source_commit_sha` with that checkout's full `HEAD`. The recorder rejects a dirty tree, a different commit, or an abbreviated SHA. Commit the resulting `store-release.json` separately on `dev`, then promote `dev` to `master`. Never set `published` while the item remains in review.
 
 ## Listing copy
 

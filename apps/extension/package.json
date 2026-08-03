@@ -5,11 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "wxt",
+    "dev:staging": "wxt --mode staging",
     "build": "wxt build",
+    "build:staging": "wxt build --mode staging",
+    "verify:staging-build": "node scripts/verify-build-target.mjs staging .output/chrome-mv3-staging",
     "build:store": "wxt build --mode store",
     "zip:store": "wxt zip --mode store",
+    "verify:store-release": "node scripts/store-release.mjs verify --release store-release.json --directory .output/chrome-mv3-store --candidate-commit HEAD",
+    "record:store-release": "node scripts/store-release.mjs record --release store-release.json --directory .output/chrome-mv3-store",
     "typecheck": "wxt prepare && tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && node --test scripts/store-release.integration.mjs",
     "test:e2e": "wxt build --mode store && wxt build --mode e2e && node scripts/e2e.mjs",
     "stub": "node scripts/stub-server.mjs",
     "postinstall": "wxt prepare"

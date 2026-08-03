@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "production": {
+    "origin": "https://understudy.proofof.tech",
+    "extensionId": "lbmbdjjaodgipnleaggclnobbijpadee"
+  },
+  "staging": {
+    "origin": "https://staging.understudy.proofof.tech",
+    "extensionId": "ebpcldlibljfjhcfknagjcdmhggeknfc",
+    "extensionPublicKey": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAv1aTMIArfLdKz2SFuQmeYtTsxU3ujbQRH/AaNzi5BZOogI99NxASnOqf0dXLMgY3vfY7fbh4tYqXKCGrS6a+lFjBNx4A8Sv1EsWM9GBJsi1CuK1teFuEkEeCGnB8g5rOGyY+sAiG8LQwqw2Ae2FKXneziGVsQMaSL8dU9ugV3OzqPHvruffn8Pa4UZ4FaDuT0HWVOsj5vuKEcrR86GQd3x4BwNL0Naqs9ThxuwG7rs9z19bJcEbfiq/jq4HLT90ZjCQXiq93BwgMtLn4Z6W3K2A5PjrGX5Bduy7VEurqHB9m08sYG/efoqJWVO/LhaWcrdY3chazl4cFMcW+VrQv3QIDAQAB"
+  }
+}

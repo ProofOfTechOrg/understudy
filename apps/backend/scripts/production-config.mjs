@@ -1,7 +1,8 @@
 import { parseStaticDeviceTokens } from "../src/static-device-config.mjs";
+import targets from "../../../deployment-targets.json" with { type: "json" };
 
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
-const EXTENSION_ID_PATTERN = /^[a-p]{32}$/;
+const PRODUCTION_EXTENSION_ID = targets.production.extensionId;
 
 export function validateProductionDeviceTokens(value, canaryDigest) {
   if (!DIGEST_PATTERN.test(canaryDigest)) {
@@ -15,8 +16,8 @@ export function validateProductionDeviceTokens(value, canaryDigest) {
 }
 
 export function validateProductionExtensionId(value) {
-  if (!EXTENSION_ID_PATTERN.test(value)) {
-    throw new Error("extension ID must be one published Chrome extension ID");
+  if (value !== PRODUCTION_EXTENSION_ID) {
+    throw new Error("extension ID must match the published Chrome extension");
   }
   return value;
 }

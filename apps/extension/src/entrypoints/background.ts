@@ -118,7 +118,7 @@ let attendedWritesBlocked = false;
 let attendedTerminal = false;
 const profileClient = new ProfileClient(
   () => broadcastState(),
-  __UNDERSTUDY_STORE__ ? DEFAULT_SERVICE_ORIGIN : undefined,
+  __UNDERSTUDY_ORIGIN_PINNED__ ? DEFAULT_SERVICE_ORIGIN : undefined,
 );
 const pairingClaims = new PairingClaimCoordinator(browser.storage.local);
 

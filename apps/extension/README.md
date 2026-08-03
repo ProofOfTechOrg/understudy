@@ -25,13 +25,17 @@ pnpm --filter @understudy/protocol build
 pnpm --filter @understudy/extension typecheck
 pnpm --filter @understudy/extension test
 pnpm --filter @understudy/extension test:e2e
+pnpm --filter @understudy/extension build:staging
+pnpm --filter @understudy/extension verify:staging-build
 pnpm --filter @understudy/extension build:store
 pnpm --filter @understudy/extension zip:store
 ```
 
 `test:e2e` launches local Chrome with the store build, enrolls a synthetic card through the extension messaging boundary, verifies a non-extractable persisted key and encrypted envelope, reloads the extension, deletes the vault, and checks that the synthetic marker did not appear in network, console, or exception events.
 
-Load `.output/chrome-mv3/` for internal testing or `.output/chrome-mv3-store/` for store acceptance. The store build connects only to `https://understudy.proofof.tech/*` and accepts external messages only from that origin.
+Load `.output/chrome-mv3/` for internal testing, `.output/chrome-mv3-staging/` for hosted staging, or `.output/chrome-mv3-store/` for store acceptance. The staging build has the stable extension ID `ebpcldlibljfjhcfknagjcdmhggeknfc` and connects only to `https://staging.understudy.proofof.tech`. The store build connects only to `https://understudy.proofof.tech` and has no pinned key.
+
+`store-release.json` records the manually submitted or published Chrome Web Store artifact for ID `lbmbdjjaodgipnleaggclnobbijpadee`. Production deployment requires `status: "published"` and normalized build contents equal to that record. ZIP timestamps and compression do not affect this gate.
 
 ## Pair a browser
 

@@ -51,6 +51,9 @@
   // Agents SDK Durable Objects require Node.js compatibility.
   "compatibility_flags": ["nodejs_compat"],
   "version_metadata": { "binding": "VERSION" },
+  "define": {
+    "__UNDERSTUDY_SERVICE_ORIGIN__": "\"https://understudy.proofof.tech\""
+  },
   "durable_objects": {
     "bindings": [
       // One SessionAgent DO per sessionId (per tenant/case) - DL-006.
@@ -160,5 +163,87 @@
   ],
   "observability": {
     "enabled": true
+  },
+  "env": {
+    "staging": {
+      "name": "understudy-backend-staging",
+      "workers_dev": false,
+      "routes": [
+        {
+          "pattern": "staging.understudy.proofof.tech",
+          "custom_domain": true
+        }
+      ],
+      "define": {
+        "__UNDERSTUDY_SERVICE_ORIGIN__": "\"https://staging.understudy.proofof.tech\""
+      },
+      "version_metadata": { "binding": "VERSION" },
+      "durable_objects": {
+        "bindings": [
+          { "name": "SESSION", "class_name": "SessionAgent" },
+          { "name": "DEVICE", "class_name": "DeviceAgent" },
+          {
+            "name": "TENANT_CONTROL",
+            "class_name": "TenantDeviceCoordinator"
+          },
+          {
+            "name": "ACCOUNT_DIRECTORY",
+            "class_name": "AccountDirectory"
+          },
+          { "name": "MCP_AGENT", "class_name": "UnderstudyMcp" },
+          { "name": "ACCOUNT", "class_name": "AccountAgent" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["SessionAgent"] },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": ["DeviceAgent", "TenantDeviceCoordinator"]
+        },
+        { "tag": "v3", "new_sqlite_classes": ["AccountDirectory"] },
+        {
+          "tag": "v4",
+          "new_sqlite_classes": ["UnderstudyMcp", "AccountAgent"]
+        }
+      ],
+      "kv_namespaces": [
+        {
+          "binding": "OAUTH_KV",
+          "id": "75b867bea00143a480c5d86a04f5bcf4"
+        }
+      ],
+      "secrets": {
+        "required": [
+          "AUTH_HMAC_SECRET",
+          "CALLER_TOKENS",
+          "EXTENSION_TOKENS",
+          "DEVICE_TOKENS",
+          "EXTENSION_ID",
+          "WS_TICKET_SECRET"
+        ]
+      },
+      "send_email": [{ "name": "EMAIL" }],
+      "vars": {
+        "QUOTA_POLICY": "{\"sessionCreatesPerActorMinute\":10,\"commandsPerSessionMinute\":120,\"commandsPerTenantMinute\":600,\"deviceTicketsPerDeviceMinute\":30,\"sessionCommandCap\":10000}",
+        "UNATTENDED_ENABLED_TENANTS": "[\"prefix:acct-\"]",
+        "SAFE_WRITE_REQUIRED_TENANTS": "[\"prefix:acct-\"]"
+      },
+      "analytics_engine_datasets": [
+        {
+          "binding": "ANALYTICS",
+          "dataset": "understudy_telemetry_staging"
+        }
+      ],
+      "ratelimits": [
+        {
+          "name": "RATE_LIMITER",
+          "namespace_id": "1002",
+          "simple": { "limit": 300, "period": 60 }
+        }
+      ],
+      "observability": {
+        "enabled": true
+      }
+    }
   }
 }

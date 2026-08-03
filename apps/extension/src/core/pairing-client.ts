@@ -11,8 +11,9 @@ import {
   readBoundedJson,
   withRequestDeadline,
 } from "./request-deadline";
+import { SERVICE_ORIGIN } from "../service-origin";
 
-export const DEFAULT_SERVICE_ORIGIN = "https://understudy.proofof.tech";
+export const DEFAULT_SERVICE_ORIGIN = SERVICE_ORIGIN;
 export const PAIRING_CLAIM_KEY = "understudy:pairingClaim";
 const PAIRING_REQUEST_TIMEOUT_MS = 15_000;
 const PAIRING_RESPONSE_MAX_BYTES = 16 * 1024;
@@ -492,6 +493,9 @@ export async function redeemPairingOffer(
   const result = parsePairingResult(body);
   if (result === null) {
     throw new PairingError("The pairing service sent an unreadable reply. Try again.");
+  }
+  if (result.serviceOrigin !== serviceOrigin) {
+    throw new PairingError("The pairing service returned an unexpected service origin.");
   }
   return result;
 }

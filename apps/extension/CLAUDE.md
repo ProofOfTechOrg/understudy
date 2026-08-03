@@ -17,6 +17,8 @@ extension owns the local encrypted payment-card vault.
 | `tsconfig.json` | TS project config (extends WXT-generated `.wxt/tsconfig.json`) | Adjusting compiler options |
 | `scripts/stub-server.mjs` | Throwaway M2 WS peer: validates every Event with real protocol schemas, sends Commands from stdin | Driving/debugging the extension over the real WS wire |
 | `scripts/e2e.mjs` | Local-Chrome store-build test for local-vault persistence, deletion, and marker non-egress | Changing the vault store, service-worker restart behavior, or store manifest |
+| `scripts/store-release.mjs` | Published store-artifact recorder and normalized-content deployment gate | Building, submitting, recording, or promoting a store release |
+| `scripts/verify-build-target.mjs` | Staging manifest authority and pinned-ID verifier | Changing staging mode, origin, permissions, or key |
 | `src/events.ts` | `errorMessage`, `actionError` — shared error-to-`action_result` helpers | Adding an executor that can fail |
 | `src/tabs.ts` | `controlledTabInfo` — scoped CDP URL/title plus non-sensitive tab state for one controlled tab | Changing tab metadata reported to the backend |
 | `src/messaging.ts` | `PanelMsg`/`SwMsg` discriminated unions for the sidepanel↔service-worker `Port` | Changing panel/background message shapes |

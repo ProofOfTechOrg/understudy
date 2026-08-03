@@ -6,8 +6,15 @@
  * base). Derive them all from one constant so a domain change is one edit.
  */
 
-export const CANONICAL_HOST = "understudy.proofof.tech";
-export const CANONICAL_ORIGIN = `https://${CANONICAL_HOST}`;
+declare const __UNDERSTUDY_SERVICE_ORIGIN__: string;
+
+const PRODUCTION_ORIGIN = "https://understudy.proofof.tech";
+
+export const CANONICAL_ORIGIN =
+  typeof __UNDERSTUDY_SERVICE_ORIGIN__ === "string"
+    ? __UNDERSTUDY_SERVICE_ORIGIN__
+    : PRODUCTION_ORIGIN;
+export const CANONICAL_HOST = new URL(CANONICAL_ORIGIN).hostname;
 export const MCP_URL = `${CANONICAL_ORIGIN}/mcp`;
 export const DASHBOARD_URL = `${CANONICAL_ORIGIN}/dashboard`;
 /** Trailing-slash base for `new URL(path, base)` composition. */

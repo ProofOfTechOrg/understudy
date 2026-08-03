@@ -9,9 +9,8 @@ import type {
   ProfileBlockReason,
   SwMsg,
 } from "../../messaging";
+import { DASHBOARD_URL, PRIVACY_URL } from "../../service-origin";
 
-const DASHBOARD_URL = "https://understudy.proofof.tech/dashboard";
-const PRIVACY_URL = "https://understudy.proofof.tech/privacy";
 const SUPPORT_URL = "https://github.com/ProofOfTechOrg/understudy/issues";
 const RECONNECT_DELAY_MS = 500;
 

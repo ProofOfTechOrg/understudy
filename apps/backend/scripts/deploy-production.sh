@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly HEALTH_URL="https://understudy.proofof.tech/health"
-readonly REQUIRED_MATCHES=3
-readonly MAX_POLLS=30
-readonly CURL_CONNECT_TIMEOUT_SECONDS=5
-readonly CURL_MAX_TIME_SECONDS=20
-
 if [[ $# -ne 4 || "$1" != /* || "$2" != /* || "$3" != /* || "$4" != /* ]]; then
   echo "usage: $0 /absolute/path/evidence.json /absolute/path/device-tokens.json /absolute/path/extension-id.txt /absolute/path/canary-credential.txt" >&2
   exit 2
 fi
+
+UNDERSTUDY_CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+unset CLOUDFLARE_API_TOKEN
 
 for command in curl cut git jq mktemp node pnpm realpath sha256sum stat; do
   command -v "$command" >/dev/null || {
@@ -20,6 +17,7 @@ for command in curl cut git jq mktemp node pnpm realpath sha256sum stat; do
 done
 
 repo_root="$(git rev-parse --show-toplevel)"
+source "$repo_root/apps/backend/scripts/deploy-lib.sh"
 evidence_path="$1"
 device_tokens_path="$2"
 extension_id_path="$3"
@@ -80,6 +78,15 @@ full_sha="$(git -C "$repo_root" rev-parse HEAD)"
   exit 1
 }
 
+assert_current_master_head() {
+  git -C "$repo_root" fetch --quiet origin \
+    "+refs/heads/master:refs/remotes/origin/master"
+  local remote_sha
+  remote_sha="$(git -C "$repo_root" rev-parse refs/remotes/origin/master)"
+  node "$repo_root/apps/backend/scripts/deployment-policy.mjs" current-ref \
+    master "$full_sha" "$remote_sha"
+}
+
 assert_source_unchanged() {
   if [[ "$(git -C "$repo_root" rev-parse HEAD)" != "$full_sha" ]] ||
     [[ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all)" ]]; then
@@ -87,6 +94,8 @@ assert_source_unchanged() {
     return 1
   fi
 }
+
+assert_current_master_head
 
 snapshot_parent="$(mktemp -d)"
 snapshot_root="$snapshot_parent/source"
@@ -116,6 +125,10 @@ lockfile_sha256="$(sha256sum "$snapshot_root/pnpm-lock.yaml" | cut -d ' ' -f 1)"
 cd "$snapshot_root"
 pnpm install --frozen-lockfile --offline
 pnpm --filter @understudy/protocol build
+pnpm --filter @understudy/extension build:store
+pnpm --filter @understudy/extension zip:store
+store_release="$(pnpm --silent --filter @understudy/extension verify:store-release)"
+production_contract="$(node "$backend_dir/scripts/verify-production-compatibility.mjs" current)"
 if [[ -n "$(git -C "$snapshot_root" status --porcelain=v1 --untracked-files=no)" ]]; then
   echo "dependency preparation changed tracked snapshot files" >&2
   exit 1
@@ -129,7 +142,8 @@ if [[ "$snapshot_compatibility_config" != "$compatibility_config" ]]; then
 fi
 
 cd "$backend_dir"
-pnpm exec wrangler deploy --dry-run
+understudy_deploy_init production "$backend_dir" "$full_sha" "$full_sha"
+understudy_deploy_dry_run
 
 read -r -p "Upload validated DEVICE_TOKENS and EXTENSION_ID, then deploy commit $full_sha? Type DEPLOY: " confirmation
 if [[ "$confirmation" != "DEPLOY" ]]; then
@@ -138,99 +152,122 @@ if [[ "$confirmation" != "DEPLOY" ]]; then
 fi
 
 assert_source_unchanged
-node "$backend_dir/scripts/put-validated-secret.mjs" \
-  DEVICE_TOKENS "$device_tokens_sha256" <"$device_tokens_path"
-printf '%s' "$extension_id" | pnpm exec wrangler secret put EXTENSION_ID
-compatibility_versions="$(pnpm exec wrangler versions list --json)"
-compatibility_secret_version="$(jq '
-  map(select(.annotations["workers/triggered_by"] == "secret")) | last // null
-' <<<"$compatibility_versions")"
-assert_source_unchanged
-pnpm exec wrangler deploy --strict --tag "$full_sha" --message "source $full_sha"
-
-matches=0
-polls=0
+assert_current_master_head
+UNDERSTUDY_PRIOR_DEPLOYMENT="$(understudy_wrangler_control_plane deployments status --json)"
+prior_versions="$(understudy_versions_json)"
 health='null'
-while (( matches < REQUIRED_MATCHES && polls < MAX_POLLS )); do
-  polls=$((polls + 1))
-  if candidate="$(curl --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
-    --max-time "$CURL_MAX_TIME_SECONDS" --fail --silent --show-error "$HEALTH_URL")" &&
-    jq -e --arg sha "$full_sha" '
-      .ok == true and .commit == $sha and
-      (.versionId | type == "string" and length > 0) and
-      (.deployedAt | type == "string" and length > 0)
-    ' >/dev/null <<<"$candidate"; then
-    health="$candidate"
-    matches=$((matches + 1))
-  else
-    matches=0
-  fi
-  if (( matches < REQUIRED_MATCHES )); then sleep 2; fi
-done
-if (( matches < REQUIRED_MATCHES )); then
-  echo "health provenance did not converge after $polls polls" >&2
-  exit 1
-fi
+active_version='null'
+source_release='null'
+deployment='null'
+device_tokens_secret_version='null'
+extension_id_secret_version='null'
+secret_derived='null'
+secret_mutation_possible='true'
+deployment_stage="prepared"
 
-versions="$(pnpm exec wrangler versions list --json)"
-deployment="$(pnpm exec wrangler deployments status --json)"
-active_version_id="$(jq -r '.versionId' <<<"$health")"
-active_version="$(jq --arg id "$active_version_id" '
-  map(select(.id == $id)) | first // null
-' <<<"$versions")"
-source_release="$(jq --arg sha "$full_sha" '
-  map(select(
-    .annotations["workers/tag"] == $sha or
-    .annotations["workers/message"] == ("source " + $sha)
-  )) | last // null
-' <<<"$versions")"
-if [[ "$source_release" == "null" || "$active_version" == "null" ]]; then
-  echo "Wrangler version inventory did not contain the source or active version" >&2
-  exit 1
-fi
-if ! jq -e --arg id "$active_version_id" '
-  any(.versions[]; .version_id == $id and .percentage == 100)
-' >/dev/null <<<"$deployment"; then
-  echo "active deployment is not serving the health-reported version at 100%" >&2
-  exit 1
-fi
+write_evidence() {
+  local outcome="$1"
+  local failure_stage="${2:-}"
+  local exit_code="${3:-0}"
+  local recorded_at
+  recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  umask 077
+  temporary="$(mktemp "$evidence_dir/.understudy-deploy.XXXXXX")"
+  jq -n \
+    --arg recordedAt "$recorded_at" \
+    --arg outcome "$outcome" \
+    --arg failureStage "$failure_stage" \
+    --argjson exitCode "$exit_code" \
+    --arg sourceSha "$full_sha" \
+    --arg pnpmVersion "$pnpm_version" \
+    --arg lockfileSha256 "$lockfile_sha256" \
+    --argjson secretMutationPossible "$secret_mutation_possible" \
+    --argjson compatibilityConfiguration "$compatibility_config" \
+    --argjson productionCompatibility "$production_contract" \
+    --argjson storeRelease "$store_release" \
+    --argjson health "$health" \
+    --argjson sourceReleaseVersion "$source_release" \
+    --argjson activeWorkerVersion "$active_version" \
+    --argjson activeDeployment "$deployment" \
+    --argjson priorDeployment "$UNDERSTUDY_PRIOR_DEPLOYMENT" \
+    --argjson priorVersions "$prior_versions" \
+    --argjson deviceTokensSecretVersion "$device_tokens_secret_version" \
+    --argjson extensionIdSecretVersion "$extension_id_secret_version" \
+    --argjson secretDerivedVersion "$secret_derived" \
+    '{
+      recordedAt: $recordedAt,
+      outcome: $outcome,
+      failureStage: (if $failureStage == "" then null else $failureStage end),
+      exitCode: $exitCode,
+      sourceSha: $sourceSha,
+      dependencySnapshot: {
+        pnpmVersion: $pnpmVersion,
+        lockfileSha256: $lockfileSha256
+      },
+      secretMutationPossible: $secretMutationPossible,
+      compatibilityConfiguration: $compatibilityConfiguration,
+      productionCompatibility: $productionCompatibility,
+      storeRelease: $storeRelease,
+      health: $health,
+      sourceReleaseVersion: $sourceReleaseVersion,
+      activeWorkerVersion: $activeWorkerVersion,
+      activeDeployment: $activeDeployment,
+      priorDeployment: $priorDeployment,
+      priorVersions: $priorVersions,
+      deviceTokensSecretVersion: $deviceTokensSecretVersion,
+      extensionIdSecretVersion: $extensionIdSecretVersion,
+      secretDerivedVersion: $secretDerivedVersion
+    }' >"$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$evidence_path"
+  temporary=""
+}
+
+record_failed_deployment() {
+  local exit_code="$?"
+  trap - EXIT
+  set +e
+  write_evidence "failed" "$deployment_stage" "$exit_code"
+  cleanup
+  exit "$exit_code"
+}
+
+write_evidence "attempting"
+trap record_failed_deployment EXIT
+deployment_stage="device-token-secret"
+understudy_with_cloudflare_auth node "$backend_dir/scripts/put-validated-secret.mjs" \
+  DEVICE_TOKENS "$device_tokens_sha256" <"$device_tokens_path"
+device_tokens_versions="$(understudy_versions_json)"
+device_tokens_secret_version="$(
+  jq -n --argjson before "$prior_versions" --argjson after "$device_tokens_versions" \
+    '{before: $before, after: $after}' |
+    node "$backend_dir/scripts/secret-version.mjs"
+)"
+deployment_stage="extension-id-secret"
+printf '%s' "$extension_id" | understudy_with_cloudflare_auth \
+  pnpm exec wrangler secret put EXTENSION_ID --env ""
+extension_id_versions="$(understudy_versions_json)"
+extension_id_secret_version="$(
+  jq -n --argjson before "$device_tokens_versions" --argjson after "$extension_id_versions" \
+    '{before: $before, after: $after}' |
+    node "$backend_dir/scripts/secret-version.mjs"
+)"
+assert_source_unchanged
+assert_current_master_head
+deployment_stage="upload"
+understudy_deploy_release
+deployment_stage="verification"
+understudy_verify_deployment
+health="$UNDERSTUDY_HEALTH"
+active_version="$UNDERSTUDY_ACTIVE_VERSION"
+source_release="$UNDERSTUDY_SOURCE_RELEASE"
+deployment="$UNDERSTUDY_DEPLOYMENT"
 
 secret_derived="$(jq '
   if .annotations["workers/triggered_by"] == "secret" then . else null end
 ' <<<"$active_version")"
-recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-umask 077
-temporary="$(mktemp "$evidence_dir/.understudy-deploy.XXXXXX")"
-jq -n \
-  --arg recordedAt "$recorded_at" \
-  --arg sourceSha "$full_sha" \
-  --arg pnpmVersion "$pnpm_version" \
-  --arg lockfileSha256 "$lockfile_sha256" \
-  --argjson compatibilityConfiguration "$compatibility_config" \
-  --argjson health "$health" \
-  --argjson sourceReleaseVersion "$source_release" \
-  --argjson activeWorkerVersion "$active_version" \
-  --argjson activeDeployment "$deployment" \
-  --argjson compatibilitySecretVersion "$compatibility_secret_version" \
-  --argjson secretDerivedVersion "$secret_derived" \
-  '{
-    recordedAt: $recordedAt,
-    sourceSha: $sourceSha,
-    dependencySnapshot: {
-      pnpmVersion: $pnpmVersion,
-      lockfileSha256: $lockfileSha256
-    },
-    compatibilityConfiguration: $compatibilityConfiguration,
-    health: $health,
-    sourceReleaseVersion: $sourceReleaseVersion,
-    activeWorkerVersion: $activeWorkerVersion,
-    activeDeployment: $activeDeployment,
-    compatibilitySecretVersion: $compatibilitySecretVersion,
-    secretDerivedVersion: $secretDerivedVersion
-  }' >"$temporary"
-chmod 600 "$temporary"
-mv "$temporary" "$evidence_path"
-temporary=""
-cleanup
+deployment_stage="evidence"
+write_evidence "verified"
 trap - EXIT
+cleanup
 echo "deployment verified; evidence: $evidence_path"

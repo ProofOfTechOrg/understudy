@@ -102,6 +102,17 @@ describe("redeemPairingOffer", () => {
     await expect(redeemPairingOffer(OFFER)).rejects.toThrow(/unreadable reply/);
   });
 
+  it("rejects a pairing response from a different service authority", async () => {
+    stubFetch(200, {
+      ...VALID_BODY,
+      serviceOrigin: "https://staging.understudy.proofof.tech",
+    });
+
+    await expect(redeemPairingOffer(OFFER)).rejects.toThrow(
+      /unexpected service origin/,
+    );
+  });
+
   it("wraps network failures", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("boom")));
     await expect(redeemPairingOffer(OFFER)).rejects.toThrow(/Could not reach/);

@@ -79,17 +79,9 @@ The Release workflow publishes the promoted versions with npm provenance. It rej
 
 Do not merge `master` back into `dev`. `NPM_TOKEN` needs publish access to the `@understudy` scope.
 
-Backend deployment remains a separate Wrangler operation. The production
-wrapper takes four absolute, out-of-repository paths: new evidence, the
-protocol-3 `DEVICE_TOKENS` JSON, the published extension ID, and the canary's
-current device credential. The three input files must be mode 0600. The wrapper
-validates the static-device schema and canary digest, performs a dry run, asks
-once immediately before uploading both required secrets and deploying,
-hash-locks the uploaded device-token bytes to the validated source, installs
-the committed lockfile offline and frozen in a detached source worktree,
-verifies
-`/health`, and records the compatibility configuration and Cloudflare
-provenance separately. Follow the [production rollout runbook](docs/unattended-production-rollout.md).
+The Deploy workflow updates staging after every `dev` push. After the one-time protocol-3 cutover, it updates production after every `master` push. Production deployment first rebuilds the store extension and requires its normalized contents to match `apps/extension/store-release.json` in the `published` state.
+
+Use the guarded production wrapper for the first protocol-3 cutover and any later compatibility-contract change. It validates the protocol-3 device map, published extension, canary credential, immutable source snapshot, Worker provenance, and deployment evidence. Follow the [production rollout runbook](docs/unattended-production-rollout.md).
 
 ## Preserve attended proof history
 

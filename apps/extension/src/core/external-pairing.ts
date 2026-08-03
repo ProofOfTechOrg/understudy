@@ -1,10 +1,16 @@
-const PAIRING_PAGE = "https://understudy.proofof.tech/dashboard/pair";
+import { SERVICE_ORIGIN } from "../service-origin";
 
 export function externalPairingOffer(
   message: unknown,
   sender: { url?: string },
+  serviceOrigin: string = SERVICE_ORIGIN,
 ): string | null {
-  if (typeof sender.url !== "string" || sender.url !== PAIRING_PAGE) return null;
+  if (
+    typeof sender.url !== "string" ||
+    sender.url !== `${serviceOrigin}/dashboard/pair`
+  ) {
+    return null;
+  }
   if (typeof message !== "object" || message === null || Array.isArray(message)) {
     return null;
   }

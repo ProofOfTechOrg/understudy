@@ -13,6 +13,23 @@ describe("externalPairingOffer", () => {
     ).toBe(OFFER);
   });
 
+  it("accepts staging only when the build supplies the staging origin", () => {
+    expect(
+      externalPairingOffer(
+        { type: "understudy_pair_offer", offer: OFFER },
+        { url: "https://staging.understudy.proofof.tech/dashboard/pair" },
+        "https://staging.understudy.proofof.tech",
+      ),
+    ).toBe(OFFER);
+    expect(
+      externalPairingOffer(
+        { type: "understudy_pair_offer", offer: OFFER },
+        { url: "https://understudy.proofof.tech/dashboard/pair" },
+        "https://staging.understudy.proofof.tech",
+      ),
+    ).toBeNull();
+  });
+
   it.each([
     undefined,
     "http://understudy.proofof.tech/dashboard/pair",

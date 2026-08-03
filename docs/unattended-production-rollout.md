@@ -46,7 +46,7 @@ These results apply to the source code in this branch. A code or configuration c
 | Unit tests | 2026-08-02: 685 tests; protocol 47, connector 29, extension 248, backend 361 | Passed |
 | Typecheck and build | `pnpm typecheck` and `pnpm build` after all review fixes | Passed |
 | Local Chrome end-to-end | Vault restart, Chrome DevTools Protocol submission, worker-eviction recovery, deletion, and synthetic-marker non-egress | Passed |
-| Store package | 127,365 bytes; local SHA-256 `3b492a1608131088c607e5254317708165e8785c67ee73c393c40578fff9b54f` | Passed |
+| Store package | Pre-workflow `0.2.0` artifact SHA-256 `3b492a1608131088c607e5254317708165e8785c67ee73c393c40578fff9b54f` | Superseded; rebuild after the deployment changes |
 | Wrangler | Generated types current; deployment dry run completed without upload | Passed |
 | Review lanes | Independent clean-code, architecture, and quality-assurance reviews returned clean after fixes | Passed |
 | Network baseline | Test A 10s and 30s passed; Test A 60s and 120s plus Test B 30s remain | Partial |
@@ -63,19 +63,24 @@ Complete the remaining work in this order:
 | ---: | --- | --- | --- |
 | 1 | Run the remaining pre-fix network baseline | No active soak; caller credential; exact device and origin; approval immediately before firewall or Tailscale mutation | Mode-0600 JSONL evidence outside Git |
 | 2 | Apply the deterministic reconnect result | Baseline evidence from step 1 | Selected branch recorded; any required code change reviewed and verified |
-| 3 | Push, review, and merge the release branch | Repository write authority | Pull request and merge SHA |
-| 4 | Publish protocol 0.9.0 and connector 0.6.0 | Package-registry release authority | Registry versions and package integrity values |
-| 5 | Submit extension 0.2.0 | Chrome Web Store authority | Submitted artifact SHA-256, review status, and published extension ID |
-| 6 | Deploy the protocol-3 compatibility backend | Production Cloudflare authority; validated mode-0600 inputs | Deployment evidence with matching source SHA and three matching health reads |
-| 7 | Upgrade the Metamind canary consumer and extension | Canary host and browser access | Version inventory and healthy control connection |
-| 8 | Execute the authentication and cloud-vault hard cut | Declared maintenance window and fresh destructive confirmation | Epoch evidence, revoked credentials, deleted vault inventory, removed secrets |
-| 9 | Re-pair browsers and reconnect MCP clients | Account owners and active browser profiles | New device-bound credentials and successful `tools/list` |
-| 10 | Run canary security and lifecycle acceptance | Synthetic card only; approved test origin | Sanitized canary evidence with no marker egress |
-| 11 | Run the post-fix network matrix | Same authority as step 1 | Recovery and lease evidence for all three cases |
-| 12 | Complete expiry, soak, and traffic ramps | Production monitoring and rollback owner | 15-minute expiry, governed proof, soak, and ramp ledgers |
-| 13 | Finish apex HTTPS and HSTS preload | DNS, TLS, Cloudflare zone, and preload submission authority | HTTPS inventory, staged headers, preload eligibility, and pending or preloaded status |
+| 3 | Finish the one-time staging CI prerequisites, then push, review, and merge the release branch into `dev` | Repository and staging GitHub-environment authority | Scoped Cloudflare token present, staging secrets provisioned, pull request, merge SHA, and automatic staging deployment evidence |
+| 4 | Verify staging with the pinned staging extension | Staging account and dedicated Chrome profile | Pairing, OAuth/MCP, and hosted-control evidence |
+| 5 | Publish protocol 0.9.0 and connector 0.6.0 | Package-registry release authority | Registry versions and package integrity values |
+| 6 | Build, submit, and publish extension 0.2.0 | Chrome Web Store authority | Submitted ZIP, normalized content digest, published status, and source SHA in `store-release.json` |
+| 7 | Promote `dev` to `master` with production automation disabled | Repository write authority | Production gates pass and deployment reports disabled |
+| 8 | Deploy the protocol-3 compatibility backend manually | Production Cloudflare authority; validated mode-0600 inputs | Deployment evidence with matching source SHA and three matching health reads |
+| 9 | Enable routine production deployment | Production GitHub environment authority | `PRODUCTION_AUTODEPLOY_ENABLED=true` after verified cutover |
+| 10 | Upgrade the Metamind canary consumer and extension | Canary host and browser access | Version inventory and healthy control connection |
+| 11 | Execute the authentication and cloud-vault hard cut | Declared maintenance window and fresh destructive confirmation | Epoch evidence, revoked credentials, deleted vault inventory, removed secrets |
+| 12 | Re-pair browsers and reconnect MCP clients | Account owners and active browser profiles | New device-bound credentials and successful `tools/list` |
+| 13 | Run canary security and lifecycle acceptance | Synthetic card only; approved test origin | Sanitized canary evidence with no marker egress |
+| 14 | Run the post-fix network matrix | Same authority as step 1 | Recovery and lease evidence for all three cases |
+| 15 | Complete expiry, soak, and traffic ramps | Production monitoring and rollback owner | 15-minute expiry, governed proof, soak, and ramp ledgers |
+| 16 | Finish apex HTTPS and HSTS preload | DNS, TLS, Cloudflare zone, and preload submission authority | HTTPS inventory, staged headers, preload eligibility, and pending or preloaded status |
 
-Do not combine steps 6 and 8 into one unobserved change. First prove that the compatibility deployment is healthy. Then start the separately confirmed hard-cut window.
+Do not combine steps 8 and 11 into one unobserved change. First prove that the compatibility deployment is healthy. Then start the separately confirmed hard-cut window.
+
+Before the first `dev` merge, create the GitHub `staging` environment, restrict it to `dev`, and add a `CLOUDFLARE_API_TOKEN` secret scoped only to the staging Worker and its required resources. Provision the six staging Worker secrets with the backend command documented below. Create the `production` environment separately, restrict it to `master`, add a production-scoped token, and leave `PRODUCTION_AUTODEPLOY_ENABLED=false` until step 9. Never reuse either deployment token or any Worker runtime secret across targets.
 
 ## Run the remaining network baseline
 
@@ -125,7 +130,7 @@ pnpm exec wrangler deploy --dry-run
 
 Use `.changeset/protocol-three-hard-cut.md` with the repository’s Changesets release flow. Confirm that the registry contains protocol 0.9.0 and connector 0.6.0 before upgrading consumers.
 
-Rebuild the Chrome Web Store package from the merged commit. Record its SHA-256, submit extension 0.2.0, and record the published extension ID. Do not invent or use a development extension ID for production pairing.
+After the staging checks and Version Packages merge, rebuild the Chrome Web Store package from the exact final `dev` commit. Submit that ZIP and wait for Web Store ID `lbmbdjjaodgipnleaggclnobbijpadee` to report `published`. Run `record:store-release` with the build commit, commit the resulting marker on `dev`, then promote `dev` to `master`. Do not use the staging extension ID for production pairing.
 
 ## Deploy the compatibility backend
 
@@ -154,7 +159,7 @@ Preserve the generated mode-0600 evidence outside Git. It separates the source r
 
 ## Upgrade and verify the canary
 
-Upgrade the canary consumer to the published connector and protocol versions. Install the submitted or published extension 0.2.0 in the canary browser profile.
+Upgrade the canary consumer to the published connector and protocol versions. Install the published extension 0.2.0 in the canary browser profile.
 
 Verify these compatibility-deployment properties before the hard cut:
 

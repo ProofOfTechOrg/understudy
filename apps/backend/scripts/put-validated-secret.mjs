@@ -2,11 +2,18 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const ALLOWED_SECRET_NAMES = new Set(["DEVICE_TOKENS"]);
+const PRODUCTION_SECRET_NAMES = new Set(["DEVICE_TOKENS"]);
+const STAGING_SECRET_NAMES = new Set([
+  "AUTH_HMAC_SECRET",
+  "CALLER_TOKENS",
+  "EXTENSION_TOKENS",
+  "DEVICE_TOKENS",
+  "EXTENSION_ID",
+  "WS_TICKET_SECRET",
+]);
 
 export function verifiedSecretBytes(source, expectedSha256) {
   if (!(source instanceof Uint8Array) || !SHA256_PATTERN.test(expectedSha256)) {
@@ -22,26 +29,46 @@ export function verifiedSecretBytes(source, expectedSha256) {
 }
 
 async function main() {
-  const [, , secretName, expectedSha256] = process.argv;
+  const [, , secretName, expectedSha256, environment] = process.argv;
+  const allowedNames =
+    environment === undefined
+      ? PRODUCTION_SECRET_NAMES
+      : environment === "staging"
+        ? STAGING_SECRET_NAMES
+        : new Set();
   if (
-    process.argv.length !== 4 ||
+    (process.argv.length !== 4 && process.argv.length !== 5) ||
     secretName === undefined ||
-    !ALLOWED_SECRET_NAMES.has(secretName) ||
+    !allowedNames.has(secretName) ||
     expectedSha256 === undefined
   ) {
-    throw new Error("usage: put-validated-secret.mjs DEVICE_TOKENS expected-sha256");
+    throw new Error(
+      "usage: put-validated-secret.mjs secret-name expected-sha256 [staging]",
+    );
   }
-  const source = verifiedSecretBytes(await readFile(0), expectedSha256);
+  const source = verifiedSecretBytes(await readStdin(), expectedSha256);
+  const args = ["exec", "wrangler", "secret", "put", secretName];
+  args.push("--env", environment === "staging" ? "staging" : "");
   const result = spawnSync(
     "pnpm",
-    ["exec", "wrangler", "secret", "put", secretName],
-    { input: source, stdio: ["pipe", "inherit", "inherit"] },
+    args,
+    {
+      cwd: fileURLToPath(new URL("..", import.meta.url)),
+      input: source,
+      stdio: ["pipe", "inherit", "inherit"],
+    },
   );
   if (result.error !== undefined) throw result.error;
   if (result.signal !== null) {
     throw new Error(`wrangler secret upload terminated by ${result.signal}`);
   }
   if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
 
 if (

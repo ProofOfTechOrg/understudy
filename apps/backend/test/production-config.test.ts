@@ -4,6 +4,10 @@ import {
   validateProductionExtensionId,
 } from "../scripts/production-config.mjs";
 import { verifiedSecretBytes } from "../scripts/put-validated-secret.mjs";
+import {
+  STAGING_EXTENSION_ID,
+  validateStagingConfiguration,
+} from "../scripts/staging-config.mjs";
 
 const CANARY_DIGEST = "a".repeat(64);
 const DEVICE_ID = "00000000-0000-4000-8000-000000000001";
@@ -29,7 +33,15 @@ describe("production deployment configuration", () => {
         CANARY_DIGEST,
       ),
     ).toEqual({ deviceCount: 1 });
-    expect(validateProductionExtensionId("a".repeat(32))).toBe("a".repeat(32));
+    expect(validateProductionExtensionId("lbmbdjjaodgipnleaggclnobbijpadee")).toBe(
+      "lbmbdjjaodgipnleaggclnobbijpadee",
+    );
+  });
+
+  it("rejects a validly shaped ID that is not the published extension", () => {
+    expect(() => validateProductionExtensionId("a".repeat(32))).toThrow(
+      /published Chrome extension/,
+    );
   });
 
   it("accepts canonical HTTP loopback origins used by local devices", () => {
@@ -93,5 +105,31 @@ describe("production deployment configuration", () => {
         CANARY_DIGEST,
       ),
     ).toThrow(/fields/);
+  });
+});
+
+describe("staging deployment configuration", () => {
+  const valid = {
+    AUTH_HMAC_SECRET: "a".repeat(32),
+    CALLER_TOKENS: "{}",
+    EXTENSION_TOKENS: "{}",
+    DEVICE_TOKENS: "{}",
+    EXTENSION_ID: STAGING_EXTENSION_ID,
+    WS_TICKET_SECRET: "b".repeat(32),
+  };
+
+  it("accepts isolated empty token maps and the pinned staging ID", () => {
+    expect(validateStagingConfiguration(valid)).toEqual(
+      expect.objectContaining({ EXTENSION_ID: expect.stringMatching(/^[0-9a-f]{64}$/) }),
+    );
+  });
+
+  it("rejects production authority and a mismatched extension ID", () => {
+    expect(() =>
+      validateStagingConfiguration({ ...valid, CALLER_TOKENS: '{"token":{}}' }),
+    ).toThrow(/empty JSON object/);
+    expect(() =>
+      validateStagingConfiguration({ ...valid, EXTENSION_ID: "a".repeat(32) }),
+    ).toThrow(/pinned manifest key/);
   });
 });

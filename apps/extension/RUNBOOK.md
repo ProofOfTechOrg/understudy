@@ -16,6 +16,8 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm --filter @understudy/extension test:e2e
+pnpm --filter @understudy/extension build:staging
+pnpm --filter @understudy/extension verify:staging-build
 pnpm --filter @understudy/extension build:store
 pnpm --filter @understudy/extension zip:store
 ```
@@ -30,11 +32,25 @@ events.
 
 1. Build with `pnpm --filter @understudy/extension build:store`.
 2. Open `chrome://extensions`, enable Developer mode, and choose Load unpacked.
-3. Select `apps/extension/.output/chrome-mv3/`.
+3. Select `apps/extension/.output/chrome-mv3-store/`.
 4. Confirm the manifest requests only the expected debugger, storage, alarms,
    side-panel, and canonical-host permissions.
 
 Do not use WXT development mode for release acceptance.
+
+## Verify staging pairing
+
+Use the pinned staging build to test hosted changes before store submission:
+
+1. Build with `pnpm --filter @understudy/extension build:staging`.
+2. Run `pnpm --filter @understudy/extension verify:staging-build`.
+3. Load `apps/extension/.output/chrome-mv3-staging/` through `chrome://extensions`.
+4. Confirm Chrome reports extension ID `ebpcldlibljfjhcfknagjcdmhggeknfc`.
+5. Sign in at `https://staging.understudy.proofof.tech/dashboard` and pair the browser.
+6. Reject pairing messages from production, loopback, query-bearing, fragment-bearing, and trailing-slash sender URLs.
+7. Verify hosted control, OAuth, Model Context Protocol (MCP), dashboard, privacy, and side-panel links remain on staging.
+
+The staging extension retains internal controls and broad host permissions. Do not submit it to the Chrome Web Store.
 
 ## Pair and reconcile policy
 
