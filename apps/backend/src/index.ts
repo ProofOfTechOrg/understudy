@@ -474,6 +474,8 @@ function v2Outcome(
       return c.json({ code: "session_busy", commandId: outcome.commandId }, 429);
     case "not_connected":
       return c.json({ error: "session connection unavailable", sessionId }, 503);
+    case "legacy_snapshot_required":
+      return c.json({ error: "legacy extension requires snapshot compatibility" }, 426);
     case "unsupported":
       return c.json({ error: "extension lacks safe-write-v3" }, 426);
     case "terminal_session":

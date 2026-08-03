@@ -138,6 +138,10 @@ describe("runDispatchLoop", () => {
 
   it.each([
     ["not_connected", { kind: "not_connected" as const, commandId: COMMAND.commandId }],
+    [
+      "legacy_snapshot_required",
+      { kind: "legacy_snapshot_required" as const, commandId: COMMAND.commandId },
+    ],
     ["unsupported", { kind: "unsupported" as const, commandId: COMMAND.commandId }],
     ["id_conflict", { kind: "id_conflict" as const, commandId: COMMAND.commandId }],
   ])("maps %s to a single terminal outcome with no retry", async (kind, step) => {

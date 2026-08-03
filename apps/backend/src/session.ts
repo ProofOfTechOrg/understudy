@@ -349,6 +349,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
     switch (ev.type) {
       case "snapshot_result":
+      case "elements_result":
       case "screenshot_result":
       case "tabs_result":
       case "action_result":
@@ -684,6 +685,23 @@ export class SessionAgent extends Agent<Env, SessionState> {
       (command.type === "list_cards" || command.type === "submit_card") &&
       !(this.state.capabilities ?? []).includes("local-card-vault-v1")
     ) {
+      return { kind: "unsupported", commandId: command.commandId };
+    }
+    if (
+      [
+        "capture_elements",
+        "find_elements",
+        "inspect_elements",
+        "continue_elements",
+      ].includes(command.type) &&
+      !(this.state.capabilities ?? []).includes("semantic-elements-v1")
+    ) {
+      if (
+        command.type === "capture_elements" &&
+        (this.state.protocolVersion ?? 1) < 3
+      ) {
+        return { kind: "legacy_snapshot_required", commandId: command.commandId };
+      }
       return { kind: "unsupported", commandId: command.commandId };
     }
     if (isWriteCommand(command) && !dryRun && this.writesBlocked()) {

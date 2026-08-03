@@ -176,6 +176,7 @@ export type V2DispatchOutcome =
   | { kind: "id_conflict"; commandId: string }
   | { kind: "busy"; commandId: string }
   | { kind: "not_connected"; commandId: string }
+  | { kind: "legacy_snapshot_required"; commandId: string }
   | { kind: "unsupported"; commandId: string }
   | { kind: "terminal_session"; commandId: string };
 

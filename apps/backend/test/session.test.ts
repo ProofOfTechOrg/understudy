@@ -928,6 +928,89 @@ describe("hello resync", () => {
 });
 
 describe("protocol-v3 command result correlation", () => {
+  it("permits legacy snapshot fallback only for a protocol-1/2 peer", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      instance.setState({
+        ...instance.state,
+        mode: "attended",
+        status: "connected",
+        activeConnectionId: FAKE_CONNECTION.id,
+        attachmentId: "attachment",
+        protocolVersion: 2,
+        capabilities: [],
+      });
+      Object.assign(instance, { getConnections: () => [FAKE_CONNECTION] });
+      const dispatchV2 = (
+        instance as unknown as {
+          dispatchV2(
+            command: Command,
+            dryRun: boolean,
+            statusUrl: string,
+          ): Promise<{ kind: string; commandId: string }>;
+        }
+      ).dispatchV2.bind(instance);
+
+      await expect(
+        dispatchV2(
+          {
+            type: "capture_elements",
+            commandId: "legacy-semantic",
+            scope: "viewport",
+            view: "interactive",
+            limit: 80,
+            changesOnly: false,
+          },
+          false,
+          "https://example.test/status",
+        ),
+      ).resolves.toEqual({
+        kind: "legacy_snapshot_required",
+        commandId: "legacy-semantic",
+      });
+    });
+  });
+
+  it("rejects semantic commands when the protocol-3 extension omitted the capability", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      instance.setState({
+        ...instance.state,
+        mode: "attended",
+        status: "connected",
+        activeConnectionId: FAKE_CONNECTION.id,
+        attachmentId: "attachment",
+        protocolVersion: 3,
+        capabilities: ["safe-write-v3"],
+      });
+      Object.assign(instance, { getConnections: () => [FAKE_CONNECTION] });
+      const dispatchV2 = (
+        instance as unknown as {
+          dispatchV2(
+            command: Command,
+            dryRun: boolean,
+            statusUrl: string,
+          ): Promise<{ kind: string; commandId: string }>;
+        }
+      ).dispatchV2.bind(instance);
+
+      await expect(
+        dispatchV2(
+          {
+            type: "capture_elements",
+            commandId: "semantic",
+            scope: "viewport",
+            view: "interactive",
+            limit: 80,
+            changesOnly: false,
+          },
+          false,
+          "https://example.test/status",
+        ),
+      ).resolves.toEqual({ kind: "unsupported", commandId: "semantic" });
+    });
+  });
+
   it("keeps a card submission pending when the result type does not match", async () => {
     const stub = await getSessionStub(crypto.randomUUID());
 

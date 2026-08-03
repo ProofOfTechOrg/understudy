@@ -5,10 +5,10 @@
  *
  *  1. each device's current session binding (survives MCP client reconnects, which
  *     kill the per-connection UnderstudyMcp instance),
- *  2. the ref-staleness guard (refsValid/refsEpoch) — the dominant LLM
- *     failure mode is reusing a generation-scoped ref after navigation, and this
- *     guard turns that into a zero-latency, self-correcting error without
- *     touching the device,
+ *  2. the exact semantic snapshot binding and ref-staleness guard — the
+ *     dominant LLM failure mode is reusing a generation-scoped ref after
+ *     navigation, and this guard turns that into a zero-latency recovery
+ *     result without touching the device,
  *  3. one command at a time per device plus the retry/poll recovery loops
  *     around the service layer's dispatch outcomes.
  *
@@ -21,6 +21,7 @@ import {
   CommandSchema,
   type Command,
   type DialogRecord,
+  type ElementSnapshot,
   type Event,
   type UnattendedSessionLifecycle,
 } from "@understudy/protocol";
@@ -53,9 +54,12 @@ import { canonicalizeOrigins, RequestBodyError, stableJson } from "./validation"
 const CANONICAL_URL = CANONICAL_BASE_URL;
 
 const BINDING_KEY = "binding";
+// Protocol-2 storage keys are read only for one-way migration. Their coarse
+// state is always invalidated rather than treated as a live semantic cache.
 const REFS_VALID_KEY = "refsValid";
 const REFS_EPOCH_KEY = "refsEpoch";
 const REFS_URL_KEY = "refsUrl";
+const SNAPSHOT_BINDING_KEY = "snapshotBinding";
 const PENDING_CREATE_KEY = "pendingCreate";
 
 function sleep(ms: number): Promise<void> {
@@ -105,6 +109,26 @@ export interface RunCommandInput {
   write: boolean;
   usesRef: boolean;
   idempotencyKey?: string;
+  /** Legacy no-argument snapshot fallback when semantic capture is unsupported. */
+  legacyFallback?: CommandDraft;
+}
+
+export interface SnapshotBinding extends ElementSnapshot {
+  url: string;
+  valid: boolean;
+}
+
+function elementsFailureInvalidatesSnapshot(
+  event: Extract<Event, { type: "elements_result"; status: "error" }>,
+): boolean {
+  if (
+    event.reason === "invalid_cursor" ||
+    event.reason === "cursor_expired" ||
+    event.reason === "unsupported"
+  ) {
+    return false;
+  }
+  return event.reason !== "page_too_large" || event.operation === "snapshot";
 }
 
 export interface RunCommandEnvelope {
@@ -124,6 +148,7 @@ export type RunCommandResult =
   | { kind: "id_conflict"; commandId: string }
   | { kind: "busy_exhausted" }
   | { kind: "not_connected" }
+  | { kind: "legacy_snapshot_required" }
   | { kind: "unsupported" }
   | { kind: "terminal_session" };
 
@@ -161,8 +186,7 @@ export type SessionReport =
       profile: string;
       status: string;
       url: string | null;
-      refsValid: boolean;
-      refsEpoch: number;
+      snapshot: SnapshotBinding | null;
       dialogs: DialogRecord[];
       allowedOrigins: string[];
     }
@@ -273,35 +297,79 @@ export class AccountAgent extends DurableObject<Env> {
   }
 
   private async clearBinding(actor: McpActorRef): Promise<void> {
-    await this.ctx.storage.delete(this.key(BINDING_KEY, actor));
-    await this.setRefsValid(actor, false);
+    await this.ctx.storage.delete([
+      this.key(BINDING_KEY, actor),
+      this.key(SNAPSHOT_BINDING_KEY, actor),
+      this.key(REFS_VALID_KEY, actor),
+      this.key(REFS_EPOCH_KEY, actor),
+      this.key(REFS_URL_KEY, actor),
+    ]);
   }
 
-  private async setRefsValid(
+  private async setSnapshotBinding(
     actor: McpActorRef,
-    valid: boolean,
-    bumpEpoch = false,
-    url: string | null = null,
+    binding: SnapshotBinding | null,
   ): Promise<void> {
-    await this.ctx.storage.put(this.key(REFS_VALID_KEY, actor), valid);
-    // The URL the current refs were observed at, so a later click that
-    // navigates can be detected by URL change and invalidate them.
-    await this.ctx.storage.put(this.key(REFS_URL_KEY, actor), url);
-    if (bumpEpoch) {
-      const key = this.key(REFS_EPOCH_KEY, actor);
-      const epoch = (await this.ctx.storage.get<number>(key)) ?? 0;
-      await this.ctx.storage.put(key, epoch + 1);
+    const key = this.key(SNAPSHOT_BINDING_KEY, actor);
+    if (binding === null) await this.ctx.storage.delete(key);
+    else await this.ctx.storage.put(key, binding);
+  }
+
+  private async invalidateSnapshot(actor: McpActorRef): Promise<void> {
+    const current = await this.snapshotState(actor);
+    if (current !== null && current.valid) {
+      await this.setSnapshotBinding(actor, { ...current, valid: false });
     }
   }
 
-  private async refsState(
-    actor: McpActorRef,
-  ): Promise<{ valid: boolean; epoch: number; url: string | null }> {
-    return {
-      valid: (await this.ctx.storage.get<boolean>(this.key(REFS_VALID_KEY, actor))) ?? false,
-      epoch: (await this.ctx.storage.get<number>(this.key(REFS_EPOCH_KEY, actor))) ?? 0,
-      url: (await this.ctx.storage.get<string | null>(this.key(REFS_URL_KEY, actor))) ?? null,
+  private async snapshotState(actor: McpActorRef): Promise<SnapshotBinding | null> {
+    const key = this.key(SNAPSHOT_BINDING_KEY, actor);
+    const current = await this.ctx.storage.get<SnapshotBinding>(key);
+    if (current !== undefined) return current;
+
+    const legacy = await this.ctx.storage.get<unknown>([
+      this.key(REFS_VALID_KEY, actor),
+      this.key(REFS_EPOCH_KEY, actor),
+      this.key(REFS_URL_KEY, actor),
+    ]);
+    const valid = legacy.get(this.key(REFS_VALID_KEY, actor));
+    const epoch = legacy.get(this.key(REFS_EPOCH_KEY, actor));
+    const url = legacy.get(this.key(REFS_URL_KEY, actor));
+    if (valid === undefined && epoch === undefined && url === undefined) return null;
+    const migrated: SnapshotBinding = {
+      id: "legacy-invalidated",
+      generation: typeof epoch === "number" && Number.isInteger(epoch) ? epoch : 0,
+      capturedAt: new Date(0).toISOString(),
+      scope: "document",
+      view: "interactive",
+      coverage: "partial",
+      url: typeof url === "string" ? url : "about:blank",
+      valid: false,
     };
+    await this.ctx.storage.put(key, migrated);
+    await this.ctx.storage.delete([
+      this.key(REFS_VALID_KEY, actor),
+      this.key(REFS_EPOCH_KEY, actor),
+      this.key(REFS_URL_KEY, actor),
+    ]);
+    return migrated;
+  }
+
+  private async reconcileSnapshotUrl(
+    actor: McpActorRef,
+    currentUrl: string | null,
+  ): Promise<SnapshotBinding | null> {
+    const snapshot = await this.snapshotState(actor);
+    if (
+      snapshot !== null &&
+      snapshot.valid &&
+      currentUrl !== snapshot.url
+    ) {
+      const invalidated = { ...snapshot, valid: false };
+      await this.setSnapshotBinding(actor, invalidated);
+      return invalidated;
+    }
+    return snapshot;
   }
 
   async openBrowser(
@@ -430,7 +498,7 @@ export class AccountAgent extends DurableObject<Env> {
       await this.ctx.storage.put(bindingKey, binding);
       await this.ctx.storage.delete(pendingKey);
       // The owned tab starts at about:blank — the model must snapshot first.
-      await this.setRefsValid(actor, false);
+      await this.setSnapshotBinding(actor, null);
       return created.kind === "connected"
         ? { kind: "ready", adopted: false, profile, url: null, allowedOrigins, recovering: false }
         : { kind: "connecting", profile };
@@ -515,7 +583,7 @@ export class AccountAgent extends DurableObject<Env> {
     if (status.status === "closing") {
       return { devices, session: { state: "closing", profile: binding.profile } };
     }
-    const refs = await this.refsState(actor);
+    const snapshot = await this.reconcileSnapshotUrl(actor, status.currentUrl);
     return {
       devices,
       session: {
@@ -523,8 +591,7 @@ export class AccountAgent extends DurableObject<Env> {
         profile: binding.profile,
         status: status.status,
         url: status.currentUrl,
-        refsValid: refs.valid,
-        refsEpoch: refs.epoch,
+        snapshot,
         dialogs: status.dialogs,
         allowedOrigins: binding.allowedOrigins,
       },
@@ -546,15 +613,24 @@ export class AccountAgent extends DurableObject<Env> {
   ): Promise<RunCommandResult> {
     if (binding === undefined) return { kind: "no_session" };
 
+    const svcActor = this.serviceActor(actor);
     let lastUrl: string | null = null;
     if (input.usesRef) {
-      const refs = await this.refsState(actor);
+      const current = await getSessionStatus(this.env, svcActor, binding.sessionId);
+      const knownUrl =
+        current.kind === "ok" &&
+        !current.terminal &&
+        "mode" in current.status &&
+        current.status.mode === "unattended" &&
+        current.status.status === "connected"
+          ? current.status.currentUrl
+          : null;
+      const refs = await this.reconcileSnapshotUrl(actor, knownUrl);
       // Zero-latency hard guard: never send a doomed ref to the device.
-      if (!refs.valid) return { kind: "stale_refs" };
+      if (refs?.valid !== true) return { kind: "stale_refs" };
       lastUrl = refs.url;
     }
 
-    const svcActor = this.serviceActor(actor);
     const salt = input.idempotencyKey ?? crypto.randomUUID();
     const command = await this.buildCommand(binding.sessionId, input, salt);
     const parsed = CommandSchema.safeParse(command);
@@ -568,6 +644,23 @@ export class AccountAgent extends DurableObject<Env> {
 
     const deps = this.dispatchDeps(svcActor, binding.sessionId);
     let result: RunCommandResult = await runDispatchLoop(parsed.data, deps);
+    if (
+      result.kind === "legacy_snapshot_required" &&
+      input.legacyFallback !== undefined
+    ) {
+      const fallback = await this.buildCommand(
+        binding.sessionId,
+        { ...input, draft: input.legacyFallback },
+        crypto.randomUUID(),
+      );
+      const parsedFallback = CommandSchema.safeParse(fallback);
+      if (parsedFallback.success) {
+        result = await runDispatchLoop(parsedFallback.data, deps);
+      }
+    }
+    if (result.kind === "legacy_snapshot_required") {
+      result = { kind: "unsupported" };
+    }
     if (result.kind === "id_conflict" && input.idempotencyKey !== undefined) {
       // The caller-chosen idempotency key collided with a different command
       // body. Retry exactly once under a fresh random identity.
@@ -632,11 +725,11 @@ export class AccountAgent extends DurableObject<Env> {
       // OUTCOME UNKNOWN: the page may have changed under us. Forcing a
       // snapshot before any further ref use makes the "do not retry,
       // observe" instruction enforced rather than merely requested.
-      await this.setRefsValid(actor, false);
+      await this.invalidateSnapshot(actor);
       return;
     }
     if (input.draft.type === "navigate" && result.kind === "pending_exhausted") {
-      await this.setRefsValid(actor, false);
+      await this.invalidateSnapshot(actor);
       return;
     }
     if (result.kind === "terminal_session") {
@@ -649,11 +742,23 @@ export class AccountAgent extends DurableObject<Env> {
       await this.applyCardResultBookkeeping(actor, event);
       return;
     }
-    if (input.draft.type === "snapshot" && event.type === "snapshot_result") {
-      await this.setRefsValid(actor, true, true, event.url);
+    if (await this.applySnapshotResultBookkeeping(actor, event)) return;
+    if (event.type !== "action_result") return;
+    const snapshot = await this.snapshotState(actor);
+    if (
+      event.refsStale === true ||
+      (event.generation !== undefined &&
+        snapshot !== null &&
+        event.generation !== snapshot.generation) ||
+      ["stale_ref", "target_changed", "frame_changed", "page_changed"].includes(
+        event.reason ?? "",
+      ) ||
+      event.error?.startsWith("stale or unknown ref") === true
+    ) {
+      await this.invalidateSnapshot(actor);
       return;
     }
-    if (event.type !== "action_result" || !event.ok) return;
+    if (!event.ok) return;
     // Any successful action that CHANGED the URL invalidates every ref — not
     // just an explicit navigate. A click that navigates is the most common
     // way an LLM moves pages, so the guard must catch it too (D11). The
@@ -661,7 +766,7 @@ export class AccountAgent extends DurableObject<Env> {
     const navigated =
       input.draft.type === "navigate" ||
       (event.url !== undefined && lastUrl !== null && event.url !== lastUrl);
-    if (navigated) await this.setRefsValid(actor, false);
+    if (navigated) await this.invalidateSnapshot(actor);
   }
 
   /** Collects a command previously reported pending and converges local bookkeeping. */
@@ -686,7 +791,7 @@ export class AccountAgent extends DurableObject<Env> {
       case "completed": {
         const event = polled.record.event;
         if (event === undefined) {
-          await this.setRefsValid(actor, false);
+          await this.invalidateSnapshot(actor);
           return { kind: "unknown_outcome" };
         }
         await this.applyPolledEventBookkeeping(actor, event);
@@ -696,7 +801,7 @@ export class AccountAgent extends DurableObject<Env> {
       case "timed_out":
         return { kind: "did_not_run", status: polled.record.status };
       case "unknown":
-        await this.setRefsValid(actor, false);
+        await this.invalidateSnapshot(actor);
         return { kind: "unknown_outcome" };
       default:
         return { kind: "in_progress", status: polled.record.status };
@@ -708,15 +813,75 @@ export class AccountAgent extends DurableObject<Env> {
       await this.applyCardResultBookkeeping(actor, event);
       return;
     }
-    if (event.type === "snapshot_result") {
-      await this.setRefsValid(actor, true, true, event.url);
-      return;
+    if (await this.applySnapshotResultBookkeeping(actor, event)) return;
+    if (event.type !== "action_result") return;
+    const snapshot = await this.snapshotState(actor);
+    if (
+      event.refsStale === true ||
+      (event.generation !== undefined &&
+        snapshot !== null &&
+        event.generation !== snapshot.generation) ||
+      (event.url !== undefined && snapshot !== null && event.url !== snapshot.url)
+    ) {
+      await this.invalidateSnapshot(actor);
     }
-    if (event.type !== "action_result" || !event.ok || event.url === undefined) return;
-    const refs = await this.refsState(actor);
-    if (refs.url !== null && event.url !== refs.url) {
-      await this.setRefsValid(actor, false);
+  }
+
+  private async applySnapshotResultBookkeeping(
+    actor: McpActorRef,
+    event: Event,
+  ): Promise<boolean> {
+    if (event.type === "elements_result") {
+      if (event.status === "ok") {
+        if (event.operation === "inspect" || event.operation === "next") {
+          const current = await this.snapshotState(actor);
+          if (
+            current === null ||
+            current.id !== event.snapshot.id ||
+            current.generation !== event.snapshot.generation ||
+            current.url !== event.url
+          ) {
+            await this.invalidateSnapshot(actor);
+          }
+        } else if (event.operation === "find") {
+          const current = await this.snapshotState(actor);
+          if (
+            current === null ||
+            current.id !== event.snapshot.id ||
+            current.generation !== event.snapshot.generation ||
+            current.url !== event.url
+          ) {
+            await this.setSnapshotBinding(actor, {
+              ...event.snapshot,
+              url: event.url,
+              valid: true,
+            });
+          }
+        } else {
+          await this.setSnapshotBinding(actor, {
+            ...event.snapshot,
+            url: event.url,
+            valid: true,
+          });
+        }
+      } else if (elementsFailureInvalidatesSnapshot(event)) {
+        await this.invalidateSnapshot(actor);
+      }
+      return true;
     }
+    if (event.type !== "snapshot_result") return false;
+    const previous = await this.snapshotState(actor);
+    await this.setSnapshotBinding(actor, {
+      id: `legacy:${event.commandId}`,
+      generation: (previous?.generation ?? 0) + 1,
+      capturedAt: new Date().toISOString(),
+      scope: "document",
+      view: "interactive",
+      coverage: "partial",
+      url: event.url,
+      valid: true,
+    });
+    return true;
   }
 
   private async applyCardResultBookkeeping(
@@ -727,6 +892,6 @@ export class AccountAgent extends DurableObject<Env> {
       await this.clearBinding(actor);
       return;
     }
-    await this.setRefsValid(actor, false);
+    await this.invalidateSnapshot(actor);
   }
 }
