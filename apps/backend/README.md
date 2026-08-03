@@ -17,6 +17,26 @@ The backend is a Cloudflare Worker with Hono, OAuth Provider, Agents SDK Durable
 
 Migrations `v1` through `v4` are additive. Do not remove them during rollback.
 
+## Semantic MCP workflow
+
+The hosted MCP surface returns object-shaped `structuredContent` for every
+tool. Page-derived fields are nested under
+`{ source: "untrusted_page", page: ... }`; the compact text fallback uses a
+random per-result boundary and JSON-quotes page strings.
+
+Use `browser_find` when the target label is known, a viewport-interactive
+`browser_snapshot` for an initial overview, `browser_inspect` for an ambiguous
+target, and `browser_snapshot_next` for more results. After a same-page update,
+request `browser_snapshot({ changesOnly: true })`. Screenshots are for visual
+ambiguity, not routine element discovery.
+
+`AccountAgent` stores the exact snapshot ID, generation, URL, capture time,
+coverage, and validity. Find, inspect, continuation, and scrolling preserve
+that binding. Fresh capture, navigation, target replacement, worker eviction,
+or an unknown write outcome invalidates it. `browser_status` reports the
+last-known binding and never claims that an extension memory cache survived
+eviction.
+
 ## HTTP and MCP surfaces
 
 All `/v1` caller endpoints require `Authorization: Bearer <caller-token>`. Unknown or cross-tenant session IDs return `404`.

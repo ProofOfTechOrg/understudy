@@ -46,9 +46,9 @@ Pairing is approved directly between the Understudy dashboard and the installed 
 
 The optional payment-card vault is stored only in this extension's local IndexedDB. Card fields are encrypted with a non-extractable local key and are never sent to the Understudy backend. Card submission requires both the dashboard origin policy and a separate local payment-origin approval. After card data is inserted, Understudy reports only that the outcome is unknown and closes the controlled tab.
 
-Understudy does not choose tasks or approve actions. Your connected AI client selects page elements and requests actions. You control pairing, allowed origins, local cards, API or OAuth connections, and device revocation.
+Understudy does not choose tasks or approve actions. Your connected AI client selects bounded semantic page elements and requests actions. Element references are opaque and checked again before use; the extension does not expose selectors or automatically redirect an action to a changed target. You control pairing, allowed origins, local cards, API or OAuth connections, and device revocation.
 
-For ordinary browser work the service may handle controlled-tab URLs and titles, website content, accessibility trees, screenshots, dialogs, requested input actions, browser metadata, status, errors, and command results. From payment sensitive-mode entry onward those observation channels are suppressed.
+For ordinary browser work the service may handle controlled-tab URLs and titles, bounded semantic website content, screenshots, dialogs, requested input actions, browser metadata, status, errors, and command results. The extension excludes editable values, raw HTML, selectors, scripts, and arbitrary DOM attributes from semantic results. From payment sensitive-mode entry onward those observation channels are suppressed.
 
 Use a dedicated Chrome profile. Controlled tabs in one profile share that profile's cookies and browser storage. Chrome's debugger banner is process-wide and cannot be suppressed by an extension.
 ```

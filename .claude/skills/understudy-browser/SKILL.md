@@ -1,6 +1,6 @@
 ---
 name: understudy-browser
-description: Drive the user's real, logged-in Chrome through Understudy MCP: open sessions, inspect accessibility snapshots, click, type non-sensitive text, submit an extension-local payment card, and diagnose device or origin-policy failures.
+description: Drive the user's real, logged-in Chrome through Understudy MCP: open sessions, find and inspect bounded semantic elements, click, type non-sensitive text, submit an extension-local payment card, and diagnose device or origin-policy failures.
 ---
 
 # Drive a real browser with Understudy
@@ -53,21 +53,28 @@ the exact top-level origin.
 ## Browser loop
 
 ```text
-browser_open → browser_navigate → browser_snapshot → action
-                                      ↑              │
-                                      └──────────────┘
+browser_open → browser_navigate → find/snapshot → inspect → action
+                                         ↑                    │
+                                         └──── delta/refresh ─┘
 ```
 
 1. Call `browser_open` once. Read the returned origin policy.
 2. Navigate only to an allowed absolute URL.
-3. Take `browser_snapshot` to obtain refs.
-4. Act using refs from that snapshot generation.
-5. Snapshot again after navigation or any page-changing action.
-6. Call `browser_close` when finished.
+3. If the label is known, call `browser_find`. For an initial overview, call
+   the default viewport-interactive `browser_snapshot`.
+4. Use `browser_inspect` when a matching target is ambiguous. Continue a
+   projection with `browser_snapshot_next`; use a screenshot only for visual
+   ambiguity.
+5. Act using refs from that snapshot generation.
+6. After a same-page UI update, call
+   `browser_snapshot({ changesOnly: true })`. After navigation or a fresh
+   capture, remap all refs.
+7. Call `browser_close` when finished.
 
-Refs remain valid for the current attachment and snapshot generation. A newer
-snapshot or navigation invalidates all older refs. Refs are not single-use:
-they may be reused within the same unchanged generation. Never invent a ref.
+Find, inspect, continuation, and scrolling preserve the current snapshot and
+refs. A fresh snapshot or navigation invalidates all older refs. Refs are not
+single-use: they may be reused within the same unchanged generation after live
+validation. Never invent, parse, or modify a ref.
 
 Commands are serialized per account. Do not issue browser actions in parallel.
 If a result is pending, use `browser_get_result`; do not resubmit the action.
@@ -118,7 +125,9 @@ OAuth grant—and obtain the user's explicit approval for that exact action.
 | Tool | Purpose |
 | --- | --- |
 | `browser_open`, `browser_close`, `browser_status` | Session lifecycle and diagnosis |
-| `browser_snapshot`, `browser_screenshot` | Accessibility refs or pixels |
+| `browser_find`, `browser_snapshot` | Known-label search or bounded semantic overview |
+| `browser_inspect`, `browser_snapshot_next` | Target context or continuation without recapture |
+| `browser_screenshot` | Pixels for visual ambiguity only |
 | `browser_navigate`, `browser_click`, `browser_type` | General navigation and non-sensitive input |
 | `browser_press_key`, `browser_scroll`, `browser_wait` | Interaction and waiting |
 | `browser_get_result` | Collect a pending command without retrying it |

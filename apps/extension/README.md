@@ -13,10 +13,39 @@ The Manifest V3 extension controls one attended user tab or at most two extensio
 | `core/session-runtime.ts` | One controlled tab, CDP session, command queue, journal, dialog outbox, and sensitive payment boundary |
 | `payment/card-vault.ts` | AES-GCM envelope format and vault operations |
 | `payment/indexeddb-card-store.ts` | Extension-origin IndexedDB records, key, schema, and local payment origins |
-| `driver/cdp.ts` | CDP actions, refs, navigation containment, popups, and atomic card-field insertion |
+| `driver/cdp.ts` | CDP queue, deadlines, frame sessions, actions, ref validation, navigation containment, and atomic card-field insertion |
+| `driver/semantic/` | Multi-frame hybrid capture, safe normalization, bounded immutable cache, projections, search, inspect, pagination, and deltas |
 | `entrypoints/sidepanel/` | Pairing, hosting state, card enrollment, and local payment-origin editor |
 
 Each unattended lease creates a new unfocused `about:blank` window. The extension never adopts an existing tab for unattended work.
+
+## Semantic element boundary
+
+The extension captures one DOM snapshot per distinct debugger session and one
+AX tree per frame, then stitches same-process frames and OOPIFs in parent-first
+order. DOM capture is used only for backend node identity, tag/type and safe
+form hints, frame ownership, clickability, bounds, and scroll offsets. Raw
+attributes and live input values are discarded during conversion and are
+never cached, logged, persisted, or returned.
+
+The normalized cache is memory-only and capped at 20,000 nodes and 8 MiB of
+page-derived strings. Each result is capped at 200 descriptors and 32 KiB.
+Capture traversals are iterative; an AX surface above the fixed 40,000-node
+work ceiling fails with `page_too_large` before normalization. Nodes within
+that ceiling all reach semantic priority selection, so a late focused or urgent
+node is not discarded by an input-order prefix limit.
+Structural noise and duplicate static text are pruned; editable values, HTML,
+selectors, XPath, IDs, classes, test IDs, scripts, and arbitrary attributes are
+excluded. A failed child-frame capture becomes a bounded partial-coverage
+placeholder rather than disappearing.
+
+Refs are generation-fenced records containing frame/session ownership, allowed
+actions, and an action-specific semantic fingerprint. Before any ref action,
+the extension re-reads one partial AX node and allowlisted DOM metadata. A
+changed, hidden, disabled, readonly, detached, or wrong-frame target returns a
+fixed failure. Generation and frame ownership are checked after live reads,
+and focus/pointer preparation is revalidated before dispatch. The extension
+never retargets or self-heals a failed write.
 
 ## Build and test
 
@@ -31,7 +60,13 @@ pnpm --filter @understudy/extension build:store
 pnpm --filter @understudy/extension zip:store
 ```
 
-`test:e2e` launches local Chrome with the store build, enrolls a synthetic card through the extension messaging boundary, verifies a non-extractable persisted key and encrypted envelope, reloads the extension, deletes the vault, and checks that the synthetic marker did not appear in network, console, or exception events.
+`test:e2e` launches local Chrome with the store build. It verifies bounded
+semantic capture on a 10,000-element document, offscreen find, inspect,
+pagination, same-process and OOPIF frames, shadow DOM, structured deltas, and
+stale refs. It also enrolls and submits a synthetic card through semantic refs,
+verifies a non-extractable persisted key and encrypted envelope, reloads the
+extension, deletes the vault, and checks that the synthetic marker did not
+appear in network, console, or exception events.
 
 Load `.output/chrome-mv3/` for internal testing, `.output/chrome-mv3-staging/` for hosted staging, or `.output/chrome-mv3-store/` for store acceptance. The staging build has the stable extension ID `ebpcldlibljfjhcfknagjcdmhggeknfc` and connects only to `https://staging.understudy.proofof.tech`. The store build connects only to `https://understudy.proofof.tech` and has no pinned key.
 

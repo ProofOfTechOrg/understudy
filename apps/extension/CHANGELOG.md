@@ -7,6 +7,9 @@
 - Add the extension-local AES-GCM payment-card vault, enrollment UI, exact payment-origin policy, and atomic card submission boundary.
 - Add direct dashboard pairing offers, versioned origin-policy acknowledgement, complete assignment and owned-window reconciliation, suspended-session adoption, and attended idle detach fencing.
 - Remove every cloud-vault and secret-fill interface.
+- Add Stagehand-derived multi-frame AX/DOM capture, bounded semantic caches,
+  deterministic find/inspect/pagination/deltas, and live action-fingerprint
+  validation without selectors, editable values, or automatic retargeting.
 
 ## 0.1.2
 

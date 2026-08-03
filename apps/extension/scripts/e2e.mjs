@@ -193,6 +193,7 @@ try {
   );
 
   const browser = { client, worker, panel };
+  await runSemanticElements(browser, localService);
   await runInterruptedPayment(browser, localService, marker, "before-insertion");
   await runInterruptedPayment(browser, localService, marker, "after-insertion");
   await runCheckpointedPayment(browser, localService, marker);
@@ -214,7 +215,7 @@ try {
   );
   assert(!leaked, "card marker escaped through network, console, or exception events");
   process.stdout.write(
-    "extension E2E passed: vault restart, real CDP submission, worker-eviction recovery, deletion, and marker non-egress\n",
+    "extension E2E passed: bounded semantic discovery, frame/shadow capture, deltas, vault restart, real CDP submission, worker-eviction recovery, deletion, and marker non-egress\n",
   );
 } catch (error) {
   if (chromeStderr.length > 0) process.stderr.write(chromeStderr);
@@ -285,6 +286,22 @@ async function startLocalService(directory) {
         "cache-control": "no-store",
       });
       response.end(checkoutPage(url.searchParams.get("stage") ?? "checkpoint"));
+      return;
+    }
+    if (url.pathname === "/semantic") {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+      });
+      response.end(semanticPage(service.origin));
+      return;
+    }
+    if (url.pathname === "/semantic-frame") {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+      });
+      response.end(semanticFramePage(url.searchParams.get("kind") ?? "same"));
       return;
     }
     if (url.pathname === "/signal" && request.method === "POST") {
@@ -447,6 +464,51 @@ function checkoutPage(stage) {
     </body></html>`;
 }
 
+function semanticPage(origin) {
+  const port = new URL(origin).port;
+  const elements = Array.from(
+    { length: 10_000 },
+    (_, index) =>
+      (index + 1) % 20 === 0
+        ? `<button type="button">Fixture button ${index + 1}</button>`
+        : `<div aria-hidden="true"></div>`,
+  ).join("");
+  return `<!doctype html>
+    <html><body>
+      <main>
+        <h1>Semantic element fixture</h1>
+        <div id="status" role="status" aria-live="polite">Waiting for update</div>
+        <button id="update" type="button">Update semantic status</button>
+        <button id="replaceable" type="button">Replaceable target</button>
+        <iframe title="Same-process fixture" src="/semantic-frame?kind=same"></iframe>
+        <iframe title="Cross-origin fixture" src="https://localhost:${port}/semantic-frame?kind=oopif"></iframe>
+        <div id="shadow-host"></div>
+        ${elements}
+        <button type="button">Late offscreen target</button>
+      </main>
+      <script>
+        document.querySelector("#update").addEventListener("click", () => {
+          document.querySelector("#status").textContent = "Semantic status updated";
+        });
+        document.querySelector("#replaceable").addEventListener("mouseenter", (event) => {
+          const replacement = document.createElement("button");
+          replacement.type = "button";
+          replacement.textContent = "Replacement target";
+          event.currentTarget.replaceWith(replacement);
+        }, { once: true });
+        const root = document.querySelector("#shadow-host").attachShadow({ mode: "open" });
+        const shadowButton = document.createElement("button");
+        shadowButton.textContent = "Shadow DOM target";
+        root.append(shadowButton);
+      </script>
+    </body></html>`;
+}
+
+function semanticFramePage(kind) {
+  const name = kind === "oopif" ? "OOPIF frame target" : "Same-process frame target";
+  return `<!doctype html><html><body><button type="button">${name}</button></body></html>`;
+}
+
 function closureFence(frame) {
   return {
     sessionId: frame.sessionId,
@@ -454,6 +516,379 @@ function closureFence(frame) {
     leaseEpoch: frame.leaseEpoch,
     browserEpoch: frame.browserEpoch,
   };
+}
+
+async function provisionScenario(service, label, url) {
+  await service.waitForControl();
+  const sequence = service.events.filter((event) => event.kind === "session_open").length + 1;
+  const scenario = {
+    sequence,
+    sessionId: `${label}-${sequence}`,
+    leaseId: `lease-${label}-${sequence}`,
+    leaseEpoch: 1,
+    browserEpoch: service.browserEpoch(),
+    url,
+  };
+  if (scenario.browserEpoch === null) {
+    throw new Error("device hello did not provide a browser epoch");
+  }
+  let cursor = service.cursor();
+  service.sendControl({
+    type: "provision",
+    ...closureFence(scenario),
+    allowedOrigins: [service.origin],
+    policyVersion: 1,
+    sessionTicket: `session-ticket-${sequence}`,
+  });
+  const provisioned = await service.waitFor(
+    (event) =>
+      event.kind === "control" &&
+      event.frame.type === "provisioned" &&
+      event.frame.sessionId === scenario.sessionId,
+    cursor,
+  );
+  const hello = await service.waitFor(
+    (event) =>
+      event.kind === "session" &&
+      event.sessionId === scenario.sessionId &&
+      event.frame.type === "hello",
+    cursor,
+  );
+  cursor = Math.max(provisioned.index, hello.index) + 1;
+  await writeCommand(service, scenario, {
+    type: "navigate",
+    commandId: `navigate-${sequence}`,
+    tabId: hello.frame.tabs[0].tabId,
+    url,
+  }, cursor, true);
+  await readCommand(service, scenario, {
+    type: "wait",
+    commandId: `wait-idle-${sequence}`,
+    for: "idle",
+  });
+  return { scenario, tabId: hello.frame.tabs[0].tabId };
+}
+
+async function readCommand(service, scenario, command, after = service.cursor()) {
+  service.sendSession(scenario.sessionId, {
+    type: "command",
+    ...commandFence(scenario, `${command.commandId}-attempt`),
+    command,
+  });
+  return service.waitFor(
+    (event) =>
+      event.kind === "session" &&
+      event.sessionId === scenario.sessionId &&
+      event.frame.type === "command_result" &&
+      event.frame.commandId === command.commandId,
+    after,
+  );
+}
+
+function requireElementsResult(result, operation) {
+  const event = result.frame.event;
+  assert(
+    event.type === "elements_result" && event.operation === operation && event.status === "ok",
+    `${operation} did not return a successful semantic result: ${JSON.stringify(event)}`,
+  );
+  return event;
+}
+
+async function runSemanticElements(browser, service) {
+  const { scenario } = await provisionScenario(
+    service,
+    "semantic",
+    `${service.origin}/semantic`,
+  );
+  const initial = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "capture_elements",
+      commandId: `semantic-snapshot-${scenario.sequence}`,
+      scope: "viewport",
+      view: "interactive",
+      limit: 80,
+      changesOnly: false,
+    }),
+    "snapshot",
+  );
+  assert(initial.elements.length <= 80, "default semantic snapshot exceeded 80 descriptors");
+  assert(
+    Buffer.byteLength(JSON.stringify(initial), "utf8") <= 32 * 1024,
+    "default semantic snapshot exceeded 32 KiB",
+  );
+  const paged = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "capture_elements",
+      commandId: `semantic-document-${scenario.sequence}`,
+      scope: "document",
+      view: "interactive",
+      limit: 80,
+      changesOnly: false,
+    }),
+    "snapshot",
+  );
+  assert(
+    Buffer.byteLength(JSON.stringify(paged), "utf8") <= 32 * 1024,
+    "document semantic snapshot exceeded 32 KiB",
+  );
+  assert(paged.page.hasMore && paged.page.cursor, "large document fixture did not paginate");
+  const initialCursor = paged.page.cursor;
+
+  const late = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "find_elements",
+      commandId: `semantic-find-late-${scenario.sequence}`,
+      query: "Late offscreen target",
+      roles: ["button"],
+      match: "exact",
+      includeHidden: false,
+      limit: 20,
+    }),
+    "find",
+  );
+  assert(
+    !JSON.stringify(late).includes("Fixture button 5000"),
+    "offscreen find emitted intervening page content",
+  );
+  const lateRef = late.elements.find((element) => element.name === "Late offscreen target")?.ref;
+  assert(typeof lateRef === "string", "find did not return the late offscreen ref");
+
+  const inspected = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "inspect_elements",
+      commandId: `semantic-inspect-${scenario.sequence}`,
+      ref: lateRef,
+      depth: 3,
+      limit: 80,
+      includeBounds: true,
+    }),
+    "inspect",
+  );
+  assert(
+    inspected.elements.some((element) => element.ref === lateRef && element.relation === "match"),
+    "inspect did not preserve the target ref",
+  );
+  const continued = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "continue_elements",
+      commandId: `semantic-next-${scenario.sequence}`,
+      cursor: initialCursor,
+    }),
+    "next",
+  );
+  assert(continued.snapshot.generation === paged.snapshot.generation, "next reminted refs");
+  const clickLate = await writeCommand(service, scenario, {
+    type: "click",
+    commandId: `semantic-click-late-${scenario.sequence}`,
+    ref: lateRef,
+  }, service.cursor(), true);
+  assert(clickLate.frame.event.ok === true, "find/inspect/next did not preserve a usable ref");
+
+  for (const query of [
+    "Same-process frame target",
+    "OOPIF frame target",
+    "Shadow DOM target",
+  ]) {
+    const found = requireElementsResult(
+      await readCommand(service, scenario, {
+        type: "find_elements",
+        commandId: `semantic-find-${query.toLowerCase().replaceAll(" ", "-")}-${scenario.sequence}`,
+        query,
+        roles: ["button"],
+        match: "exact",
+        includeHidden: false,
+        limit: 20,
+      }),
+      "find",
+    );
+    assert(found.elements.some((element) => element.name === query), `find missed ${query}`);
+  }
+
+  const updater = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "find_elements",
+      commandId: `semantic-find-updater-${scenario.sequence}`,
+      query: "Update semantic status",
+      roles: ["button"],
+      match: "exact",
+      includeHidden: false,
+      limit: 20,
+    }),
+    "find",
+  ).elements.find((element) => element.name === "Update semantic status")?.ref;
+  assert(typeof updater === "string", "find did not return the custom-handler ref");
+  const updateResult = await writeCommand(service, scenario, {
+    type: "click",
+    commandId: `semantic-click-updater-${scenario.sequence}`,
+    ref: updater,
+  }, service.cursor(), true);
+  assert(updateResult.frame.event.ok === true, "custom click handler did not execute");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const delta = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "capture_elements",
+      commandId: `semantic-delta-${scenario.sequence}`,
+      scope: "document",
+      view: "all",
+      limit: 80,
+      changesOnly: true,
+    }),
+    "snapshot",
+  );
+  assert(delta.delta?.applied === true, "same-document semantic delta was not applied");
+  assert(
+    (delta.delta.added + delta.delta.changed + delta.delta.removed) > 0,
+    "same-document semantic delta did not report the status update",
+  );
+  const stale = await writeCommand(service, scenario, {
+    type: "click",
+    commandId: `semantic-click-stale-${scenario.sequence}`,
+    ref: lateRef,
+  }, service.cursor(), true);
+  assert(
+    stale.frame.event.ok === false && stale.frame.event.reason === "stale_ref",
+    "fresh semantic capture did not stale the prior ref",
+  );
+
+  const replaceable = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "find_elements",
+      commandId: `semantic-find-replaceable-${scenario.sequence}`,
+      query: "Replaceable target",
+      roles: ["button"],
+      match: "exact",
+      includeHidden: false,
+      limit: 20,
+    }),
+    "find",
+  ).elements.find((element) => element.name === "Replaceable target")?.ref;
+  assert(typeof replaceable === "string", "find did not return the replaceable ref");
+  const replaced = await writeCommand(service, scenario, {
+    type: "click",
+    commandId: `semantic-click-replaced-${scenario.sequence}`,
+    ref: replaceable,
+  }, service.cursor(), true);
+  assert(
+    replaced.frame.event.ok === false && replaced.frame.event.reason === "target_changed",
+    "a target replaced after pointer movement was not rejected as target_changed",
+  );
+
+  const beforeEviction = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "capture_elements",
+      commandId: `semantic-before-eviction-${scenario.sequence}`,
+      scope: "document",
+      view: "interactive",
+      limit: 1,
+      changesOnly: false,
+    }),
+    "snapshot",
+  );
+  const evictionCursor = beforeEviction.page.cursor;
+  const evictionRef = beforeEviction.elements[0]?.ref;
+  assert(evictionCursor && evictionRef, "worker-eviction fixture did not mint refs and a cursor");
+  const restartCursor = service.cursor();
+  await stopExtensionWorker(browser.client, browser.worker, browser.panel.sessionId);
+  await panelCommand(browser.client, browser.panel.sessionId, { type: "getState" }, "true");
+  browser.worker = await attachWorker(browser.client);
+  await browser.client.call("Runtime.enable", {}, browser.worker.sessionId);
+  await service.waitFor(
+    (event) => event.kind === "control" && event.frame.type === "device_hello",
+    restartCursor,
+  );
+  service.sendControl({
+    type: "provision",
+    ...closureFence(scenario),
+    allowedOrigins: [service.origin],
+    policyVersion: 1,
+    sessionTicket: `semantic-recovery-ticket-${scenario.sequence}`,
+  });
+  await service.waitFor(
+    (event) =>
+      event.kind === "session" &&
+      event.sessionId === scenario.sessionId &&
+      event.frame.type === "hello",
+    restartCursor,
+  );
+
+  const evictedCursor = await readCommand(service, scenario, {
+    type: "continue_elements",
+    commandId: `semantic-evicted-cursor-${scenario.sequence}`,
+    cursor: evictionCursor,
+  });
+  assert(
+    evictedCursor.frame.event.type === "elements_result" &&
+      evictedCursor.frame.event.status === "error" &&
+      evictedCursor.frame.event.reason === "snapshot_expired",
+    "worker eviction did not expire the semantic snapshot behind the cursor",
+  );
+  const evictedRef = await readCommand(service, scenario, {
+    type: "inspect_elements",
+    commandId: `semantic-evicted-ref-${scenario.sequence}`,
+    ref: evictionRef,
+    depth: 3,
+    limit: 80,
+    includeBounds: false,
+  });
+  assert(
+    evictedRef.frame.event.type === "elements_result" &&
+      evictedRef.frame.event.status === "error" &&
+      evictedRef.frame.event.reason === "snapshot_expired",
+    "worker eviction did not expire the semantic snapshot behind the ref",
+  );
+
+  const refreshed = requireElementsResult(
+    await readCommand(service, scenario, {
+      type: "find_elements",
+      commandId: `semantic-find-after-eviction-${scenario.sequence}`,
+      query: "Late offscreen target",
+      roles: ["button"],
+      match: "exact",
+      includeHidden: false,
+      limit: 20,
+    }),
+    "find",
+  );
+  assert(
+    refreshed.snapshot.generation > beforeEviction.snapshot.generation,
+    "find after worker eviction did not mint a newer snapshot generation",
+  );
+
+  const legacy = await readCommand(service, scenario, {
+    type: "snapshot",
+    commandId: `semantic-legacy-baseline-${scenario.sequence}`,
+    mode: "a11y",
+  });
+  assert(
+    legacy.frame.event.type === "snapshot_result",
+    "representative legacy snapshot did not complete",
+  );
+  const legacyBytes = Buffer.byteLength(JSON.stringify(legacy.frame.event), "utf8");
+  const semanticBytes = [initial, paged, beforeEviction].map((event) =>
+    Buffer.byteLength(JSON.stringify(event), "utf8"));
+  assert(
+    semanticBytes.every((bytes) => bytes <= legacyBytes),
+    "a representative semantic result exceeded the legacy renderer",
+  );
+  const reductions = semanticBytes
+    .map((bytes) => 1 - bytes / legacyBytes)
+    .sort((left, right) => left - right);
+  assert(
+    reductions[1] >= 0.7,
+    `semantic median output reduction was below 70%: ${JSON.stringify(reductions)}`,
+  );
+
+  const closeCursor = service.cursor();
+  service.sendControl({ type: "close_lease", ...closureFence(scenario) });
+  await service.waitFor(
+    (event) =>
+      event.kind === "control" &&
+      event.frame.type === "closed" &&
+      event.frame.sessionId === scenario.sessionId,
+    closeCursor,
+  );
+  await waitForManagerIdle(browser.client, browser.panel.sessionId);
 }
 
 async function runInterruptedPayment(browser, service, marker, stage) {
@@ -572,72 +1007,49 @@ async function runCheckpointedPayment(browser, service, marker) {
 }
 
 async function preparePaymentScenario(service, stage) {
-  await service.waitForControl();
-  const sequence = service.events.filter((event) => event.kind === "session_open").length + 1;
-  const sessionId = `payment-${sequence}-${stage}`;
-  const leaseId = `lease-${sequence}-${stage}`;
-  const browserEpoch = service.browserEpoch();
-  if (browserEpoch === null) throw new Error("device hello did not provide a browser epoch");
-  const scenario = {
-    sessionId,
-    leaseId,
-    leaseEpoch: 1,
-    browserEpoch,
-    checkoutUrl: `${service.origin}/checkout?stage=${encodeURIComponent(stage)}`,
-  };
-  let cursor = service.cursor();
-  service.sendControl({
-    type: "provision",
-    ...closureFence(scenario),
-    allowedOrigins: [service.origin],
-    policyVersion: 1,
-    sessionTicket: `session-ticket-${sequence}`,
-  });
-  const provisioned = await service.waitFor(
-    (event) =>
-      event.kind === "control" &&
-      event.frame.type === "provisioned" &&
-      event.frame.sessionId === sessionId,
-    cursor,
+  const checkoutUrl = `${service.origin}/checkout?stage=${encodeURIComponent(stage)}`;
+  const { scenario } = await provisionScenario(
+    service,
+    `payment-${stage}`,
+    checkoutUrl,
   );
-  const hello = await service.waitFor(
-    (event) =>
-      event.kind === "session" &&
-      event.sessionId === sessionId &&
-      event.frame.type === "hello",
-    cursor,
-  );
-  cursor = Math.max(provisioned.index, hello.index) + 1;
-  await writeCommand(service, scenario, {
-    type: "navigate",
-    commandId: `navigate-${sequence}`,
-    tabId: hello.frame.tabs[0].tabId,
-    url: scenario.checkoutUrl,
-  }, cursor, true);
-  cursor = service.cursor();
+  scenario.checkoutUrl = checkoutUrl;
+  const sequence = scenario.sequence;
+  const cursor = service.cursor();
   const snapshotAttemptId = `snapshot-attempt-${sequence}`;
   const snapshotCommandId = `snapshot-${sequence}`;
-  service.sendSession(sessionId, {
+  service.sendSession(scenario.sessionId, {
     type: "command",
     ...commandFence(scenario, snapshotAttemptId),
     command: {
-      type: "snapshot",
+      type: "capture_elements",
       commandId: snapshotCommandId,
-      tabId: hello.frame.tabs[0].tabId,
-      mode: "a11y",
+      scope: "document",
+      view: "all",
+      limit: 80,
+      changesOnly: false,
     },
   });
   const snapshot = await service.waitFor(
     (event) =>
       event.kind === "session" &&
-      event.sessionId === sessionId &&
+      event.sessionId === scenario.sessionId &&
       event.frame.type === "command_result" &&
       event.frame.commandId === snapshotCommandId,
     cursor,
   );
-  const refs = refsByName(snapshot.frame.event.tree);
-  for (const name of ["Cardholder name", "Card number", "Expiration", "CVV", "Submit payment"]) {
-    assert(typeof refs[name] === "string", `snapshot did not expose ${name}`);
+  const semanticSnapshot = requireElementsResult(snapshot, "snapshot");
+  const refs = {};
+  for (const name of ["Expiration", "Cardholder name", "Card number", "CVV", "Submit payment"]) {
+    const requiredAction = name === "Submit payment" ? "click" : "type";
+    const element = semanticSnapshot.elements.find(
+      (candidate) => candidate.name === name && candidate.actions.includes(requiredAction),
+    );
+    assert(
+      typeof element?.ref === "string",
+      `snapshot did not expose an actionable ${name}`,
+    );
+    refs[name] = element.ref;
   }
   scenario.submitAttemptId = `submit-attempt-${sequence}`;
   scenario.submitCommand = {
@@ -651,7 +1063,7 @@ async function preparePaymentScenario(service, stage) {
     submitRef: refs["Submit payment"],
   };
   const prepareCursor = service.cursor();
-  service.sendSession(sessionId, {
+  service.sendSession(scenario.sessionId, {
     type: "write_prepare",
     ...commandFence(scenario, scenario.submitAttemptId),
     commandId: scenario.submitCommand.commandId,
@@ -661,7 +1073,7 @@ async function preparePaymentScenario(service, stage) {
   await service.waitFor(
     (event) =>
       event.kind === "session" &&
-      event.sessionId === sessionId &&
+      event.sessionId === scenario.sessionId &&
       event.frame.type === "write_ready" &&
       event.frame.attemptId === scenario.submitAttemptId,
     prepareCursor,
@@ -726,17 +1138,6 @@ function commandFence(scenario, attemptId) {
     leaseEpoch: scenario.leaseEpoch,
     browserEpoch: scenario.browserEpoch,
   };
-}
-
-function refsByName(tree) {
-  const refs = {};
-  const pending = [...tree];
-  while (pending.length > 0) {
-    const node = pending.pop();
-    if (node?.name && node.ref) refs[node.name] = node.ref;
-    pending.push(...(node?.children ?? []));
-  }
-  return refs;
 }
 
 async function stopExtensionWorker(client, worker, controllerSessionId) {

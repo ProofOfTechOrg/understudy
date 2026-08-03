@@ -168,6 +168,12 @@ Verify these compatibility-deployment properties before the hard cut:
 - Existing non-secret attended reads continue where temporary protocol compatibility allows them
 - The canary device connects only to `https://understudy.proofof.tech`
 - Device inventory reconciles before the backend allocates new work
+- `device_hello` advertises `semantic-elements-v1` before the backend enables
+  semantic MCP tools for the canary
+- `tools/list` exposes input and output schemas for `browser_snapshot`,
+  `browser_find`, `browser_inspect`, and `browser_snapshot_next`
+- Structured output, compact fallback text, find, inspect, continuation,
+  same-document deltas, and stale-ref recovery work in both ChatGPT and Claude
 
 Stop here if the source SHA, active deployment, or canary inventory differs from the recorded evidence.
 
@@ -246,11 +252,19 @@ The canary must pass:
 - Known and ambiguous provisioning failures, close retry, late provision, orphan redelivery, and physical divergence
 - Same-epoch recovery, new-epoch adoption, capacity conflict, 15-minute expiry, worker eviction, and full Chrome restart
 - Attended deliberate detach, debugger detach, stale attachment rejection, and `idle` artifact clearing
+- Bounded semantic capture on a 10,000-element page, offscreen find,
+  same-process iframe, OOPIF, shadow DOM, custom click handlers, pagination,
+  deltas, worker eviction, and replaced-target rejection
 - Vault enrollment, restart persistence, key loss, corruption, deletion, exact-origin intersection, and split or combined expiry mapping
 - Pre-fill `not_started`, post-fill `outcome_unknown`, and tab closure on every sensitive completion path
 - Revoked browser, old epoch, old OAuth props, legacy token, retired route, retired command, and retired MCP-tool rejection
 
-After the first synthetic card byte enters the page, attempt every documented egress path: accessibility, screenshot, dialogs, URL and title, tab metadata, console, exception, network capture, runtime evaluation, clipboard, download, crash report, WebSocket frame, command journal, analytics, and logs. The marker may appear only inside the executor and approved page.
+After the first synthetic card byte enters the page, attempt every documented
+egress path: semantic capture, legacy accessibility capture, screenshot,
+dialogs, URL and title, tab metadata, console, exception, network capture,
+runtime evaluation, clipboard, download, crash report, WebSocket frame,
+command journal, analytics, and logs. The marker may appear only inside the
+executor and approved page.
 
 Stop on any marker egress, page-derived sensitive result, automatic retry after insertion, duplicate window or lease, stale detach acceptance, or credential surviving device revocation.
 

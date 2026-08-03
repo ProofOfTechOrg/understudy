@@ -83,10 +83,20 @@ provider grants through `listUserGrants` and `revokeGrant`.
 ChatGPT and Claude receive the canonical `/mcp` URL and use their documented
 connector UI. CLI/JSON clients use a browser-bound `usk_v2` token.
 
-All page-derived text—URLs, titles, accessibility nodes, dialogs, errors, and
-captions—is delimited as untrusted. Refs are valid for the current attachment
-and snapshot generation. Navigation or a newer snapshot invalidates them; they
-are not consumed by one use.
+All page-derived text, including URLs, titles, semantic elements, legacy
+accessibility nodes, dialogs, errors, and screenshot metadata, is returned as
+untrusted data. Every MCP tool has an output schema and structured content;
+compact text fallbacks use a random boundary and JSON-quoted page strings.
+
+Protocol 3 advertises `semantic-elements-v1`. The extension owns a bounded,
+memory-only normalized cache assembled from per-session DOM capture and
+per-frame AX trees. It exposes deterministic capture, find, inspect,
+continuation, and identity-aware same-document deltas, not raw DOM, selectors,
+XPath, arbitrary attributes, or editable values. A fresh capture or navigation
+invalidates refs; find, inspect, continuation, and scrolling preserve them.
+Every ref action revalidates frame ownership, action capability, live AX state,
+and allowlisted DOM identity. A changed target fails with a fixed reason and is
+never automatically retargeted.
 
 ## Provisioning and physical windows
 

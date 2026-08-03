@@ -23,10 +23,37 @@ pnpm --filter @understudy/extension zip:store
 ```
 
 `test:e2e` uses local Chrome and the existing `ws` package. It loads the store
-build, exercises the real panel message boundary and IndexedDB, verifies a
-non-extractable persisted key and encrypted record, reloads the extension, and
-deletes the vault. No card marker may appear in network, console, or exception
-events.
+build, exercises bounded semantic discovery across large pages, frames, and
+shadow DOM, then exercises the real panel message boundary and IndexedDB. It
+verifies a non-extractable persisted key and encrypted record, reloads the
+extension, and deletes the vault. No card marker may appear in protocol frames,
+network, console, exception, storage, journal, or ordinary log output.
+
+## Verify semantic discovery
+
+1. Confirm `device_hello` advertises `semantic-elements-v1` before enabling the
+   new MCP tools for a canary.
+2. Capture the default viewport-interactive snapshot. It must return at most 80
+   descriptors and 32 KiB, even on the 10,000-element fixture.
+3. Find the late offscreen target by exact label. The result must not emit the
+   intervening fixture text.
+4. Inspect the target and continue the original cursor. Both operations must
+   preserve snapshot ID, generation, and refs without a full capture.
+5. Find targets inside a same-process iframe, a cross-origin OOPIF, and open
+   shadow DOM. An unresolved child frame must produce partial coverage and a
+   bounded placeholder.
+6. Trigger the fixture's custom click handler, then request `changesOnly`. The
+   same loader, URL, and frame topology must produce a structured delta; a
+   navigation must return a normal snapshot with `delta.applied: false`.
+7. Replace or rename a retained target. The old ref must return a fixed stale or
+   target-changed reason and must never dispatch to a replacement.
+8. Evict the extension worker. Old cursors must return `cursor_expired`; old
+   refs must not revive from the persisted generation.
+9. Confirm editable, password, and synthetic card values never appear in
+   protocol events, WSS, MCP output, logs, journals, storage, or analytics.
+10. Enter payment sensitive mode. Semantic capture, find, inspect,
+    continuation, screenshots, page-derived errors, and automatic retry remain
+    unavailable before any page data is read.
 
 ## Load the release build
 
