@@ -3,6 +3,7 @@ import {
   safeParseEvent,
   utf8ByteLength,
   type Command,
+  type ElementsResult,
   type Event,
 } from "@understudy/protocol";
 import type { CdpSession } from "../driver/cdp";
@@ -25,6 +26,49 @@ async function withSession(
     );
   }
   return run(session);
+}
+
+function semanticOperation(
+  command: Command,
+): ElementsResult["operation"] | undefined {
+  switch (command.type) {
+    case "capture_elements":
+      return "snapshot";
+    case "find_elements":
+      return "find";
+    case "inspect_elements":
+      return "inspect";
+    case "continue_elements":
+      return "next";
+    default:
+      return undefined;
+  }
+}
+
+function semanticFailure(
+  commandId: string,
+  operation: ElementsResult["operation"],
+  reason: "capture_failed" | "page_too_large",
+): ElementsResult {
+  return {
+    type: "elements_result",
+    commandId,
+    operation,
+    status: "error",
+    reason,
+    retryable: reason === "capture_failed",
+  };
+}
+
+async function withSemanticSession(
+  session: CdpSession | null,
+  commandId: string,
+  operation: ElementsResult["operation"],
+  run: (session: CdpSession) => Promise<Event>,
+): Promise<Event> {
+  return session === null
+    ? semanticFailure(commandId, operation, "capture_failed")
+    : run(session);
 }
 
 async function routeGetTabs(commandId: string, session: CdpSession | null): Promise<Event> {
@@ -57,6 +101,10 @@ export async function routeCommand(cmd: Command, session: CdpSession | null): Pr
   ) {
     return parsed.data;
   }
+  const operation = semanticOperation(cmd);
+  if (operation !== undefined) {
+    return semanticFailure(cmd.commandId, operation, "page_too_large");
+  }
   return actionError(cmd.commandId, "command result exceeded protocol limits");
 }
 
@@ -83,6 +131,45 @@ async function routeCommandUnchecked(
           cmd.commandId,
           (s) => s.screenshot(cmd.commandId),
           cmd.tabId,
+        );
+      }
+      case "capture_elements": {
+        return await withSemanticSession(session, cmd.commandId, "snapshot", (s) =>
+          s.captureElements(
+            cmd.commandId,
+            cmd.scope,
+            cmd.view,
+            cmd.limit,
+            cmd.changesOnly,
+          ),
+        );
+      }
+      case "find_elements": {
+        return await withSemanticSession(session, cmd.commandId, "find", (s) =>
+          s.findElements(
+            cmd.commandId,
+            cmd.query,
+            cmd.roles,
+            cmd.match,
+            cmd.includeHidden,
+            cmd.limit,
+          ),
+        );
+      }
+      case "inspect_elements": {
+        return await withSemanticSession(session, cmd.commandId, "inspect", (s) =>
+          s.inspectElements(
+            cmd.commandId,
+            cmd.ref,
+            cmd.depth,
+            cmd.limit,
+            cmd.includeBounds,
+          ),
+        );
+      }
+      case "continue_elements": {
+        return await withSemanticSession(session, cmd.commandId, "next", (s) =>
+          s.continueElements(cmd.commandId, cmd.cursor),
         );
       }
       case "navigate": {
@@ -130,6 +217,10 @@ async function routeCommandUnchecked(
       }
     }
   } catch (cause) {
+    const operation = semanticOperation(cmd);
+    if (operation !== undefined) {
+      return semanticFailure(cmd.commandId, operation, "capture_failed");
+    }
     return actionError(cmd.commandId, errorMessage(cause));
   }
 }

@@ -607,7 +607,7 @@ function extractCommandId(raw: unknown): string | null {
 // Generation is bumped exclusively via session.bumpGeneration() (the persisting,
 // monotonic path) — never by mutating session.generation directly.
 async function onCdpEvent(
-  source: { tabId?: number },
+  source: Browser.debugger.DebuggerSession,
   method: string,
   params: unknown,
 ): Promise<void> {
@@ -617,9 +617,25 @@ async function onCdpEvent(
   if (active === null || source.tabId !== active.tabId) return;
   const eventPeer = acceptingPeer;
   try {
+    if (method === "Target.attachedToTarget") {
+      await active.handleAttachedTarget(source.sessionId, params, false);
+      await active.bumpGeneration();
+      return;
+    }
+    if (method === "Target.detachedFromTarget") {
+      if (active.handleDetachedTarget(params)) await active.bumpGeneration();
+      return;
+    }
+    if (method === "Accessibility.nodesUpdated") {
+      if (active.hasMeaningfulAccessibilityUpdate(params, source.sessionId)) {
+        await active.bumpGeneration(true);
+      }
+      return;
+    }
     const decision = classifyCdpEvent(method, params, {
       currentUrl: active.currentUrl,
       mainFrameId: active.mainFrameId,
+      isRootSession: source.sessionId === undefined,
     });
     if (decision.newMainFrameId !== undefined) {
       active.mainFrameId = decision.newMainFrameId;
@@ -631,7 +647,7 @@ async function onCdpEvent(
       active.markLoadStarted();
     }
     if (decision.bumpGeneration === true) {
-      await active.bumpGeneration();
+      await active.bumpGeneration(decision.preserveDeltaBaseline === true);
     }
     if (session !== active) return;
     if (decision.pageEvent?.kind === "load") {
@@ -687,8 +703,8 @@ async function onCdpEvent(
         }`,
       );
     }
-  } catch (cause) {
-    log(`cdp event (${method}) failed: ${errorMessage(cause)}`, "error");
+  } catch {
+    log(`cdp event (${method}) failed`, "error");
   }
 }
 

@@ -1,9 +1,105 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import type { Protocol } from "devtools-protocol";
 import { CdpSession } from "./cdp";
+import type { RefRecord } from "./semantic/types";
 
 const TEST_SCOPE = "test";
 const testRef = (generation: number, sequence: number): string =>
   `a${TEST_SCOPE}:s${generation}e${sequence}`;
+const testRefMap = (
+  entries: ReadonlyArray<readonly [string, number]>,
+  fingerprint: Partial<RefRecord["fingerprint"]> = {},
+): Map<string, RefRecord> =>
+  new Map(
+    entries.map(([ref, backendNodeId]) => [
+      ref,
+      {
+        backendNodeId,
+        frameId: "frame-1",
+        generation: Number(ref.match(/:s(\d+)e/)?.[1] ?? 0),
+        actions: new Set(["click", "type", "key", "scroll", "inspect"]),
+        fingerprint: {
+          role: "textbox",
+          domMetadataKnown: false,
+          hidden: false,
+          disabled: false,
+          readonly: false,
+          editable: true,
+          focusable: true,
+          scrollable: true,
+          ...fingerprint,
+        },
+        identity: `be:root:frame-1:${backendNodeId}`,
+      },
+    ]),
+  );
+function seedTestRefs(
+  session: CdpSession,
+  entries: ReadonlyArray<readonly [string, number]>,
+  fingerprint: Partial<RefRecord["fingerprint"]> = {},
+): void {
+  session.replaceRefMap(testRefMap(entries, fingerprint));
+  session.frameSessions.set("frame-1", {
+    targetId: "frame-1",
+    frameId: "frame-1",
+    targetType: "page",
+    ready: true,
+  });
+}
+
+function liveRefResponse(method: string, params?: { backendNodeId?: number }): unknown {
+  const backendNodeId = params?.backendNodeId ?? 42;
+  if (method === "Accessibility.getPartialAXTree") {
+    return {
+      nodes: [
+        {
+          nodeId: `ax-${backendNodeId}`,
+          ignored: false,
+          role: { type: "role", value: "textbox" },
+          backendDOMNodeId: backendNodeId,
+          properties: [
+            { name: "editable", value: { type: "token", value: "plaintext" } },
+            { name: "focusable", value: { type: "booleanOrUndefined", value: true } },
+            { name: "focused", value: { type: "booleanOrUndefined", value: true } },
+          ],
+        },
+      ],
+    };
+  }
+  if (method === "DOM.describeNode") {
+    return {
+      node: {
+        nodeId: backendNodeId,
+        backendNodeId,
+        nodeType: 1,
+        nodeName: "INPUT",
+        localName: "input",
+        nodeValue: "",
+        attributes: ["type", "text"],
+        isScrollable: true,
+      },
+    };
+  }
+  return {};
+}
+
+function fixedActionFailure(
+  commandId: string,
+  generation: number,
+  reason: "action_failed" | "navigation_blocked" | "timeout" = "action_failed",
+  refsStale = false,
+  refreshRecommended = true,
+): object {
+  return {
+    type: "action_result",
+    commandId,
+    ok: false,
+    reason,
+    generation,
+    refsStale,
+    refreshRecommended,
+  };
+}
 const ACTIONABLE_AX_TREE = [
   {
     nodeId: "root",
@@ -33,7 +129,11 @@ function stubBrowserStorage(): void {
 }
 
 function stubActionBrowser(): ReturnType<typeof vi.fn> {
-  const sendCommand = vi.fn().mockResolvedValue({});
+  const sendCommand = vi
+    .fn()
+    .mockImplementation((_target, method: string, params?: { backendNodeId?: number }) =>
+      Promise.resolve(liveRefResponse(method, params)),
+    );
   vi.stubGlobal("browser", {
     storage: {
       session: {
@@ -58,9 +158,9 @@ afterEach(() => {
 describe("CdpSession.resolveRefCheck", () => {
   it("answers ok:true from the live ref map without bumping the generation", async () => {
     // #given a session whose current generation holds the ref
-    stubBrowserStorage();
+    stubActionBrowser();
     const session = await CdpSession.create(1, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
     const generationBefore = session.generation;
 
     // #when the ref is probed
@@ -68,7 +168,14 @@ describe("CdpSession.resolveRefCheck", () => {
 
     // #then it resolves ok and the generation is untouched (probing must not
     // invalidate the consumer's outstanding refs)
-    expect(event).toEqual({ type: "action_result", commandId: "c1", ok: true });
+    expect(event).toEqual({
+      type: "action_result",
+      commandId: "c1",
+      ok: true,
+      generation: 0,
+      refsStale: false,
+      refreshRecommended: false,
+    });
     expect(session.generation).toBe(generationBefore);
   });
 
@@ -76,7 +183,7 @@ describe("CdpSession.resolveRefCheck", () => {
     // #given a session that has never seen this ref's generation
     stubBrowserStorage();
     const session = await CdpSession.create(1, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
     const generationBefore = session.generation;
 
     // #when a ref from another generation is probed
@@ -87,7 +194,10 @@ describe("CdpSession.resolveRefCheck", () => {
       type: "action_result",
       commandId: "c2",
       ok: false,
-      error: `stale or unknown ref: ${testRef(9, 9)}`,
+      reason: "stale_ref",
+      generation: 0,
+      refsStale: true,
+      refreshRecommended: true,
     });
     expect(session.generation).toBe(generationBefore);
   });
@@ -96,7 +206,7 @@ describe("CdpSession.resolveRefCheck", () => {
     // #given a session whose current generation does not contain this ref
     stubBrowserStorage();
     const session = await CdpSession.create(1, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
 
     // #when a right-generation but unknown ref is probed
     const event = await session.resolveRefCheck("c3", testRef(0, 9));
@@ -106,7 +216,10 @@ describe("CdpSession.resolveRefCheck", () => {
       type: "action_result",
       commandId: "c3",
       ok: false,
-      error: `stale or unknown ref: ${testRef(0, 9)}`,
+      reason: "stale_ref",
+      generation: 0,
+      refsStale: true,
+      refreshRecommended: true,
     });
   });
 
@@ -114,7 +227,7 @@ describe("CdpSession.resolveRefCheck", () => {
     // #given a snapshot occupying the FIFO queue, its AX-tree fetch not yet
     // resolved, and a ref that is valid in the CURRENT (pre-bump) generation
     let releaseTree!: (value: { nodes: unknown[] }) => void;
-    const sendCommand = vi.fn().mockImplementation((_target, method: string) => {
+    const sendCommand = vi.fn().mockImplementation((_target, method: string, params) => {
       if (method === "Accessibility.getFullAXTree") {
         return new Promise((resolve) => {
           releaseTree = resolve;
@@ -127,7 +240,7 @@ describe("CdpSession.resolveRefCheck", () => {
           },
         });
       }
-      return Promise.resolve({});
+      return Promise.resolve(liveRefResponse(method, params));
     });
     vi.stubGlobal("browser", {
       storage: {
@@ -139,7 +252,7 @@ describe("CdpSession.resolveRefCheck", () => {
       debugger: { sendCommand },
     });
     const session = await CdpSession.create(1, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
     const snapshotPromise = session.snapshotA11y("c-snap");
 
     // #when a probe for the pre-bump ref is enqueued behind the snapshot,
@@ -162,7 +275,10 @@ describe("CdpSession.resolveRefCheck", () => {
       type: "action_result",
       commandId: "c-probe",
       ok: false,
-      error: `stale or unknown ref: ${testRef(0, 1)}`,
+      reason: "stale_ref",
+      generation: 1,
+      refsStale: true,
+      refreshRecommended: true,
     });
   });
 });
@@ -171,15 +287,22 @@ describe("CdpSession keyboard dispatch", () => {
   it("submits typed text with Enter's carriage-return key event", async () => {
     const sendCommand = stubActionBrowser();
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
 
     await expect(session.type("c-submit", testRef(0, 1), "secret", true)).resolves.toEqual({
       type: "action_result",
       commandId: "c-submit",
       ok: true,
+      generation: 0,
+      refsStale: false,
+      refreshRecommended: true,
     });
 
-    expect(sendCommand.mock.calls).toEqual([
+    expect(
+      sendCommand.mock.calls
+        .slice(2)
+        .filter((call) => ["DOM.focus", "Input.insertText", "Input.dispatchKeyEvent"].includes(call[1] as string)),
+    ).toEqual([
       [{ tabId: 7 }, "DOM.focus", { backendNodeId: 42 }],
       [{ tabId: 7 }, "Input.insertText", { text: "secret" }],
       [
@@ -212,24 +335,312 @@ describe("CdpSession keyboard dispatch", () => {
   it("does not dispatch a key event when type submit is false", async () => {
     const sendCommand = stubActionBrowser();
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
 
     await session.type("c-no-submit", testRef(0, 1), "plain text", false);
 
-    expect(sendCommand.mock.calls.map((call) => call[1])).toEqual([
-      "DOM.focus",
-      "Input.insertText",
+    expect(
+      sendCommand.mock.calls
+        .slice(2)
+        .map((call) => call[1])
+        .filter((method) => ["DOM.focus", "Input.insertText", "Input.dispatchKeyEvent"].includes(method as string)),
+    ).toEqual(["DOM.focus", "Input.insertText"]);
+  });
+
+  it("allows repeated typing when only the editable value changes", async () => {
+    let liveRead = 0;
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string, params) => {
+      const response = liveRefResponse(method, params);
+      if (method !== "Accessibility.getPartialAXTree") {
+        return Promise.resolve(response);
+      }
+      liveRead += 1;
+      const tree = structuredClone(response) as {
+        nodes: Array<{ value?: { type: string; value: string } }>;
+      };
+      tree.nodes[0]!.value = { type: "string", value: `private-${liveRead}` };
+      return Promise.resolve(tree);
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+
+    await expect(session.type("first", testRef(0, 1), "first")).resolves.toMatchObject({
+      ok: true,
+      refreshRecommended: false,
+    });
+    await expect(session.type("second", testRef(0, 1), "second")).resolves.toMatchObject({
+      ok: true,
+      refreshRecommended: false,
+    });
+    expect(
+      sendCommand.mock.calls
+        .filter((call) => call[1] === "Input.insertText")
+        .map((call) => call[2]),
+    ).toEqual([{ text: "first" }, { text: "second" }]);
+  });
+
+  it("returns target_changed without dispatch when the live semantic identity changed", async () => {
+    const sendCommand = stubActionBrowser();
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]], { name: "Original field" });
+
+    await expect(session.type("changed", testRef(0, 1), "must not type"))
+      .resolves.toEqual({
+        type: "action_result",
+        commandId: "changed",
+        ok: false,
+        reason: "target_changed",
+        generation: 0,
+        refsStale: true,
+        refreshRecommended: true,
+      });
+    expect(
+      sendCommand.mock.calls.some((call) =>
+        ["DOM.focus", "Input.insertText"].includes(call[1] as string),
+      ),
+    ).toBe(false);
+  });
+
+  it("treats a formerly absent AX name as a semantic identity change", async () => {
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string, params) => {
+      const response = liveRefResponse(method, params);
+      if (method !== "Accessibility.getPartialAXTree") {
+        return Promise.resolve(response);
+      }
+      const tree = structuredClone(response) as {
+        nodes: Array<{ name?: { type: string; value: string } }>;
+      };
+      tree.nodes[0]!.name = { type: "computedString", value: "New identity" };
+      return Promise.resolve(tree);
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+
+    await expect(session.type("new-name", testRef(0, 1), "must not type"))
+      .resolves.toMatchObject({ ok: false, reason: "target_changed" });
+    expect(
+      sendCommand.mock.calls.some((call) => call[1] === "Input.insertText"),
+    ).toBe(false);
+  });
+
+  it.each([
+    { propertyName: "disabled", action: "click" as const },
+    { propertyName: "readonly", action: "type" as const },
+    { propertyName: "hidden", action: "click" as const },
+  ])("rejects a live $propertyName target before $action dispatch", async ({
+    propertyName,
+    action,
+  }) => {
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string, params) => {
+      const response = liveRefResponse(method, params);
+      if (method !== "Accessibility.getPartialAXTree") {
+        return Promise.resolve(response);
+      }
+      const tree = structuredClone(response) as {
+        nodes: Array<{ properties: Protocol.Accessibility.AXProperty[] }>;
+      };
+      tree.nodes[0]!.properties.push({
+        name: propertyName,
+        value: { type: "booleanOrUndefined", value: true },
+      } as Protocol.Accessibility.AXProperty);
+      return Promise.resolve(tree);
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+
+    const result =
+      action === "type"
+        ? await session.type("state-change", testRef(0, 1), "blocked")
+        : await session.click("state-change", testRef(0, 1));
+    expect(result).toMatchObject({ ok: false, reason: "target_changed" });
+    expect(
+      sendCommand.mock.calls.some((call) =>
+        ["DOM.focus", "Input.insertText", "Input.dispatchMouseEvent"].includes(
+          call[1] as string,
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a ref whose owning frame changed before live validation", async () => {
+    const sendCommand = stubActionBrowser();
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+    session.frameSessions.delete("frame-1");
+
+    await expect(session.type("wrong-frame", testRef(0, 1), "blocked")).resolves
+      .toMatchObject({ ok: false, reason: "frame_changed" });
+    expect(sendCommand.mock.calls).toHaveLength(0);
+  });
+
+  it("revalidates after focus and refuses insertion into a replaced target", async () => {
+    let liveRead = 0;
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string, params) => {
+      const response = liveRefResponse(method, params);
+      if (method !== "Accessibility.getPartialAXTree") {
+        return Promise.resolve(response);
+      }
+      liveRead += 1;
+      const tree = structuredClone(response) as {
+        nodes: Array<{ name?: { type: string; value: string } }>;
+      };
+      tree.nodes[0]!.name = {
+        type: "computedString",
+        value: liveRead === 1 ? "Stable field" : "Replacement field",
+      };
+      return Promise.resolve(tree);
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]], { name: "Stable field" });
+
+    await expect(session.type("focus-replace", testRef(0, 1), "blocked")).resolves
+      .toMatchObject({ ok: false, reason: "target_changed" });
+    expect(sendCommand.mock.calls.some((call) => call[1] === "Input.insertText")).toBe(false);
+  });
+
+  it("rechecks generation after awaited live reads", async () => {
+    const sendCommand = stubActionBrowser();
+    let session!: CdpSession;
+    sendCommand.mockImplementation((_target, method: string, params) => {
+      if (method === "DOM.describeNode") void session.bumpGeneration();
+      return Promise.resolve(liveRefResponse(method, params));
+    });
+    session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+
+    await expect(session.type("read-race", testRef(0, 1), "blocked")).resolves
+      .toMatchObject({ ok: false, reason: "target_changed", generation: 1 });
+    expect(sendCommand.mock.calls.some((call) => call[1] === "Input.insertText")).toBe(false);
+  });
+
+  it("fails a referenced key without dispatch when DOM focus fails", async () => {
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string, params) =>
+      method === "DOM.focus"
+        ? Promise.reject(new Error("focus failed"))
+        : Promise.resolve(liveRefResponse(method, params)),
+    );
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+
+    await expect(session.key("focus-failed", "Enter", testRef(0, 1))).resolves
+      .toMatchObject({ ok: false, reason: "action_failed" });
+    expect(
+      sendCommand.mock.calls.some((call) => call[1] === "Input.dispatchKeyEvent"),
+    ).toBe(false);
+  });
+
+  it("fails typing without pointer fallback when DOM focus fails", async () => {
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string, params) =>
+      method === "DOM.focus"
+        ? Promise.reject(new Error("focus failed"))
+        : Promise.resolve(liveRefResponse(method, params)),
+    );
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+
+    await expect(session.type("focus-failed", testRef(0, 1), "blocked")).resolves
+      .toMatchObject({ ok: false, reason: "action_failed" });
+    expect(
+      sendCommand.mock.calls.some((call) =>
+        ["Input.dispatchMouseEvent", "Input.insertText"].includes(call[1] as string),
+      ),
+    ).toBe(false);
+  });
+
+  it("invalidates only meaningful AX cache updates and ignores focus-only churn", async () => {
+    stubActionBrowser();
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+
+    expect(
+      session.hasMeaningfulAccessibilityUpdate({
+        nodes: [
+          {
+            nodeId: "ax-42",
+            ignored: false,
+            backendDOMNodeId: 42,
+            properties: [
+              {
+                name: "focused",
+                value: { type: "booleanOrUndefined", value: true },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      session.hasMeaningfulAccessibilityUpdate({
+        nodes: [
+          {
+            nodeId: "ax-42",
+            ignored: false,
+            backendDOMNodeId: 42,
+            name: { type: "computedString", value: "New identity" },
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("revalidates AX-derived scroll capability with the same source policy", async () => {
+    const sendCommand = stubActionBrowser();
+    sendCommand.mockImplementation((_target, method: string, params) => {
+      const response = liveRefResponse(method, params);
+      if (method === "Accessibility.getPartialAXTree") {
+        const tree = structuredClone(response) as {
+          nodes: Array<{ properties?: Array<{ name: string; value: unknown }> }>;
+        };
+        tree.nodes[0]!.properties?.push({
+          name: "scrollable",
+          value: { type: "booleanOrUndefined", value: true },
+        });
+        return Promise.resolve(tree);
+      }
+      if (method === "DOM.describeNode") {
+        const described = structuredClone(response) as {
+          node: { isScrollable?: boolean };
+        };
+        described.node.isScrollable = false;
+        return Promise.resolve(described);
+      }
+      if (method === "DOM.getBoxModel") {
+        return Promise.resolve({
+          model: { content: [0, 0, 20, 0, 20, 20, 0, 20] },
+        });
+      }
+      return Promise.resolve(response);
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
+
+    await expect(session.scroll("ax-scroll", 200, testRef(0, 1))).resolves
+      .toMatchObject({ ok: true });
+    expect(sendCommand.mock.calls).toContainEqual([
+      { tabId: 7 },
+      "Input.dispatchMouseEvent",
+      expect.objectContaining({ type: "mouseWheel", deltaY: 200 }),
     ]);
   });
 
   it("uses the same Enter payload for the explicit key command", async () => {
     const sendCommand = stubActionBrowser();
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
 
     await session.key("c-enter", "Enter", testRef(0, 1));
 
-    expect(sendCommand.mock.calls.slice(1)).toEqual([
+    expect(
+      sendCommand.mock.calls
+        .slice(3)
+        .filter((call) => call[1] === "Input.dispatchKeyEvent"),
+    ).toEqual([
       [
         { tabId: 7 },
         "Input.dispatchKeyEvent",
@@ -281,7 +692,7 @@ describe("CdpSession sensitive payment submission", () => {
   it("prevalidates every ref before issuing any CDP command", async () => {
     const sendCommand = stubActionBrowser();
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 41]]);
+    seedTestRefs(session, [[testRef(0, 1), 41]]);
 
     await expect(
       session.submitSensitiveFields(
@@ -323,7 +734,7 @@ describe("CdpSession sensitive payment submission", () => {
       return Promise.resolve({});
     });
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([
+    seedTestRefs(session, [
       [testRef(0, 1), 41],
       [testRef(0, 2), 42],
       [testRef(0, 3), 43],
@@ -370,7 +781,7 @@ describe("CdpSession sensitive payment submission", () => {
     vi.setSystemTime(new Date("2026-08-31T23:59:59.999Z"));
     let releaseBlocker!: () => void;
     let blocked = false;
-    const sendCommand = vi.fn().mockImplementation((_target, method: string) => {
+    const sendCommand = vi.fn().mockImplementation((_target, method: string, params) => {
       if (method === "DOM.focus" && !blocked) {
         blocked = true;
         return new Promise<void>((resolve) => {
@@ -388,7 +799,7 @@ describe("CdpSession sensitive payment submission", () => {
           },
         });
       }
-      return Promise.resolve({});
+      return Promise.resolve(liveRefResponse(method, params));
     });
     vi.stubGlobal("browser", {
       storage: {
@@ -400,7 +811,7 @@ describe("CdpSession sensitive payment submission", () => {
       debugger: { sendCommand },
     });
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([
+    seedTestRefs(session, [
       [testRef(0, 1), 41],
       [testRef(0, 2), 42],
       [testRef(0, 3), 43],
@@ -452,7 +863,7 @@ describe("CdpSession sensitive payment submission", () => {
       return Promise.resolve({});
     });
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([
+    seedTestRefs(session, [
       [testRef(0, 1), 41],
       [testRef(0, 2), 42],
     ]);
@@ -490,7 +901,7 @@ describe("CdpSession sensitive payment submission", () => {
       return Promise.resolve({});
     });
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([
+    seedTestRefs(session, [
       [testRef(0, 1), 41],
       [testRef(0, 2), 42],
     ]);
@@ -531,7 +942,7 @@ describe("CdpSession sensitive payment submission", () => {
       return Promise.resolve({});
     });
     session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([
+    seedTestRefs(session, [
       [testRef(0, 1), 41],
       [testRef(0, 2), 42],
     ]);
@@ -630,17 +1041,12 @@ describe("CdpSession snapshot target identity", () => {
     });
     stubSnapshotBrowser(sendCommand);
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
 
     const event = await session.snapshotA11y("c-redirect");
 
-    expect(event).toEqual({
-      type: "action_result",
-      commandId: "c-redirect",
-      ok: false,
-      error: "page changed during snapshot",
-    });
-    expect(session.refMap.size).toBe(0);
+    expect(event).toEqual(fixedActionFailure("c-redirect", 1));
+    expect(session.refCount).toBe(0);
     expect(session.generation).toBe(1);
   });
 
@@ -666,12 +1072,9 @@ describe("CdpSession snapshot target identity", () => {
     stubSnapshotBrowser(sendCommand);
     const session = await CdpSession.create(7, TEST_SCOPE);
 
-    await expect(session.snapshotA11y("c-fragment")).resolves.toEqual({
-      type: "action_result",
-      commandId: "c-fragment",
-      ok: false,
-      error: "page changed during snapshot",
-    });
+    await expect(session.snapshotA11y("c-fragment")).resolves.toEqual(
+      fixedActionFailure("c-fragment", 1),
+    );
     expect(session.generation).toBe(1);
   });
 
@@ -696,12 +1099,9 @@ describe("CdpSession snapshot target identity", () => {
     stubSnapshotBrowser(sendCommand);
     const session = await CdpSession.create(7, TEST_SCOPE);
 
-    await expect(session.snapshotA11y("c-loader")).resolves.toEqual({
-      type: "action_result",
-      commandId: "c-loader",
-      ok: false,
-      error: "page changed during snapshot",
-    });
+    await expect(session.snapshotA11y("c-loader")).resolves.toEqual(
+      fixedActionFailure("c-loader", 1),
+    );
   });
 
   it("fails closed when the document generation changes at the same URL during capture", async () => {
@@ -733,12 +1133,7 @@ describe("CdpSession snapshot target identity", () => {
     await session.bumpGeneration();
     releaseTree({ nodes: [] });
 
-    await expect(snapshot).resolves.toEqual({
-      type: "action_result",
-      commandId: "c-generation",
-      ok: false,
-      error: "page changed during snapshot",
-    });
+    await expect(snapshot).resolves.toEqual(fixedActionFailure("c-generation", 1));
   });
 
   it("invalidates prior refs when the artifact capture fails before the closing identity read", async () => {
@@ -757,15 +1152,12 @@ describe("CdpSession snapshot target identity", () => {
     });
     stubSnapshotBrowser(sendCommand);
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
 
-    await expect(session.snapshotA11y("c-capture-failed")).resolves.toEqual({
-      type: "action_result",
-      commandId: "c-capture-failed",
-      ok: false,
-      error: "AX capture failed",
-    });
-    expect(session.refMap.size).toBe(0);
+    await expect(session.snapshotA11y("c-capture-failed")).resolves.toEqual(
+      fixedActionFailure("c-capture-failed", 1),
+    );
+    expect(session.refCount).toBe(0);
     expect(session.generation).toBe(1);
   });
 
@@ -786,15 +1178,12 @@ describe("CdpSession snapshot target identity", () => {
     });
     stubSnapshotBrowser(sendCommand);
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
 
-    await expect(session.snapshotA11y("c-identity-failed")).resolves.toEqual({
-      type: "action_result",
-      commandId: "c-identity-failed",
-      ok: false,
-      error: "identity read failed",
-    });
-    expect(session.refMap.size).toBe(0);
+    await expect(session.snapshotA11y("c-identity-failed")).resolves.toEqual(
+      fixedActionFailure("c-identity-failed", 1),
+    );
+    expect(session.refCount).toBe(0);
     expect(session.generation).toBe(1);
   });
 
@@ -838,14 +1227,9 @@ describe("CdpSession snapshot target identity", () => {
     const navigationBump = session.bumpGeneration();
     releaseFirstWrite();
 
-    await expect(snapshot).resolves.toEqual({
-      type: "action_result",
-      commandId: "c-persist-race",
-      ok: false,
-      error: "page changed during snapshot",
-    });
+    await expect(snapshot).resolves.toEqual(fixedActionFailure("c-persist-race", 2));
     await navigationBump;
-    expect(session.refMap.size).toBe(0);
+    expect(session.refCount).toBe(0);
     expect(session.generation).toBe(2);
   });
 
@@ -879,23 +1263,20 @@ describe("CdpSession snapshot target identity", () => {
     });
     stubSnapshotBrowser(sendCommand);
     const session = await CdpSession.create(7, TEST_SCOPE);
-    session.refMap = new Map([[testRef(0, 1), 42]]);
+    seedTestRefs(session, [[testRef(0, 1), 42]]);
     const snapshot = session.snapshotA11y("c-aggregate-timeout");
 
     await vi.advanceTimersByTimeAsync(25_000);
 
-    await expect(snapshot).resolves.toEqual({
-      type: "action_result",
-      commandId: "c-aggregate-timeout",
-      ok: false,
-      error: "snapshot timed out after 25000ms",
-    });
+    await expect(snapshot).resolves.toEqual(
+      fixedActionFailure("c-aggregate-timeout", 1),
+    );
     expect(sendCommand.mock.calls.map((call) => call[1])).toEqual([
       "Page.getFrameTree",
       "Accessibility.getFullAXTree",
       "Page.getFrameTree",
     ]);
-    expect(session.refMap.size).toBe(0);
+    expect(session.refCount).toBe(0);
 
     // Let the losing browser promise reject after the aggregate race. Vitest
     // treats an unhandled rejection as a test failure.
@@ -912,12 +1293,9 @@ describe("CdpSession snapshot target identity", () => {
 
     await vi.advanceTimersByTimeAsync(25_000);
 
-    await expect(snapshot).resolves.toEqual({
-      type: "action_result",
-      commandId: "c-queued-timeout",
-      ok: false,
-      error: "snapshot timed out after 25000ms",
-    });
+    await expect(snapshot).resolves.toEqual(
+      fixedActionFailure("c-queued-timeout", 0, "timeout", true),
+    );
     expect(sendCommand).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(5_000);
@@ -998,7 +1376,7 @@ describe("CdpSession ref target binding", () => {
     expect(firstRef).toBe("aattachment-a:s1e0");
     expect(secondRef).toBe("aattachment-b:s1e0");
     expect(second.resolveRef(firstRef ?? "")).toBeNull();
-    expect(second.resolveRef(secondRef ?? "")).toBe(42);
+    expect(second.resolveRef(secondRef ?? "")?.backendNodeId).toBe(42);
   });
 
   it("rotates the ref namespace and invalidates the old map at a WS-session barrier", async () => {
@@ -1011,7 +1389,7 @@ describe("CdpSession ref target binding", () => {
     await session.invalidateRefsForSessionChange("session-b");
 
     expect(session.resolveRef(oldRef)).toBeNull();
-    expect(session.refMap.size).toBe(0);
+    expect(session.refCount).toBe(0);
 
     const secondEvent = await session.snapshotA11y("c-second");
     if (secondEvent.type !== "snapshot_result") throw new Error("expected snapshot result");
@@ -1029,14 +1407,14 @@ describe("CdpSession ref target binding", () => {
     });
     const session = await CdpSession.create(7, "session-a");
     const oldRef = "asession-a:s0e0";
-    session.refMap = new Map([[oldRef, 42]]);
+    seedTestRefs(session, [[oldRef, 42]]);
 
     await expect(
       session.invalidateRefsForSessionChange("session-b"),
     ).resolves.toBeUndefined();
 
     expect(session.generation).toBe(1);
-    expect(session.refMap.size).toBe(0);
+    expect(session.refCount).toBe(0);
     expect(session.resolveRef(oldRef)).toBeNull();
   });
 });
@@ -1073,12 +1451,9 @@ describe("CdpSession unattended containment", () => {
     expect(session.isAllowedTopLevelUrl("https://blocked.example/")).toBe(false);
     await expect(
       session.navigate("blocked-nav", "https://blocked.example/"),
-    ).resolves.toEqual({
-      type: "action_result",
-      commandId: "blocked-nav",
-      ok: false,
-      error: "navigation origin is not allowed for this session",
-    });
+    ).resolves.toEqual(
+      fixedActionFailure("blocked-nav", 0, "navigation_blocked", true, false),
+    );
     expect(
       sendCommand.mock.calls.some((call) => call[1] === "Page.navigate"),
     ).toBe(false);
@@ -1196,9 +1571,10 @@ describe("CdpSession unattended containment", () => {
   it("closes a paused related page target before resuming it", async () => {
     const { session, sendCommand } = await containmentSession();
 
-    await session.closePausedRelatedTarget({
+    await session.handleAttachedTarget(undefined, {
+      sessionId: "popup-session",
       targetInfo: { type: "page", targetId: "popup-target" },
-    });
+    }, true);
 
     expect(sendCommand).toHaveBeenCalledWith(
       { tabId: 7 },
@@ -1208,5 +1584,155 @@ describe("CdpSession unattended containment", () => {
     expect(
       sendCommand.mock.calls.some((call) => call[1] === "Runtime.runIfWaitingForDebugger"),
     ).toBe(false);
+  });
+});
+
+describe("CdpSession OOPIF routing", () => {
+  it("initializes nested iframe sessions and routes ref validation and actions through them", async () => {
+    const sendCommand = vi.fn(
+      async (
+        target: { tabId: number; sessionId?: string },
+        method: string,
+        params?: { backendNodeId?: number },
+      ) => {
+        if (method === "Page.getFrameTree") {
+          return {
+            frameTree: {
+              frame: {
+                id: target.sessionId === "child-session" ? "child-frame" : "main-frame",
+                loaderId: "loader",
+                url: "https://example.com/",
+              },
+            },
+          };
+        }
+        if (method === "Accessibility.getPartialAXTree") {
+          return {
+            nodes: [
+              {
+                nodeId: "live-button",
+                ignored: false,
+                role: { type: "role", value: "button" },
+                name: { type: "computedString", value: "Pay" },
+                backendDOMNodeId: params?.backendNodeId,
+                properties: [
+                  {
+                    name: "focusable",
+                    value: { type: "booleanOrUndefined", value: true },
+                  },
+                ],
+              },
+            ],
+          };
+        }
+        if (method === "DOM.describeNode") {
+          return {
+            node: {
+              nodeId: 42,
+              backendNodeId: 42,
+              nodeType: 1,
+              nodeName: "BUTTON",
+              localName: "button",
+              nodeValue: "",
+              attributes: [],
+              isScrollable: false,
+            },
+          };
+        }
+        if (method === "DOM.getBoxModel") {
+          return { model: { content: [0, 0, 10, 0, 10, 10, 0, 10] } };
+        }
+        return {};
+      },
+    );
+    vi.stubGlobal("browser", {
+      storage: {
+        session: {
+          get: vi.fn(async () => ({})),
+          set: vi.fn(async () => {}),
+        },
+      },
+      debugger: { sendCommand },
+    });
+    const session = await CdpSession.create(7, TEST_SCOPE);
+
+    await session.handleAttachedTarget(
+      undefined,
+      {
+        sessionId: "child-session",
+        targetInfo: { type: "iframe", targetId: "child-target" },
+      },
+      false,
+    );
+    session.replaceRefMap(
+      new Map([
+        [
+          testRef(0, 1),
+          {
+            backendNodeId: 42,
+            frameId: "child-frame",
+            debuggerSessionId: "child-session",
+            generation: 0,
+            actions: new Set(["click", "inspect"]),
+            fingerprint: {
+              role: "button",
+              name: "Pay",
+              tagName: "button",
+              domMetadataKnown: true,
+              hidden: false,
+              disabled: false,
+              readonly: false,
+              editable: false,
+              focusable: true,
+              scrollable: false,
+            },
+            identity: "be:child-session:child-frame:42",
+          },
+        ],
+      ]),
+    );
+
+    await expect(session.click("click-child", testRef(0, 1))).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(
+      sendCommand.mock.calls
+        .filter((call) =>
+          [
+            "Accessibility.getPartialAXTree",
+            "DOM.describeNode",
+            "DOM.getBoxModel",
+            "Input.dispatchMouseEvent",
+          ].includes(call[1] as string),
+        )
+        .every((call) => call[0].sessionId === "child-session"),
+    ).toBe(true);
+    expect(
+      sendCommand.mock.calls.some(
+        (call) =>
+          call[1] === "Target.setAutoAttach" &&
+          call[0].sessionId === "child-session",
+      ),
+    ).toBe(true);
+    session.frameSessions.set("grandchild-frame", {
+      sessionId: "grandchild-session",
+      targetId: "grandchild-target",
+      frameId: "grandchild-frame",
+      parentSessionId: "child-session",
+      targetType: "iframe",
+      ready: true,
+    });
+    session.frameSessions.set("great-grandchild-frame", {
+      sessionId: "great-grandchild-session",
+      targetId: "great-grandchild-target",
+      frameId: "great-grandchild-frame",
+      parentSessionId: "grandchild-session",
+      targetType: "iframe",
+      ready: true,
+    });
+    expect(session.handleDetachedTarget({ sessionId: "child-session" })).toBe(true);
+    expect(session.frameSessions.has("child-frame")).toBe(false);
+    expect(session.frameSessions.has("grandchild-frame")).toBe(false);
+    expect(session.frameSessions.has("great-grandchild-frame")).toBe(false);
   });
 });

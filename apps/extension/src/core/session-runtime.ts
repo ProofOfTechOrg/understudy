@@ -8,6 +8,7 @@ import {
   type SessionServerFrame,
   type TabInfo,
 } from "@understudy/protocol";
+import type { Browser } from "wxt/browser";
 import { routeCommand } from "./router";
 import { ReconnectingWs } from "./ws-client";
 import { WriteJournal } from "./write-journal";
@@ -234,7 +235,11 @@ export class SessionRuntime {
     this.peer = null;
   }
 
-  async onCdpEvent(method: string, params: unknown): Promise<void> {
+  async onCdpEvent(
+    source: Browser.debugger.DebuggerSession,
+    method: string,
+    params: unknown,
+  ): Promise<void> {
     const cdp = this.cdp;
     if (cdp === null || !this.host.isCurrent(this)) return;
     if (method === "Fetch.requestPaused") {
@@ -242,12 +247,27 @@ export class SessionRuntime {
       return;
     }
     if (method === "Target.attachedToTarget") {
-      await cdp.closePausedRelatedTarget(params);
+      await cdp.handleAttachedTarget(source.sessionId, params, true);
+      await cdp.bumpGeneration();
+      return;
+    }
+    if (method === "Target.detachedFromTarget") {
+      if (cdp.handleDetachedTarget(params)) await cdp.bumpGeneration();
+      return;
+    }
+    if (method === "Accessibility.nodesUpdated") {
+      if (
+        !this.sensitive &&
+        cdp.hasMeaningfulAccessibilityUpdate(params, source.sessionId)
+      ) {
+        await cdp.bumpGeneration(true);
+      }
       return;
     }
     const decision = classifyCdpEvent(method, params, {
       currentUrl: cdp.currentUrl,
       mainFrameId: cdp.mainFrameId,
+      isRootSession: source.sessionId === undefined,
     });
     await this.applyCdpDecision(cdp, decision);
     if (this.sensitive) {
@@ -302,7 +322,9 @@ export class SessionRuntime {
     if (decision.newMainFrameId !== undefined) cdp.mainFrameId = decision.newMainFrameId;
     if (decision.newUrl !== undefined) cdp.currentUrl = decision.newUrl;
     if (decision.loadStarted === true) cdp.markLoadStarted();
-    if (decision.bumpGeneration === true) await cdp.bumpGeneration();
+    if (decision.bumpGeneration === true) {
+      await cdp.bumpGeneration(decision.preserveDeltaBaseline === true);
+    }
     if (decision.pageEvent?.kind === "load") cdp.notifyLoadEventFired();
   }
 
@@ -649,6 +671,15 @@ export class SessionRuntime {
         return cardResult(command.commandId, "not_started", "stale_ref");
       }
       if (expired()) return expirePayment();
+      if (
+        !(await cdp.preflightSensitiveRefs(
+          paymentFieldRefs(command),
+          command.submitRef,
+        ))
+      ) {
+        return cardResult(command.commandId, "not_started", "stale_ref");
+      }
+      if (expired()) return expirePayment();
 
       cdp.pinSensitiveOrigin(origin);
       this.sensitive = true;
@@ -748,6 +779,12 @@ function deadline(value: string): number {
 }
 
 function paymentRefs(command: Extract<Command, { type: "submit_card" }>): string[] {
+  return [...paymentFieldRefs(command), command.submitRef];
+}
+
+function paymentFieldRefs(
+  command: Extract<Command, { type: "submit_card" }>,
+): string[] {
   return [
     command.numberRef,
     ...(command.expiry.kind === "combined"
@@ -755,7 +792,6 @@ function paymentRefs(command: Extract<Command, { type: "submit_card" }>): string
       : [command.expiry.monthRef, command.expiry.yearRef]),
     command.cvvRef,
     ...(command.cardholderNameRef === undefined ? [] : [command.cardholderNameRef]),
-    command.submitRef,
   ];
 }
 

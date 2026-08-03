@@ -356,14 +356,14 @@ export class SessionManager implements RuntimeHost {
   }
 
   async onCdpEvent(
-    source: { tabId?: number },
+    source: Browser.debugger.DebuggerSession,
     method: string,
     params: unknown,
   ): Promise<void> {
     if (source.tabId === undefined) return;
     const runtime = this.byTab.get(source.tabId);
     if (runtime === undefined) return;
-    await runtime.onCdpEvent(method, params);
+    await runtime.onCdpEvent(source, method, params);
   }
 
   async onDebuggerDetach(source: { tabId?: number }): Promise<void> {

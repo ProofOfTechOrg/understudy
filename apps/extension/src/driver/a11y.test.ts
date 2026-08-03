@@ -187,13 +187,14 @@ describe("buildA11ySnapshot", () => {
     expect(topButton?.children).toBeUndefined();
   });
 
-  it("carries role/name/value and leaves a missing name undefined", () => {
+  it("carries role/name but never exposes AX values", () => {
     const { tree } = buildA11ySnapshot(FIXTURE, {
       scopeId: "fixture",
       generation: 4,
     });
     const textbox = tree.find((node) => node.role === "textbox");
-    expect(textbox).toMatchObject({ role: "textbox", name: "Search", value: "hello" });
+    expect(textbox).toMatchObject({ role: "textbox", name: "Search" });
+    expect(textbox?.value).toBeUndefined();
     const heading = tree.find((node) => node.role === "heading");
     expect(heading?.name).toBeUndefined();
     expect(heading?.value).toBeUndefined();

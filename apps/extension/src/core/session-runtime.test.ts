@@ -244,7 +244,7 @@ describe("SessionRuntime dialog handling", () => {
       send,
     });
 
-    const handling = runtime.onCdpEvent("Page.javascriptDialogOpening", {
+    const handling = runtime.onCdpEvent({ tabId: 7 }, "Page.javascriptDialogOpening", {
       type: "confirm",
       message: "Continue?",
       url: "https://example.com/",
@@ -349,7 +349,7 @@ describe("SessionRuntime payment boundary", () => {
       peer: { send: peerSend },
     });
 
-    await runtime.onCdpEvent("Page.frameNavigated", {
+    await runtime.onCdpEvent({ tabId: 7 }, "Page.frameNavigated", {
       frame: { id: "main", url: "https://example.com/changed" },
     });
 
@@ -359,6 +359,25 @@ describe("SessionRuntime payment boundary", () => {
     expect(runtimeHost.onTabChanged).not.toHaveBeenCalled();
   });
 
+  it("does not inspect AX mutation payloads or advance generation in sensitive mode", async () => {
+    stubBrowser(async () => {});
+    const runtime = new SessionRuntime(ASSIGNMENT, paymentHost());
+    const cdp = {
+      hasMeaningfulAccessibilityUpdate: vi.fn(() => true),
+      bumpGeneration: vi.fn(async () => 2),
+    };
+    Object.assign(runtime, { sensitive: true, cdp });
+
+    await runtime.onCdpEvent(
+      { tabId: 7 },
+      "Accessibility.nodesUpdated",
+      { nodes: [{ name: { value: "must not be read" } }] },
+    );
+
+    expect(cdp.hasMeaningfulAccessibilityUpdate).not.toHaveBeenCalled();
+    expect(cdp.bumpGeneration).not.toHaveBeenCalled();
+  });
+
   it("rejects duplicate mappings, unapproved origins, and stale refs before sensitive mode", async () => {
     stubBrowser(async () => {});
     const runtimeHost = paymentHost();
@@ -366,6 +385,7 @@ describe("SessionRuntime payment boundary", () => {
     const cdp = {
       currentUrl: "https://example.com/checkout",
       hasCurrentRefs: vi.fn(() => true),
+      preflightSensitiveRefs: vi.fn(async () => true),
     } as unknown as CdpSession;
 
     await expect(
@@ -433,6 +453,7 @@ describe("SessionRuntime payment boundary", () => {
     const cdp = {
       currentUrl: "https://example.com/checkout",
       hasCurrentRefs: vi.fn(() => true),
+      preflightSensitiveRefs: vi.fn(async () => true),
       pinSensitiveOrigin: vi.fn(() => order.push("pin")),
       stopPendingSensitiveNavigation: vi.fn(async () => {
         order.push("stop-navigation");
@@ -484,6 +505,7 @@ describe("SessionRuntime payment boundary", () => {
     const cdp = {
       currentUrl: "https://example.com/checkout",
       hasCurrentRefs: vi.fn(() => true),
+      preflightSensitiveRefs: vi.fn(async () => true),
       pinSensitiveOrigin: vi.fn(),
       stopPendingSensitiveNavigation: vi.fn(async () => true),
       submitSensitiveFields,
@@ -530,6 +552,7 @@ describe("SessionRuntime payment boundary", () => {
     const cdp = {
       currentUrl: "https://example.com/checkout",
       hasCurrentRefs: vi.fn(() => true),
+      preflightSensitiveRefs: vi.fn(async () => true),
       pinSensitiveOrigin: vi.fn(),
       stopPendingSensitiveNavigation: vi.fn(async () => true),
       submitSensitiveFields: vi.fn(
@@ -572,6 +595,7 @@ describe("SessionRuntime payment boundary", () => {
     const before = {
       currentUrl: "https://example.com/checkout",
       hasCurrentRefs: vi.fn(() => true),
+      preflightSensitiveRefs: vi.fn(async () => true),
       pinSensitiveOrigin: vi.fn(),
       stopPendingSensitiveNavigation: vi.fn(async () => true),
       submitSensitiveFields: vi.fn(async () => ({
@@ -625,6 +649,7 @@ describe("SessionRuntime payment boundary", () => {
     const after = {
       currentUrl: "https://example.com/checkout",
       hasCurrentRefs: vi.fn(() => true),
+      preflightSensitiveRefs: vi.fn(async () => true),
       submitSensitiveFields: vi.fn(
         async (
           _fields: unknown,
@@ -656,6 +681,7 @@ describe("SessionRuntime payment boundary", () => {
     const cdp = {
       currentUrl: "https://example.com/checkout",
       hasCurrentRefs: vi.fn(() => true),
+      preflightSensitiveRefs: vi.fn(async () => true),
       pinSensitiveOrigin: vi.fn(),
       stopPendingSensitiveNavigation: vi.fn(async () => true),
       submitSensitiveFields: vi.fn(async (mapped: Array<{ ref: string; text: string }>) => {
@@ -719,6 +745,7 @@ describe("SessionRuntime payment boundary", () => {
       cdp: {
         currentUrl: "https://example.com/checkout",
         hasCurrentRefs: vi.fn(() => true),
+        preflightSensitiveRefs: vi.fn(async () => true),
         pinSensitiveOrigin: vi.fn(),
         stopPendingSensitiveNavigation: vi.fn(async () => true),
         submitSensitiveFields: vi.fn(
@@ -806,6 +833,7 @@ describe("SessionRuntime payment boundary", () => {
       cdp: {
         currentUrl: "https://example.com/checkout",
         hasCurrentRefs: vi.fn(() => true),
+        preflightSensitiveRefs: vi.fn(async () => true),
         pinSensitiveOrigin: vi.fn(),
         stopPendingSensitiveNavigation: vi.fn(async () => true),
         submitSensitiveFields: vi.fn(async () => ({
