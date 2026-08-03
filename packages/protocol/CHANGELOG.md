@@ -1,5 +1,17 @@
 # @understudy/protocol
 
+## 0.9.0
+
+### Minor Changes
+
+- Add the `semantic-elements-v1` capability, strict bounded capture, find,
+  inspect, continuation, descriptor, delta, and fixed failure contracts.
+- Extend protocol-3 action results with generation, ref validity, refresh
+  guidance, and fixed failure reasons while retaining legacy wire errors.
+- Add protocol-3 device policy, physical-window inventory, suspended-session
+  adoption, attended-idle, and extension-local payment-card contracts; remove
+  the cloud-secret command.
+
 ## 0.8.0
 
 ### Minor Changes

@@ -4,6 +4,9 @@ export const PROTOCOL_VERSION = 3 as const;
 export const COMMAND_HTTP_BODY_MAX_BYTES = 128 * 1024;
 export const DEVICE_CONTROL_FRAME_MAX_BYTES = 64 * 1024;
 export const SESSION_RESULT_FRAME_MAX_BYTES = 16 * 1024 * 1024;
+export const ELEMENTS_RESULT_MAX_BYTES = 32 * 1024;
+export const MAX_ELEMENT_DESCRIPTORS = 200;
+export const MAX_SEMANTIC_NODES = 20_000;
 export const MAX_A11Y_NODES = 5_000;
 export const MAX_A11Y_DEPTH = 64;
 export const WS_CLOSE_REPLACED = 4001;
@@ -17,7 +20,7 @@ const utf8String = (maxBytes: number) =>
     }
   });
 const IdSchema = z.string().min(1).max(128);
-const RefSchema = z.string().min(1).max(256);
+export const RefSchema = z.string().min(1).max(256);
 export const CardAliasSchema = z
   .string()
   .min(1)
@@ -94,6 +97,167 @@ export const SnapshotTargetSchema = strictObject({
 });
 export type SnapshotTarget = z.infer<typeof SnapshotTargetSchema>;
 
+export const ElementScopeSchema = z.enum(["viewport", "document"]);
+export type ElementScope = z.infer<typeof ElementScopeSchema>;
+
+export const ElementViewSchema = z.enum(["interactive", "content", "all"]);
+export type ElementView = z.infer<typeof ElementViewSchema>;
+
+export const ElementOperationSchema = z.enum(["snapshot", "find", "inspect", "next"]);
+export type ElementOperation = z.infer<typeof ElementOperationSchema>;
+
+export const ElementActionSchema = z.enum(["click", "type", "key", "scroll", "inspect"]);
+export type ElementAction = z.infer<typeof ElementActionSchema>;
+
+export const ElementVisibilitySchema = z.enum([
+  "viewport",
+  "offscreen",
+  "hidden",
+  "unknown",
+]);
+export type ElementVisibility = z.infer<typeof ElementVisibilitySchema>;
+
+const ElementStringSchema = utf8String(512);
+const OptionalBooleanOrMixedSchema = z.union([z.boolean(), z.literal("mixed")]);
+
+export const ElementDescriptorSchema = strictObject({
+  ref: RefSchema.optional(),
+  role: ElementStringSchema.min(1),
+  category: z.enum(["interactive", "content", "structure", "status"]),
+  name: ElementStringSchema.optional(),
+  description: ElementStringSchema.optional(),
+  depth: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+  visibility: ElementVisibilitySchema,
+  actions: z.array(ElementActionSchema).max(ElementActionSchema.options.length),
+  states: strictObject({
+    disabled: z.boolean().optional(),
+    readonly: z.boolean().optional(),
+    required: z.boolean().optional(),
+    invalid: z.boolean().optional(),
+    checked: OptionalBooleanOrMixedSchema.optional(),
+    selected: z.boolean().optional(),
+    expanded: z.boolean().optional(),
+    pressed: OptionalBooleanOrMixedSchema.optional(),
+    focused: z.boolean().optional(),
+    level: NonnegativeIntSchema.optional(),
+    modal: z.boolean().optional(),
+    hasPopup: utf8String(128).optional(),
+  }).optional(),
+  form: strictObject({
+    inputType: utf8String(128).optional(),
+    placeholder: ElementStringSchema.optional(),
+    autocomplete: ElementStringSchema.optional(),
+  }).optional(),
+  range: strictObject({
+    min: z.number().finite().optional(),
+    max: z.number().finite().optional(),
+    now: z.number().finite().optional(),
+    text: ElementStringSchema.optional(),
+  }).optional(),
+  bounds: strictObject({
+    x: z.number().finite(),
+    y: z.number().finite(),
+    width: z.number().finite().nonnegative(),
+    height: z.number().finite().nonnegative(),
+  }).optional(),
+  relation: z.enum(["match", "ancestor", "sibling", "descendant"]).optional(),
+  change: z.enum(["added", "changed", "removed", "unchanged_context"]).optional(),
+});
+export type ElementDescriptor = z.infer<typeof ElementDescriptorSchema>;
+
+export const ElementSnapshotSchema = strictObject({
+  id: IdSchema,
+  generation: NonnegativeIntSchema,
+  capturedAt: TimestampSchema,
+  scope: ElementScopeSchema,
+  view: ElementViewSchema,
+  coverage: z.enum(["complete", "partial"]),
+});
+export type ElementSnapshot = z.infer<typeof ElementSnapshotSchema>;
+
+export const ElementsFailureReasonSchema = z.enum([
+  "capture_failed",
+  "page_changed",
+  "page_too_large",
+  "stale_ref",
+  "target_changed",
+  "frame_changed",
+  "snapshot_expired",
+  "cursor_expired",
+  "invalid_cursor",
+  "sensitive_mode",
+  "unsupported",
+]);
+export type ElementsFailureReason = z.infer<typeof ElementsFailureReasonSchema>;
+
+const ElementsResultSuccessSchema = strictObject({
+  type: z.literal("elements_result"),
+  commandId: IdSchema,
+  operation: ElementOperationSchema,
+  status: z.literal("ok"),
+  tabId: NonnegativeIntSchema,
+  url: UrlStringSchema,
+  snapshot: ElementSnapshotSchema,
+  elements: z.array(ElementDescriptorSchema).max(MAX_ELEMENT_DESCRIPTORS),
+  page: strictObject({
+    returned: NonnegativeIntSchema.max(MAX_ELEMENT_DESCRIPTORS),
+    available: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+    hasMore: z.boolean(),
+    cursor: z.string().min(1).max(128).optional(),
+  }),
+  delta: strictObject({
+    requested: z.boolean(),
+    applied: z.boolean(),
+    added: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+    changed: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+    removed: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+  }).optional(),
+}).superRefine((result, ctx) => {
+  if (result.page.returned !== result.elements.length) {
+    ctx.addIssue({ code: "custom", path: ["page", "returned"], message: "returned mismatch" });
+  }
+  if (result.page.hasMore !== (result.page.cursor !== undefined)) {
+    ctx.addIssue({ code: "custom", path: ["page", "cursor"], message: "cursor/hasMore mismatch" });
+  }
+  if (result.delta !== undefined && result.operation !== "snapshot") {
+    ctx.addIssue({ code: "custom", path: ["delta"], message: "delta is snapshot-only" });
+  }
+  if (utf8ByteLength(JSON.stringify(result)) > ELEMENTS_RESULT_MAX_BYTES) {
+    ctx.addIssue({ code: "custom", message: `elements result exceeds ${ELEMENTS_RESULT_MAX_BYTES} bytes` });
+  }
+});
+
+const ElementsResultErrorSchema = strictObject({
+  type: z.literal("elements_result"),
+  commandId: IdSchema,
+  operation: ElementOperationSchema,
+  status: z.literal("error"),
+  reason: ElementsFailureReasonSchema,
+  retryable: z.boolean(),
+});
+
+export const ElementsResultSchema = z.discriminatedUnion("status", [
+  ElementsResultSuccessSchema,
+  ElementsResultErrorSchema,
+]);
+export type ElementsResult = z.infer<typeof ElementsResultSchema>;
+
+export const ActionFailureReasonSchema = z.enum([
+  "no_session",
+  "tab_mismatch",
+  "stale_ref",
+  "target_changed",
+  "frame_changed",
+  "sensitive_mode",
+  "unsupported",
+  "navigation_blocked",
+  "page_changed",
+  "timeout",
+  "action_failed",
+  "result_too_large",
+]);
+export type ActionFailureReason = z.infer<typeof ActionFailureReasonSchema>;
+
 export const DialogTypeSchema = z.enum(["alert", "confirm", "prompt", "beforeunload"]);
 export type DialogType = z.infer<typeof DialogTypeSchema>;
 
@@ -140,6 +304,36 @@ export const CommandSchema = z.discriminatedUnion("type", [
     ...CommandBase,
     mode: SnapshotModeSchema,
     tabId: NonnegativeIntSchema.optional(),
+  }),
+  strictObject({
+    type: z.literal("capture_elements"),
+    ...CommandBase,
+    scope: ElementScopeSchema,
+    view: ElementViewSchema,
+    limit: z.number().int().min(1).max(MAX_ELEMENT_DESCRIPTORS),
+    changesOnly: z.boolean(),
+  }),
+  strictObject({
+    type: z.literal("find_elements"),
+    ...CommandBase,
+    query: utf8String(256).min(1),
+    roles: z.array(utf8String(256).min(1)).max(8),
+    match: z.enum(["contains", "exact"]),
+    includeHidden: z.boolean(),
+    limit: z.number().int().min(1).max(50),
+  }),
+  strictObject({
+    type: z.literal("inspect_elements"),
+    ...CommandBase,
+    ref: RefSchema,
+    depth: z.number().int().min(0).max(8),
+    limit: z.number().int().min(1).max(MAX_ELEMENT_DESCRIPTORS),
+    includeBounds: z.boolean(),
+  }),
+  strictObject({
+    type: z.literal("continue_elements"),
+    ...CommandBase,
+    cursor: z.string().min(1).max(128),
   }),
   strictObject({
     type: z.literal("navigate"),
@@ -216,6 +410,7 @@ export const PROTOCOL_CAPABILITIES = [
   "local-card-vault-v1",
   "device-policy-v1",
   "owned-window-inventory-v1",
+  "semantic-elements-v1",
 ] as const;
 export const ProtocolCapabilitySchema = z.enum(PROTOCOL_CAPABILITIES);
 export type ProtocolCapability = z.infer<typeof ProtocolCapabilitySchema>;
@@ -225,6 +420,7 @@ export const ATTENDED_PROTOCOL_CAPABILITIES = [
   "command-status-v3",
   "dialog-ack-v3",
   "single-owned-tab-v3",
+  "semantic-elements-v1",
 ] as const satisfies readonly ProtocolCapability[];
 
 const HelloEventSchema = strictObject({
@@ -265,7 +461,24 @@ const HelloEventSchema = strictObject({
   }
 });
 
-export const EventSchema = z.discriminatedUnion("type", [
+const ActionResultSchema = strictObject({
+  type: z.literal("action_result"),
+  ...CommandBase,
+  ok: z.boolean(),
+  reason: ActionFailureReasonSchema.optional(),
+  generation: NonnegativeIntSchema.optional(),
+  refsStale: z.boolean().optional(),
+  refreshRecommended: z.boolean().optional(),
+  error: utf8String(4 * 1024).optional(),
+  url: UrlStringSchema.optional(),
+  simulated: z.boolean().optional(),
+}).superRefine((result, ctx) => {
+  if (result.ok && result.reason !== undefined) {
+    ctx.addIssue({ code: "custom", path: ["reason"], message: "successful action cannot have a failure reason" });
+  }
+});
+
+export const EventSchema = z.union([
   HelloEventSchema,
   strictObject({
     type: z.literal("snapshot_result"),
@@ -285,14 +498,8 @@ export const EventSchema = z.discriminatedUnion("type", [
     ...CommandBase,
     tabs: z.array(TabInfoSchema).max(1),
   }),
-  strictObject({
-    type: z.literal("action_result"),
-    ...CommandBase,
-    ok: z.boolean(),
-    error: utf8String(4 * 1024).optional(),
-    url: UrlStringSchema.optional(),
-    simulated: z.boolean().optional(),
-  }),
+  ActionResultSchema,
+  ElementsResultSchema,
   strictObject({
     type: z.literal("cards_result"),
     ...CommandBase,
@@ -339,6 +546,10 @@ export type EventType = Event["type"];
 
 const COMMAND_RESULT_EVENT_TYPES = {
   snapshot: ["snapshot_result", "screenshot_result", "action_result"],
+  capture_elements: ["elements_result"],
+  find_elements: ["elements_result"],
+  inspect_elements: ["elements_result"],
+  continue_elements: ["elements_result"],
   navigate: ["action_result"],
   click: ["action_result"],
   type: ["action_result"],

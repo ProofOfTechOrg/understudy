@@ -22,16 +22,32 @@ Protocol 1 and 2 may retain non-secret attended reads during transition. The ret
 
 | Command | Class |
 |---|---|
-| `snapshot`, `get_tabs`, `list_cards`, `wait`, `resolve_ref` | Read |
+| `snapshot`, `capture_elements`, `find_elements`, `inspect_elements`, `continue_elements`, `get_tabs`, `list_cards`, `wait`, `resolve_ref` | Read |
 | `click`, `type`, `submit_card`, `key`, `navigate`, `scroll`, `switch_tab` | Write |
 
 Use `isWriteCommand` or `WRITE_COMMAND_TYPES`; do not maintain a second classification. `resolve_ref` is internal.
 
 The HTTP layer must enforce `COMMAND_HTTP_BODY_MAX_BYTES` before parsing. WebSocket layers must enforce `DEVICE_CONTROL_FRAME_MAX_BYTES` and `SESSION_RESULT_FRAME_MAX_BYTES` before parsing.
 
-## Use accessibility refs
+## Use semantic elements
 
-Refs are opaque capabilities valid for the current browser attachment and snapshot generation. Navigation, a newer snapshot, attachment replacement, or browser restart invalidates them. A ref is not consumed by a successful action and must not be parsed as a selector.
+Protocol 3 advertises `semantic-elements-v1`. `capture_elements` emits a bounded
+projection; `find_elements` searches the extension's current immutable cache;
+`inspect_elements` expands one retained target; and `continue_elements`
+continues an existing projection without recapture. Each successful result is
+an `elements_result` containing no HTML, selectors, XPath, arbitrary
+attributes, scripts, or editable values.
+
+Refs are opaque capabilities valid for the current browser attachment and
+snapshot generation. A fresh capture, navigation, attachment replacement, or
+browser restart invalidates them. Find, inspect, continuation, scrolling, and
+an unchanged validated action do not remint refs. A ref is not consumed by a
+successful action and must not be parsed as a selector.
+
+`changesOnly` applies only when loader, URL, and frame topology still match the
+prior capture. Otherwise the extension returns a normal snapshot with
+`delta.applied: false`. Cursors are opaque, memory-only, expire after ten
+minutes, and never trigger a capture.
 
 ## Submit a local card
 
@@ -121,15 +137,18 @@ Attended hello frames carry an attachment incarnation UUID. `attended_detached` 
 | Dialog default prompt | 1 KiB |
 | Browser user agent | 512 characters |
 | Extension version | 64 characters |
-| Accessibility tree | 5,000 nodes, depth 64 |
-| Accessibility name or value | 4 KiB |
+| Legacy accessibility tree | 5,000 nodes, depth 64 |
+| Semantic capture cache | 20,000 nodes and 8 MiB of normalized page strings |
+| Semantic descriptor text | 512 UTF-8 bytes per field |
+| Semantic result | 200 descriptors and 32 KiB |
+| Active semantic cursors | 16, each with a 10-minute TTL |
 | Owned-window inventory | 100 records |
 
 Schemas reject oversized or unknown fields. Transport code rejects oversized frames before durable mutation and closes oversized WebSockets with code `1009`.
 
 ## Version history
 
-- **0.9.0 / protocol 3**: cloud-secret hard cut, local-card commands, device policy acknowledgement, physical-window inventory, suspended adoption, and attended idle
+- **0.9.0 / protocol 3**: cloud-secret hard cut, local-card commands, bounded semantic elements, fixed action failures, device policy acknowledgement, physical-window inventory, suspended adoption, and attended idle
 - **0.8.0**: durable device-control closure acknowledgements
 - **0.7.0**: protocol 2 write safety, unattended control, strict bounds, and command polling
 - **0.6.0**: target-bound snapshots and refs

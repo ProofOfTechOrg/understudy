@@ -35,6 +35,10 @@ describe("command result correlation", () => {
   it("accepts only result types produced by the corresponding command", () => {
     expect(isCommandResultEvent("snapshot", "snapshot_result")).toBe(true);
     expect(isCommandResultEvent("snapshot", "screenshot_result")).toBe(true);
+    expect(isCommandResultEvent("capture_elements", "elements_result")).toBe(true);
+    expect(isCommandResultEvent("find_elements", "elements_result")).toBe(true);
+    expect(isCommandResultEvent("inspect_elements", "elements_result")).toBe(true);
+    expect(isCommandResultEvent("continue_elements", "elements_result")).toBe(true);
     expect(isCommandResultEvent("get_tabs", "tabs_result")).toBe(true);
     expect(isCommandResultEvent("list_cards", "cards_result")).toBe(true);
     expect(isCommandResultEvent("submit_card", "card_submission_result")).toBe(true);
@@ -68,6 +72,73 @@ describe("CommandSchema", () => {
   it("accepts navigate with a real URL", () => {
     const cmd = { type: "navigate", commandId: "c1", url: "https://example.com/" };
     expect(CommandSchema.parse(cmd)).toEqual(cmd);
+  });
+
+  it("parses bounded semantic element commands", () => {
+    const commands = [
+      {
+        type: "capture_elements",
+        commandId: "capture",
+        scope: "viewport",
+        view: "interactive",
+        limit: 200,
+        changesOnly: true,
+      },
+      {
+        type: "find_elements",
+        commandId: "find",
+        query: "Pay now",
+        roles: ["button", "link"],
+        match: "contains",
+        includeHidden: false,
+        limit: 50,
+      },
+      {
+        type: "inspect_elements",
+        commandId: "inspect",
+        ref: "opaque-ref",
+        depth: 8,
+        limit: 200,
+        includeBounds: true,
+      },
+      { type: "continue_elements", commandId: "next", cursor: "opaque-cursor" },
+    ];
+    for (const command of commands) expect(parseCommand(command)).toEqual(command);
+  });
+
+  it("enforces semantic query, role, depth, and result limits strictly", () => {
+    expect(
+      safeParseCommand({
+        type: "find_elements",
+        commandId: "find",
+        query: "😀".repeat(65),
+        roles: [],
+        match: "contains",
+        includeHidden: false,
+        limit: 20,
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({
+        type: "find_elements",
+        commandId: "find",
+        query: "Pay",
+        roles: Array.from({ length: 9 }, (_, index) => `role-${index}`),
+        match: "contains",
+        includeHidden: false,
+        limit: 20,
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({
+        type: "inspect_elements",
+        commandId: "inspect",
+        ref: "ref",
+        depth: 9,
+        limit: 80,
+        includeBounds: false,
+      }).success,
+    ).toBe(false);
   });
 
   it("parses a valid card submission command", () => {
@@ -309,6 +380,88 @@ describe("EventSchema", () => {
   it("round-trips an action_result", () => {
     const ev = { type: "action_result", commandId: "c1", ok: true, url: "https://example.com/" };
     expect(EventSchema.parse(ev)).toEqual(ev);
+  });
+
+  it("round-trips fixed protocol-3 action metadata", () => {
+    const event = {
+      type: "action_result",
+      commandId: "c1",
+      ok: false,
+      reason: "target_changed",
+      generation: 7,
+      refsStale: true,
+      refreshRecommended: true,
+    };
+    expect(EventSchema.parse(event)).toEqual(event);
+  });
+
+  it("round-trips a strict bounded semantic result", () => {
+    const event = {
+      type: "elements_result",
+      commandId: "capture",
+      operation: "snapshot",
+      status: "ok",
+      tabId: 7,
+      url: "https://example.com/",
+      snapshot: {
+        id: "snapshot-1",
+        generation: 3,
+        capturedAt: "2026-08-03T00:00:00.000Z",
+        scope: "viewport",
+        view: "interactive",
+        coverage: "complete",
+      },
+      elements: [
+        {
+          ref: "opaque-ref",
+          role: "button",
+          category: "interactive",
+          name: "Pay",
+          depth: 1,
+          visibility: "viewport",
+          actions: ["click", "key", "inspect"],
+          states: { disabled: false, pressed: "mixed" },
+        },
+      ],
+      page: { returned: 1, available: 1, hasMore: false },
+      delta: { requested: true, applied: false, added: 0, changed: 0, removed: 0 },
+    };
+    expect(EventSchema.parse(event)).toEqual(event);
+  });
+
+  it("rejects semantic results with mismatched pagination or unbounded output", () => {
+    const base = {
+      type: "elements_result",
+      commandId: "capture",
+      operation: "snapshot",
+      status: "ok",
+      tabId: 7,
+      url: "https://example.com/",
+      snapshot: {
+        id: "snapshot-1",
+        generation: 3,
+        capturedAt: "2026-08-03T00:00:00.000Z",
+        scope: "document",
+        view: "all",
+        coverage: "partial",
+      },
+      elements: [],
+      page: { returned: 1, available: 1, hasMore: false },
+    };
+    expect(EventSchema.safeParse(base).success).toBe(false);
+    expect(
+      EventSchema.safeParse({
+        ...base,
+        elements: Array.from({ length: 201 }, () => ({
+          role: "button",
+          category: "interactive",
+          depth: 0,
+          visibility: "viewport",
+          actions: ["inspect"],
+        })),
+        page: { returned: 201, available: 201, hasMore: false },
+      }).success,
+    ).toBe(false);
   });
 
   it("round-trips an action_result with simulated:true", () => {
