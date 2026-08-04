@@ -151,10 +151,8 @@ if [[ "$confirmation" != "DEPLOY" ]]; then
   exit 1
 fi
 
-assert_source_unchanged
-assert_current_master_head
-UNDERSTUDY_PRIOR_DEPLOYMENT="$(understudy_wrangler_control_plane deployments status --json)"
-prior_versions="$(understudy_versions_json)"
+UNDERSTUDY_PRIOR_DEPLOYMENT='null'
+prior_versions='null'
 health='null'
 active_version='null'
 source_release='null'
@@ -162,7 +160,7 @@ deployment='null'
 device_tokens_secret_version='null'
 extension_id_secret_version='null'
 secret_derived='null'
-secret_mutation_possible='true'
+secret_mutation_possible='false'
 deployment_stage="prepared"
 
 write_evidence() {
@@ -227,6 +225,18 @@ record_failed_deployment() {
   local exit_code="$?"
   trap - EXIT
   set +e
+  compatibility_config="$(understudy_json_or_null "$compatibility_config")"
+  production_contract="$(understudy_json_or_null "$production_contract")"
+  store_release="$(understudy_json_or_null "$store_release")"
+  health="$(understudy_json_or_null "$health")"
+  source_release="$(understudy_json_or_null "$source_release")"
+  active_version="$(understudy_json_or_null "$active_version")"
+  deployment="$(understudy_json_or_null "$deployment")"
+  UNDERSTUDY_PRIOR_DEPLOYMENT="$(understudy_json_or_null "$UNDERSTUDY_PRIOR_DEPLOYMENT")"
+  prior_versions="$(understudy_json_or_null "$prior_versions")"
+  device_tokens_secret_version="$(understudy_json_or_null "$device_tokens_secret_version")"
+  extension_id_secret_version="$(understudy_json_or_null "$extension_id_secret_version")"
+  secret_derived="$(understudy_json_or_null "$secret_derived")"
   write_evidence "failed" "$deployment_stage" "$exit_code"
   cleanup
   exit "$exit_code"
@@ -234,6 +244,15 @@ record_failed_deployment() {
 
 write_evidence "attempting"
 trap record_failed_deployment EXIT
+deployment_stage="source-ref"
+assert_source_unchanged
+assert_current_master_head
+deployment_stage="prior-deployment"
+UNDERSTUDY_PRIOR_DEPLOYMENT="$(understudy_wrangler_control_plane deployments status --json)"
+understudy_require_json_type "$UNDERSTUDY_PRIOR_DEPLOYMENT" object "prior deployment"
+prior_versions="$(understudy_versions_json)"
+understudy_require_json_type "$prior_versions" array "prior version inventory"
+secret_mutation_possible='true'
 deployment_stage="device-token-secret"
 understudy_with_cloudflare_auth node "$backend_dir/scripts/put-validated-secret.mjs" \
   DEVICE_TOKENS "$device_tokens_sha256" <"$device_tokens_path"
@@ -252,6 +271,7 @@ extension_id_secret_version="$(
     '{before: $before, after: $after}' |
     node "$backend_dir/scripts/secret-version.mjs"
 )"
+deployment_stage="source-ref"
 assert_source_unchanged
 assert_current_master_head
 deployment_stage="upload"

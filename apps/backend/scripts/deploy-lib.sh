@@ -53,6 +53,26 @@ understudy_deploy_dry_run() {
   fi
 }
 
+understudy_json_or_null() {
+  local value="${1:-null}"
+  if jq -e -n --argjson value "$value" '$value | type' >/dev/null 2>&1; then
+    printf '%s' "$value"
+  else
+    printf 'null'
+  fi
+}
+
+understudy_require_json_type() {
+  local value="$1"
+  local expected_type="$2"
+  local label="$3"
+  if ! jq -e -n --argjson value "$value" --arg expected "$expected_type" \
+    '$value | type == $expected' >/dev/null 2>&1; then
+    echo "$label did not return a JSON $expected_type" >&2
+    return 1
+  fi
+}
+
 understudy_versions_json() {
   understudy_wrangler_control_plane versions list --json
 }

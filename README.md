@@ -82,7 +82,7 @@ The Release workflow publishes the promoted versions with npm provenance. It rej
 
 Do not merge `master` back into `dev`. `NPM_TOKEN` needs publish access to the `@understudy` scope.
 
-The Deploy workflow updates staging after every `dev` push. After the one-time protocol-3 cutover, it updates production after every `master` push. Production deployment first rebuilds the store extension and requires its normalized contents to match `apps/extension/store-release.json` in the `published` state.
+The Deploy workflow attempts a staging update after every `dev` push. The `staging` GitHub environment must provide its scoped `CLOUDFLARE_API_TOKEN` before the upload can run. After the one-time protocol-3 cutover, the workflow updates production after every `master` push. Production deployment first rebuilds the store extension and requires its normalized contents to match `apps/extension/store-release.json` in the `published` state.
 
 Use the guarded production wrapper for the first protocol-3 cutover and any later compatibility-contract change. It validates the protocol-3 device map, published extension, canary credential, immutable source snapshot, Worker provenance, and deployment evidence. Follow the [production rollout runbook](docs/unattended-production-rollout.md).
 

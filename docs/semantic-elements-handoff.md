@@ -20,16 +20,17 @@ selector cache, action self-healing, or post-capture full-tree filtering.
 
 | Field | Value |
 | --- | --- |
-| Implementation branch | `feat/semantic-elements` |
+| Implementation status | PR #24 merged into `dev` at `a35b8221111df6757ec6d87745cd7110e804536e` |
+| Feature head | `414aa35d30115e5e157d81e1abe3add88dfe9e21` |
 | Branch point | `554a09c53dd4a9b64755da38d0260d4da37fa3d2` (`feat: add guarded deployment workflow`) |
 | Fetched `origin/dev` at implementation start | `857e0e3ebb8312be3e260e7339968f602703afdf` |
 | Node.js | 24.16.0; packages require 22 or newer |
 | pnpm | 11.5.2 |
 | Release train | Protocol 0.9.0, connector 0.6.0, extension 0.2.0, backend 0.2.0 |
 
-The local `dev` branch was clean and three commits ahead of the fetched
-`origin/dev` when this branch was created. Do not rebase this work onto the
-older remote ref without reviewing those local commits.
+The feature branch started from a local `dev` that was three commits ahead of
+the fetched `origin/dev`; PR #24 preserved that full stack. The older remote
+ref is historical context, not a valid release base.
 
 `pnpm test` and the backend deployment integration suite require permission to
 bind loopback ports. The extension release integration test creates temporary
@@ -247,7 +248,7 @@ the exact source tree on which it ran.
 | Gate | Result |
 | --- | --- |
 | Protocol focused tests | Passed: 52 tests |
-| Backend suite | Passed: 383 Vitest and 4 deployment integration tests |
+| Backend suite | Passed: 383 Vitest and 9 deployment integration tests |
 | Extension focused semantic/event tests | Passed: 87 tests in the final focused run |
 | Extension full suite | Passed: 307 Vitest and 3 release integration tests |
 | Root typecheck/build/test | Passed; connector 29 tests also passed |
@@ -275,7 +276,7 @@ pnpm exec wrangler types --check
 pnpm exec wrangler deploy --dry-run
 ```
 
-All commands above pass on the implementation tree. The implementation tranche is committed; publication still requires the Changesets version pull request and the `dev` to `master` promotion described in the release runbook.
+All commands above pass on the implementation tree. PR #24 merged the implementation into `dev`; publication still requires merging Changesets release PR #25 and completing the `dev` to `master` promotion described in the release runbook.
 
 ## Out of scope
 

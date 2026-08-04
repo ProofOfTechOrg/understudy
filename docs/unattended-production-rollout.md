@@ -2,7 +2,7 @@
 
 # Finish the protocol-3 production rollout
 
-This runbook defines the release sequence after the local protocol-3 implementation. The source and automated checks are complete. Network disruption tests, publishing, production changes, destructive cleanup, canary acceptance, and the HTTPS Strict Transport Security (HSTS) apex rollout still require operator action.
+This runbook defines the release sequence after PR #24 merged the protocol-3 implementation into `dev`. Source integration and the local automated checks are complete. The first automatic staging deployment stopped before upload because the `staging` GitHub environment had no `CLOUDFLARE_API_TOKEN`; no staging Worker change occurred. Staging credentials and provisioning, network disruption tests, publishing, production changes, destructive cleanup, canary acceptance, and the HTTPS Strict Transport Security (HSTS) apex rollout still require operator action.
 
 ## Handoff baseline
 
@@ -10,16 +10,18 @@ Use this table to establish the source and environment before you act:
 
 | Field | Recorded value |
 | --- | --- |
-| Integration branch | `feat/semantic-elements` |
-| Comparison base | `origin/dev` at `857e0e3ebb8312be3e260e7339968f602703afdf` |
+| Integration branch | `dev` |
+| Integration pull request | PR #24, merged 2026-08-04 |
+| Feature head | `414aa35d30115e5e157d81e1abe3add88dfe9e21` |
+| Integration merge | `a35b8221111df6757ec6d87745cd7110e804536e` |
+| Historical comparison base | `origin/dev` at `857e0e3ebb8312be3e260e7339968f602703afdf` |
 | Semantic tranche base | `554a09c53dd4a9b64755da38d0260d4da37fa3d2` (`feat: add guarded deployment workflow`) |
-| Fetched `origin/dev` on 2026-08-04 | `857e0e3ebb8312be3e260e7339968f602703afdf` |
-| Release source | The commit containing this handoff; resolve it with `git rev-parse HEAD` |
+| Release source | Current `origin/dev`; refresh it and resolve with `git rev-parse origin/dev` before acting |
 | Node.js | 24.16.0; repository minimum is 22 |
 | pnpm | 11.5.2; the root manifest pins this version |
 | Production state last inspected | 2026-08-04 for HTTP/HTTPS health; DNS inventory remains from 2026-08-02; refresh every external value before acting |
 
-The integration branch intentionally includes the local card-vault requirements, protocol-3/card-vault implementation, guarded deployment workflow, and semantic-elements tranche. Do not split or rebase this stack onto the older remote ref without re-running the compatibility review. Do not deploy a dirty tree or a later unreviewed commit.
+The merged stack includes the local card-vault requirements, protocol-3/card-vault implementation, guarded deployment workflow, and semantic-elements tranche. Do not split or rebase this stack onto the historical remote ref without re-running the compatibility review. Do not deploy a dirty tree or a later unreviewed commit.
 
 ## Implemented release
 
@@ -42,13 +44,15 @@ These results apply to the source code in this branch. A code or configuration c
 
 | Gate | Evidence | State |
 | --- | --- | --- |
-| Unit and integration tests | 2026-08-04: 778 tests; protocol 52, connector 29, extension 307 plus 3 release integration tests, backend 383 plus 4 deployment integration tests | Passed |
+| Unit and integration tests | 2026-08-04: 783 tests; protocol 52, connector 29, extension 307 plus 3 release integration tests, backend 383 plus 9 deployment integration tests | Passed |
 | Typecheck and build | `pnpm typecheck` and `pnpm build` after all review fixes | Passed |
 | Dependency audit | 2026-08-04: 0 critical/high; 2 moderate and 2 low transitive advisories remain | Passed release threshold |
 | Local Chrome end-to-end | Vault restart, Chrome DevTools Protocol submission, worker-eviction recovery, deletion, and synthetic-marker non-egress | Passed |
 | Store package | Pre-workflow `0.2.0` artifact SHA-256 `3b492a1608131088c607e5254317708165e8785c67ee73c393c40578fff9b54f` | Superseded; rebuild after the deployment changes |
 | Wrangler | Generated types current; deployment dry run completed without upload | Passed |
 | Review lanes | Independent clean-code, architecture, and quality-assurance reviews returned clean after fixes | Passed |
+| Integration workflows | PR #24 and post-merge CI passed; Version run `30883763357` opened release PR #25 | Passed |
+| Automatic staging deployment | Run `30883763461` passed install, build, typecheck, tests, Worker types, extension verification, and dry run, then failed before upload because the `staging` environment had no `CLOUDFLARE_API_TOKEN` | Blocked; no staging mutation |
 | Network baseline | Test A 10s and 30s passed; Test A 60s and 120s plus Test B 30s remain | Partial |
 | Production HSTS | 2026-08-04 probes found no HTTP upgrade and no HTTPS HSTS header; the 2026-08-02 DNS inventory found no apex address record | Pending |
 | Cloud-vault cleanup | No values, namespace, or production secrets were deleted | Pending |
@@ -63,7 +67,7 @@ Complete the remaining work in this order:
 | ---: | --- | --- | --- |
 | 1 | Run the remaining pre-fix network baseline | No active soak; caller credential; exact device and origin; approval immediately before firewall or Tailscale mutation | Mode-0600 JSONL evidence outside Git |
 | 2 | Apply the deterministic reconnect result | Baseline evidence from step 1 | Selected branch recorded; any required code change reviewed and verified |
-| 3 | Confirm the integration pull request is merged into `dev`, then verify the automatic staging deployment | Repository and staging GitHub-environment authority | Scoped Cloudflare token present, staging secrets provisioned, pull request, merge SHA, and automatic staging deployment evidence |
+| 3 | Add the missing staging-scoped `CLOUDFLARE_API_TOKEN`, provision staging, and rerun the automatic deployment; PR #24 is already merged | Staging GitHub-environment and Cloudflare authority | Scoped token present, staging secrets provisioned, merge SHA, and verified automatic deployment evidence |
 | 4 | Verify staging with the pinned staging extension | Staging account and dedicated Chrome profile | Pairing, OAuth/MCP, and hosted-control evidence |
 | 5 | Publish protocol 0.9.0 and connector 0.6.0 | Package-registry release authority | Registry versions and package integrity values |
 | 6 | Build, submit, and publish extension 0.2.0 | Chrome Web Store authority | Submitted ZIP, normalized content digest, published status, and source SHA in `store-release.json` |
@@ -80,7 +84,7 @@ Complete the remaining work in this order:
 
 Do not combine steps 8 and 11 into one unobserved change. First prove that the compatibility deployment is healthy. Then start the separately confirmed hard-cut window.
 
-If the environments are not already configured, create the GitHub `staging` environment, restrict it to `dev`, and add a `CLOUDFLARE_API_TOKEN` secret scoped only to the staging Worker and its required resources before relying on the staging deployment. Provision the six staging Worker secrets with the backend command documented below. Create the `production` environment separately, restrict it to `master`, add a production-scoped token, and leave `PRODUCTION_AUTODEPLOY_ENABLED=false` until step 9. Never reuse either deployment token or any Worker runtime secret across targets.
+The GitHub `staging` environment exists, but its environment-secret inventory was empty when checked on 2026-08-04. Restrict it to `dev`, add a `CLOUDFLARE_API_TOKEN` secret scoped only to the staging Worker and its required resources, then provision the six staging Worker secrets with the backend command documented below. The separate `production` environment also exists with an empty secret inventory; restrict it to `master`, add a production-scoped token before deployment, and leave `PRODUCTION_AUTODEPLOY_ENABLED=false` until step 9. Never reuse either deployment token or any Worker runtime secret across targets.
 
 ## Run the remaining network baseline
 
