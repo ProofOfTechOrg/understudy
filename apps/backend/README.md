@@ -177,6 +177,8 @@ The GitHub `staging` environment exists, but its secret inventory was empty when
 
 After the mode and evidence path are validated, every automated deployment writes an `attempting`, `failed`, or `verified` evidence artifact. Build, dry-run, prior-deployment lookup, source-ref, upload, and verification failures identify their stage. Failed post-upload evidence includes `priorDeployment`, the exact deployment state captured before upload. Recover staging with its prior 100% version:
 
+Post-merge run `30886405702` exercised the missing-token path at commit `16eda20956f902e87baaf6d6c2ce7b84be87232e`. It made no staging upload and preserved an artifact with `outcome: "failed"`, `failureStage: "prior-deployment"`, `exitCode: 1`, and `priorDeployment: null`.
+
 ```bash
 previous_version="$(jq -r '.priorDeployment.versions[] | select(.percentage == 100) | .version_id' /absolute/path/staging-deployment.json)"
 pnpm --filter @understudy/backend exec wrangler rollback "$previous_version" \

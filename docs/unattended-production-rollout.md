@@ -2,7 +2,7 @@
 
 # Finish the protocol-3 production rollout
 
-This runbook defines the release sequence after PR #24 merged the protocol-3 implementation into `dev`. Source integration and the local automated checks are complete. The first automatic staging deployment stopped before upload because the `staging` GitHub environment had no `CLOUDFLARE_API_TOKEN`; no staging Worker change occurred. Staging credentials and provisioning, network disruption tests, publishing, production changes, destructive cleanup, canary acceptance, and the HTTPS Strict Transport Security (HSTS) apex rollout still require operator action.
+This runbook defines the release sequence after PR #24 merged the protocol-3 implementation into `dev`. Source integration and the local automated checks are complete. Automatic staging stops before upload because the `staging` GitHub environment has no `CLOUDFLARE_API_TOKEN`; no staging Worker change occurred. PR #26 corrected early failure evidence, and post-merge run `30886405702` uploaded an artifact for the same external credential failure. Staging credentials and provisioning, network disruption tests, publishing, production changes, destructive cleanup, canary acceptance, and the HTTPS Strict Transport Security (HSTS) apex rollout still require operator action.
 
 ## Handoff baseline
 
@@ -14,6 +14,7 @@ Use this table to establish the source and environment before you act:
 | Integration pull request | PR #24, merged 2026-08-04 |
 | Feature head | `414aa35d30115e5e157d81e1abe3add88dfe9e21` |
 | Integration merge | `a35b8221111df6757ec6d87745cd7110e804536e` |
+| Deployment-evidence follow-up | PR #26, merged at `16eda20956f902e87baaf6d6c2ce7b84be87232e` |
 | Historical comparison base | `origin/dev` at `857e0e3ebb8312be3e260e7339968f602703afdf` |
 | Semantic tranche base | `554a09c53dd4a9b64755da38d0260d4da37fa3d2` (`feat: add guarded deployment workflow`) |
 | Release source | Current `origin/dev`; refresh it and resolve with `git rev-parse origin/dev` before acting |
@@ -51,8 +52,8 @@ These results apply to the source code in this branch. A code or configuration c
 | Store package | Pre-workflow `0.2.0` artifact SHA-256 `3b492a1608131088c607e5254317708165e8785c67ee73c393c40578fff9b54f` | Superseded; rebuild after the deployment changes |
 | Wrangler | Generated types current; deployment dry run completed without upload | Passed |
 | Review lanes | Independent clean-code, architecture, and quality-assurance reviews returned clean after fixes | Passed |
-| Integration workflows | PR #24 and post-merge CI passed; Version run `30883763357` opened release PR #25 | Passed |
-| Automatic staging deployment | Run `30883763461` passed install, build, typecheck, tests, Worker types, extension verification, and dry run, then failed before upload because the `staging` environment had no `CLOUDFLARE_API_TOKEN` | Blocked; no staging mutation |
+| Integration workflows | PR #24 and PR #26 passed CI and merged; post-PR #26 CI run `30886405878` and Version run `30886405689` passed; release PR #25 is open | Passed |
+| Automatic staging deployment | Run `30883763461` exposed the missing token and absent failure artifact. After PR #26, run `30886405702` again stopped before upload, then successfully uploaded failed evidence for source `16eda20956f902e87baaf6d6c2ce7b84be87232e` | Blocked; no staging mutation |
 | Network baseline | Test A 10s and 30s passed; Test A 60s and 120s plus Test B 30s remain | Partial |
 | Production HSTS | 2026-08-04 probes found no HTTP upgrade and no HTTPS HSTS header; the 2026-08-02 DNS inventory found no apex address record | Pending |
 | Cloud-vault cleanup | No values, namespace, or production secrets were deleted | Pending |
