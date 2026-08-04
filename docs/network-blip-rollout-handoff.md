@@ -4,7 +4,7 @@
 
 ## Current state
 
-This record applies to the protocol-3 stack merged into `dev` by PR #24 at `a35b8221111df6757ec6d87745cd7110e804536e`. Its historical comparison base is `origin/dev` at `857e0e3ebb8312be3e260e7339968f602703afdf`, and the semantic tranche starts after `554a09c53dd4a9b64755da38d0260d4da37fa3d2`. The first automatic staging deployment did not upload because its GitHub environment lacked `CLOUDFLARE_API_TOKEN`; production still serves the pre-change Worker until an operator completes the gated release process.
+This record applies to the protocol-3 stack merged into `dev` by PR #24 at `a35b8221111df6757ec6d87745cd7110e804536e`. Its historical comparison base is `origin/dev` at `857e0e3ebb8312be3e260e7339968f602703afdf`, and the semantic tranche starts after `554a09c53dd4a9b64755da38d0260d4da37fa3d2`. Automatic staging still stops before upload because its GitHub environment lacks `CLOUDFLARE_API_TOKEN`; PR #26 made that failure auditable, and run `30886405702` uploaded the failed evidence artifact without changing staging. Production still serves the pre-change Worker until an operator completes the gated release process.
 
 Historical sanitized observations:
 
