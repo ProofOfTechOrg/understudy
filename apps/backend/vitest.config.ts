@@ -3,15 +3,12 @@ import { defineConfig } from "vitest/config";
 import {
   CALLER_TOKENS,
   EXTENSION_TOKENS,
-  TEST_VAULT_MASTER_KEY,
-  TEST_VAULT_UPLOAD_PRIVATE_KEY,
 } from "./test/tokens";
 
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      // Reuse the real wrangler config for the SESSION Durable Object
-      // binding + migration and the VAULT KV namespace (DL-006, DL-004).
+      // Reuse the real wrangler config for Durable Object bindings and migrations.
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
         // String/JSON vars layered on top of wrangler.jsonc - never real
@@ -22,6 +19,7 @@ export default defineConfig({
           CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),
           EXTENSION_TOKENS: JSON.stringify(EXTENSION_TOKENS),
           DEVICE_TOKENS: "{}",
+          EXTENSION_ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           // Pinned so the suite's baseline is a TEST value, not whatever the
           // rollout has left in wrangler.jsonc. Without these the allowlists are
           // inherited from a production knob, and editing that knob silently
@@ -29,13 +27,10 @@ export default defineConfig({
           UNATTENDED_ENABLED_TENANTS: "[]",
           SAFE_WRITE_REQUIRED_TENANTS: "[]",
           WS_TICKET_SECRET: "test-ticket-secret-do-not-use-in-prod",
-          VAULT_MASTER_KEY: TEST_VAULT_MASTER_KEY,
-          VAULT_UPLOAD_PRIVATE_KEY: TEST_VAULT_UPLOAD_PRIVATE_KEY,
           QUOTA_POLICY: JSON.stringify({
             sessionCreatesPerActorMinute: 10_000,
             commandsPerSessionMinute: 10_000,
             commandsPerTenantMinute: 100_000,
-            credentialFillsPerActorMinute: 10_000,
             deviceTicketsPerDeviceMinute: 10_000,
             sessionCommandCap: 10_000,
           }),
@@ -52,12 +47,8 @@ export default defineConfig({
     // --no-isolate`, expressed here as config so `vitest run` needs no
     // extra flags.
     //
-    // This also means storage (Durable Object state AND the VAULT KV
-    // namespace) is shared across every test/file in the run, not reset
-    // per file. That's safe here because every session is keyed by a fresh
-    // crypto.randomUUID() sessionId, and every seeded vault secret uses a
-    // distinct vault:// key - so no two tests can collide on the same
-    // storage key even though nothing resets between them.
+    // Durable Object storage is shared across every test/file in the run.
+    // Fresh UUID-backed identities keep test resources isolated.
     isolate: false,
     maxWorkers: 1,
   },

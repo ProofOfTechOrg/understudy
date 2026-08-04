@@ -38,6 +38,7 @@ export type DispatchLoopOutcome =
   | { kind: "id_conflict"; commandId: string }
   | { kind: "busy_exhausted" }
   | { kind: "not_connected" }
+  | { kind: "legacy_snapshot_required" }
   | { kind: "unsupported" }
   | { kind: "terminal_session" };
 
@@ -82,6 +83,8 @@ export async function runDispatchLoop(
         continue;
       case "not_connected":
         return { kind: "not_connected" };
+      case "legacy_snapshot_required":
+        return { kind: "legacy_snapshot_required" };
       case "unsupported":
         return { kind: "unsupported" };
       case "terminal_session":

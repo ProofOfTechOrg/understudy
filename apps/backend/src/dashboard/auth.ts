@@ -11,8 +11,8 @@
  * an attacker completes the OTP flow against their own address, then cross-site
  * posts that challengeId+code from the victim's browser. `Set-Cookie` is
  * honoured on a cross-site response (SameSite governs sending, not setting), so
- * the victim ends up authenticated as the attacker and pairs their browser and
- * vault secrets into the attacker's tenant. Do not reduce this to
+ * the victim ends up authenticated as the attacker and pairs their browser
+ * into the attacker's tenant. Do not reduce this to
  * defence-in-depth on the strength of the authed routes' extra layers.
  */
 

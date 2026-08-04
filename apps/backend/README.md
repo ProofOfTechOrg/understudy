@@ -2,190 +2,234 @@
 
 # Operate the Understudy backend
 
-The backend is a Cloudflare Worker with Hono, Agents SDK Durable Objects, a raw SQLite coordinator, KV vault storage, Analytics Engine telemetry, and a rate-limit backstop. It coordinates attended and unattended sessions but never runs the browser.
+The backend is a Cloudflare Worker with Hono, OAuth Provider, Agents SDK Durable Objects, SQLite coordination, Analytics Engine telemetry, and a rate-limit backstop. It coordinates browser work but never runs Chromium or stores payment cards.
 
-## Understand the object topology
-
-The Worker binds three Durable Object classes:
+## Object topology
 
 | Binding | Class | Authority |
 |---|---|---|
-| `SESSION` | `SessionAgent` | Session WebSocket, command journal, schedules, results, dialogs, and vault resolution |
-| `DEVICE` | `DeviceAgent` | One authoritative control WebSocket per enrolled profile |
-| `TENANT_CONTROL` | `TenantDeviceCoordinator` | Tenant devices, allocations, leases, exact quotas, idempotency, and alarms |
+| `SESSION` | `SessionAgent` | Session socket, lifecycle, command journal, results, dialogs, and attended attachment |
+| `DEVICE` | `DeviceAgent` | One authoritative control socket per paired browser |
+| `TENANT_CONTROL` | `TenantDeviceCoordinator` | Device inventory, policy acknowledgement, leases, capacity, idempotency, and alarms |
+| `ACCOUNT_DIRECTORY` | `AccountDirectory` | Accounts, pairing offers, browser credentials, API tokens, and auth epochs |
+| `ACCOUNT` | `AccountAgent` | Per-device MCP browser bindings and ref-generation guards within one tenant |
+| `MCP_AGENT` | `UnderstudyMcp` | Streamable HTTP MCP connection |
 
-Migration `v1` created `SessionAgent`. Additive migration `v2` creates `DeviceAgent` and `TenantDeviceCoordinator`. Do not remove either migration during rollback.
+Migrations `v1` through `v4` are additive. Do not remove them during rollback.
 
-## Use the HTTP API
+Pairing offers retain the internal `pairing_codes` table name for migration compatibility. The public interface passes a direct one-time offer and never asks a person to transcribe a code.
 
-All `/v1` caller endpoints require `Authorization: Bearer <caller_token>`. The service returns `404` for malformed, unknown, or cross-tenant session IDs.
+## Semantic MCP workflow
+
+The hosted MCP surface returns object-shaped `structuredContent` for every
+tool. Page-derived fields are nested under
+`{ source: "untrusted_page", page: page_data_here }`; the compact text fallback uses a
+random per-result boundary and JSON-quotes page strings.
+
+Use `browser_find` when the target label is known, a viewport-interactive
+`browser_snapshot` for an initial overview, `browser_inspect` for an ambiguous
+target, and `browser_snapshot_next` for more results. After a same-page update,
+request `browser_snapshot({ changesOnly: true })`. Screenshots are for visual
+ambiguity, not routine element discovery.
+
+`AccountAgent` stores the exact snapshot ID, generation, URL, capture time,
+coverage, and validity. Find, inspect, continuation, and scrolling preserve
+that binding. Fresh capture, navigation, target replacement, worker eviction,
+or an unknown write outcome invalidates it. `browser_status` reports the
+last-known binding and never claims that an extension memory cache survived
+eviction.
+
+## HTTP and MCP surfaces
+
+All `/v1` caller endpoints require `Authorization: Bearer <caller-token>`. Unknown or cross-tenant session IDs return `404`.
 
 | Endpoint | Result |
 |---|---|
 | `POST /v1/sessions` with no body | Create an attended session |
 | `POST /v1/sessions` with an unattended body | Allocate and provision a device lease |
-| `GET /v1/devices` | Read device status and capacity |
-| `GET /v1/sessions/:id` | Read active or terminal session status |
-| `DELETE /v1/sessions/:id` | Retire attended authority or request unattended cleanup |
-| `POST /v1/sessions/:id/commands` | Admit a strict command request |
-| `GET /v1/sessions/:id/commands/:commandId` | Poll a protocol-2 command |
-| `POST /v1/device/connect-ticket` | Mint a device control ticket |
+| `GET /v1/devices` | Read logical and physical inventory, capacity, and divergence |
+| `GET /v1/sessions/:id` | Read active or terminal state |
+| `DELETE /v1/sessions/:id` | Retire authority and converge browser cleanup |
+| `POST /v1/sessions/:id/commands` | Admit a strict command |
+| `GET /v1/sessions/:id/commands/:commandId` | Poll a pending protocol-3 command |
+| `POST /v1/device/connect-ticket` | Mint a single-use device ticket |
+| `POST /v1/pairing/claim` | Redeem one opaque pairing offer from the extension |
+| `POST /mcp` | OAuth or device-bound `usk_v2` MCP transport |
 
-Unattended creation requires a UUID `Idempotency-Key` and this body:
+Unattended creation requires a UUID `Idempotency-Key` and a strict body:
 
 ```json
 {
   "mode": "unattended",
+  "deviceId": "00000000-0000-4000-8000-000000000001",
   "allowedOrigins": ["https://portal.example"],
   "profileStateKey": "portal_account_a"
 }
 ```
 
-The API canonicalizes origins and hashes the profile key with tenant domain separation. It persists neither raw value in coordinator state.
+The API canonicalizes origins and tenant-hashes the profile key. It persists neither raw profile key nor page content in coordinator state.
 
-Command requests are limited to 128 KiB and parsed against `CommandRequestSchema`. Unknown fields and malformed `dryRun` values return `400` before WebSocket traffic or durable command mutation.
+Known-unsent provisioning failures release the exact fence and return a terminal `closed` handle. A thrown device RPC preserves ambiguity as pollable `closing`. Extension-reported provisioning failure retains a durable release outbox until closure acknowledgement. `DELETE` also preserves that polling handle when close delivery throws after the exact-fenced `closing` state has been committed.
 
-Protocol-2 connectors send `Understudy-Command-Contract: 2`. They can receive `202` and poll the returned status URL. Legacy connectors never receive `202`.
+## Authentication hard cut
 
-Attended deletion persists terminal authority immediately, cancels active attempts, closes the extension socket with code `4003`, and returns `204`. Repeated attended deletion also returns `204`. Later commands return `410`, and reconnecting extensions receive code `4003`.
+- Static MCP tokens use `usk_v2`, bind one active browser and the account’s current `auth_epoch`, and are revalidated on every request.
+- OAuth consent requires selecting one active browser. Grant metadata and props carry device ID, auth epoch, and contract version.
+- OAuth authorization requires an exact 43-character base64url S256 challenge on both consent render and submission. Plain, missing, malformed, or altered requests fail closed.
+- Browser revocation immediately invalidates every bound API and OAuth credential.
+- Pre-cutover OAuth props, `usk_v1`, cloud-vault routes, `fill_secret`, `browser_fill_secret`, and `browser_list_secrets` are retired.
 
-Unattended deletion remains acknowledgement-driven. It returns `202` while the extension still owns the tab or the matching closure frame is pending, then returns `204` after cleanup confirmation.
+A normal deployment does not advance authentication epochs. During the
+separately confirmed maintenance window, set the optional Worker secret
+`AUTH_EPOCH_CUTOVER` to the exact value `protocol-3-auth-hard-cut`. The next
+`AccountDirectory` activation advances every existing user once, before it
+validates any token or grant; a durable migration marker makes the latch
+idempotent. Remove the secret after cutover evidence is recorded.
 
-`GET /v1/sessions/:id` keeps unattended `closing` sessions pollable with `200`; only unattended `closed`, `expired`, and `lost` sessions return `410`. Attended sessions with a durable closed flag also return `410`, even though their response body retains `status: "detached"`.
+## Device policy and lifecycle
 
-## Configure secrets
+`users.allowed_origins` is the default for a newly paired browser. `devices.allowed_origins` is authoritative after pairing and carries a monotonic policy version.
 
-Wrangler requires six secrets:
+- Narrowing terminalizes affected leases before the policy is recorded and pushed.
+- Additions remain unavailable until the extension acknowledges the exact version.
+- Offline or stale-policy devices remain paired but cannot receive new work.
+- Provision frames carry the policy version and a subset origin list.
 
-| Secret | Format | Purpose |
-|---|---|---|
-| `AUTH_HMAC_SECRET` | Random HMAC key | Session IDs, profile hashes, request fingerprints, and telemetry pseudonyms |
-| `CALLER_TOKENS` | JSON object | Caller token to actor and tenant |
-| `EXTENSION_TOKENS` | JSON object | Legacy attended extension token to tenant |
-| `DEVICE_TOKENS` | JSON object | SHA-256 device credential digest to tenant-bound device identity |
-| `WS_TICKET_SECRET` | Independent random HMAC key | 60-second single-use WebSocket tickets |
-| `VAULT_MASTER_KEY` | Base64url 32-byte key | AES-256-GCM vault envelope encryption |
+Configured static devices use the same exact schema validator during deployment and at runtime. A connected or returning static device can atomically advance the coordinator from any lower policy version, including across versions it missed while offline, before the extension receives the update. Directory-backed policy remains contiguous and is advanced by the dashboard transaction before it is pushed.
 
-`CALLER_TOKENS` uses:
+At 75 seconds without a heartbeat, active leases become `recovering`. At 90 seconds they become `suspended`, stop consuming capacity, and receive a 15-minute adoption deadline. Suspended leases still reserve their profile and origins. Same-epoch exact inventory can reconnect them; an exact physical closure terminalizes them as `closed`; new-epoch adoption bumps the lease fence and reprovisions only if capacity, profile, and policy still permit. The deadline terminalizes `lost` and creates exact orphan cleanup. An exact-fenced `closing` or `expired` lease is instead released at the 90-second device-loss boundary, so an unreachable browser cannot reserve capacity indefinitely.
 
-```json
-{
-  "caller_token_here": {
-    "actor": "consumer_worker",
-    "tenantId": "tenant_a"
-  }
-}
-```
+The extension reports managed assignments and owned windows. A newly registered
+device remains unavailable until the hello inventory has passed the same
+reconciliation used for heartbeats. `/v1/devices` exposes server usage, both
+physical counts, missing IDs, divergence, and comparison time. The backend asks
+Chrome to close only exact reported orphan fences.
 
-`DEVICE_TOKENS` uses:
+## Configure secrets and variables
 
-```json
-{
-  "sha256_device_credential_here": {
-    "tenantId": "tenant_a",
-    "deviceId": "00000000-0000-4000-8000-000000000001",
-    "credentialVersion": 1
-  }
-}
-```
+Wrangler requires:
 
-The raw device credential appears only in HTTPS authorization headers and the trusted extension’s local storage. Rotate a device by adding a higher `credentialVersion` entry and removing the old digest. A heartbeat detects revocation and fences the old socket.
+| Secret | Purpose |
+|---|---|
+| `AUTH_HMAC_SECRET` | Session IDs, hashes, request fingerprints, CSRF/consent signatures, and telemetry pseudonyms |
+| `CALLER_TOKENS` | Legacy caller token to actor and tenant |
+| `EXTENSION_TOKENS` | Attended extension token map |
+| `DEVICE_TOKENS` | Bootstrap device identities still using configured digests |
+| `EXTENSION_ID` | Published Chrome extension ID for direct pairing messages |
+| `WS_TICKET_SECRET` | Single-use control and session tickets |
+
+There is no vault KV binding, vault master key, or vault upload key.
+
+`UNATTENDED_ENABLED_TENANTS` and `SAFE_WRITE_REQUIRED_TENANTS` accept exact tenant IDs or audited `prefix:` classes; `"*"` enables nothing. `QUOTA_POLICY` contains session, command, tenant, device-ticket, and total-command limits. No credential-fill quota remains.
 
 Copy `.dev.vars.example` to `.dev.vars` for local development. Never commit `.dev.vars`.
 
-## Configure rollout and quotas
+## Transport and response policy
 
-Non-secret Wrangler variables include:
+The canonical host is `https://understudy.proofof.tech`. Canonical HTTP requests receive `308` before routing. Every canonical HTTPS response, including errors, redirects, dashboard, OAuth, MCP, well-known metadata, and `/v1`, carries HSTS. The current staged value is five minutes; do not add `includeSubDomains; preload` until every `proofof.tech` hostname is valid HTTPS and the apex ramp is complete.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `UNATTENDED_ENABLED_TENANTS` | `[]` | Tenant allowlist for new unattended leases |
-| `SAFE_WRITE_REQUIRED_TENANTS` | `[]` | Legacy-path write guard (see below) |
-| `QUOTA_POLICY` | Built-in JSON | Exact SQLite quota configuration |
+`/health` returns the Worker source tag, active version ID, and deployment timestamp from the `VERSION` metadata binding.
 
-Both allowlists are set per tenant during rollout. `wrangler.jsonc` is authoritative for what is deployed; do not restate their values elsewhere.
+## Telemetry boundary
 
-Allowlist entries are exact tenant ids (`"metamind"`) or an explicit class prefix (`"prefix:acct-"`, the self-serve accounts AccountDirectory mints). A prefix entry is a scoped, auditable statement about one namespace, reviewed in source and atomic with `wrangler rollback`. `enabledForTenant` no longer honours `"*"` at all: a wildcard would admit every tenant holding a caller token — the blast radius the allowlist exists to bound — and wildcard enablement is a rejected option in the [rollout runbook](../../docs/unattended-production-rollout.md). Onboard consumer tenants by name, one at a time; self-serve accounts arrive as the `acct-` class.
+Telemetry is content-free. Never add page URL, title, content, dialog text, screenshot data, refs, card aliases, card values, credentials, tickets, or complete socket URLs.
 
-Keep unattended creation disabled during the initial backend deployment. Enable it for a named tenant once that tenant's canary device is enrolled and reporting protocol 2 — the Chromium acceptance suite creates unattended sessions and cannot run against an empty allowlist.
-
-`SAFE_WRITE_REQUIRED_TENANTS` guards the **legacy** command path, which is reached only when all of: the caller omits `understudy-command-contract: 2`, the session is attended, and the extension is protocol-1. `@understudy/connector` has sent that header unconditionally since 0.5.0, so a consumer on a current connector never reaches it.
-
-On that path this flag is the **only** refusal. `dispatch()` does not check the protocol version, so with the tenant unlisted a protocol-1 write executes. `dispatchV2` returns the same 426 for a protocol-1 write, but only for callers that reach it — and the legacy path is by definition the one that does not. Enable this flag for a tenant whenever that tenant is enabled for unattended sessions.
-
-The default exact quotas are:
-
-- 10 session creates/min per actor
-- 120 commands/min per session
-- 600 commands/min per tenant
-- 30 credential fills/min per actor
-- 30 device tickets/min per device
-- 10,000 admitted commands per session
-
-The `RATE_LIMITER` binding allows 300 requests/min per authenticated caller or device identity pseudonym. It is an abuse backstop, not the authoritative quota mechanism.
-
-## Protect WebSocket authority
-
-Long-lived device credentials never enter WebSocket URLs. A device authenticates over HTTPS, receives a signed ticket, and uses it once on the control socket.
-
-The Worker verifies ticket signature, audience, expiry, and path-bound object name before object routing. The target object consumes the JTI hash atomically and validates current tenant, device, lease, and epoch authority.
-
-The extension persists a `closed` record and retries it until the Worker returns an exact `closed_ack`. The coordinator acknowledges the first durable closure, exact closed or expired replays, and exact lost-fence replays while preserving `lost`. It rejects missing leases and stale or mismatched fences. `DeviceAgent` updates the session lifecycle before sending the acknowledgement, and it emits release telemetry only for the first transition.
-
-Deploy this backend behavior before the acknowledging extension. Older extensions ignore `closed_ack`. Newer extensions fail closed against an older backend by retaining their closure records and staged profiles.
-
-Attended protocol-1 sockets retain their legacy `EXTENSION_TOKENS` query flow for compatibility. Unattended sockets require tickets.
-
-## Store vault values
-
-KV stores only `v1.<iv>.<ciphertext>` envelopes. Seed a tenant-scoped key through the encryption script:
-
-```bash
-printf '%s' 'secret_value_here' |
-  VAULT_MASTER_KEY=base64url_key_here \
-  node apps/backend/scripts/vault-put.mjs \
-  'vault://tenant_a/portal/password'
-```
-
-`fill_secret` rejects a ref outside the session tenant before a KV read. Plaintext exists only after write readiness and only in the in-memory grant frame.
-
-## Emit telemetry
-
-`src/telemetry.ts` writes content-free dimensions to Analytics Engine and structured logs. HMAC pseudonyms replace tenant, actor, device, and session identifiers.
-
-Never add URL, title, page content, dialog content, text, keys, refs, secret references, credentials, tickets, or full WebSocket URLs to telemetry.
-
-## Develop and verify
-
-Run from the repository root:
+## Verify
 
 ```bash
 pnpm --filter @understudy/backend typecheck
 pnpm --filter @understudy/backend test
-pnpm --filter @understudy/backend exec wrangler deploy --dry-run \
-  --outdir /tmp/understudy-unattended-worker
+cd apps/backend
+pnpm exec wrangler types --check
+pnpm exec wrangler deploy --dry-run --env ""
+pnpm exec wrangler deploy --dry-run --env staging
 ```
 
-The Miniflare test suite needs permission to bind a loopback port.
+The Workers test pool needs permission to bind loopback ports. `worker-configuration.d.ts` is generated by `wrangler types` and is the source of truth for runtime bindings; `src/types.ts` extends it only with bindings that the OAuth provider injects per request and the optional cutover latch.
 
-## Deploy safely
+## Deploy staging
 
-Use the [unattended production rollout runbook](../../docs/unattended-production-rollout.md) as the canonical deployment, evidence, and rollback procedure. Deploy the dual-protocol backend with unattended creation disabled:
+The `dev` deployment workflow updates `understudy-backend-staging` at `https://staging.understudy.proofof.tech`. Staging uses a separate OAuth KV namespace, Durable Object state, telemetry dataset, rate-limit namespace, runtime secrets, and extension ID. It enables only the `prefix:acct-` unattended account class.
+
+Provision the six staging secrets from mode-0600 files outside the repository:
 
 ```bash
-pnpm --filter @understudy/backend exec wrangler deploy
+pnpm --filter @understudy/backend provision:staging -- \
+  /absolute/private/staging-auth-hmac.txt \
+  /absolute/private/staging-caller-tokens.json \
+  /absolute/private/staging-extension-tokens.json \
+  /absolute/private/staging-device-tokens.json \
+  /absolute/private/staging-extension-id.txt \
+  /absolute/private/staging-ws-ticket.txt
 ```
 
-After deployment, record the exact migration-`v2`, flags-off version as the rollback baseline. After one canary extension reports protocol 2, enable only its tenant. Complete the production Chromium acceptance suite and 24-hour soak before broad enablement.
+The three token-map files must contain `{}`. The extension-ID file must contain `ebpcldlibljfjhcfknagjcdmhggeknfc`. Never copy production token maps or signing secrets into staging.
 
-A rollback must:
+Deploy clean or dirty local code to the shared staging target:
 
-1. Return the consumer to attended mode
-2. Roll back to the recorded migration-`v2`, flags-off version
-3. Confirm new unattended leases are disabled
-4. Delete and poll active leases while the durable sweeper retains unresolved cleanup
-5. Retain the additive Durable Object migrations and coordinator data
+```bash
+pnpm --filter @understudy/backend deploy:staging
+```
 
-Migration `v2` is additive and irreversible. Cloudflare blocks rollback across incompatible Durable Object class lifecycle changes, so the active migration-`v1` version cannot be assumed to remain a valid rollback target after `v2`. See [Cloudflare Worker rollback constraints](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
+The command records local dirty provenance and writes evidence under `/tmp`. The next `dev` deployment can replace the local deployment.
 
-Do not remove migration `v2` or deploy protocol-1-only code while protocol-2 leases exist.
+Before the first `dev` merge, create a GitHub `staging` environment restricted to `dev`, add a staging-scoped `CLOUDFLARE_API_TOKEN`, and run `provision:staging`. Create a separate `production` environment restricted to `master`, add a production-scoped token, and keep `PRODUCTION_AUTODEPLOY_ENABLED=false` until the manual compatibility cutover has passed. Workflow deployment tokens are exposed only to their deployment step.
+
+Every deployment writes an `attempting`, `failed`, or `verified` evidence artifact. Failed post-upload evidence includes `priorDeployment`, the exact deployment state captured before upload. Recover staging with its prior 100% version:
+
+```bash
+previous_version="$(jq -r '.priorDeployment.versions[] | select(.percentage == 100) | .version_id' /absolute/path/staging-deployment.json)"
+pnpm --filter @understudy/backend exec wrangler rollback "$previous_version" \
+  --env staging --message "recover failed staging deployment" --yes
+curl --fail --silent --show-error https://staging.understudy.proofof.tech/health | jq
+```
+
+Use the same process for production with `--env ""` and the production evidence artifact. Do not roll back merely because an older workflow was rerun: CI rejects any source commit that is no longer the current `origin/dev` or `origin/master` head before upload.
+
+## Deploy production
+
+Routine production deployment runs from the `master` GitHub Actions workflow. It is disabled until the protocol-3 manual cutover completes. GitHub stores only a scoped Cloudflare deployment token; existing Worker secrets remain in Cloudflare.
+
+From a committed clean tree:
+
+```bash
+pnpm --filter @understudy/backend deploy:production -- \
+  /absolute/path/outside-the-repository/deployment-evidence.json \
+  /absolute/path/outside-the-repository/device-tokens.json \
+  /absolute/path/outside-the-repository/extension-id.txt \
+  /absolute/path/outside-the-repository/canary-device-credential.txt
+```
+
+The three credential/configuration inputs must be mode 0600. `device-tokens.json`
+must use the protocol-3 static-device shape, including `allowedOrigins` and
+`policyVersion` for every digest; the canary credential's digest must be present.
+The extension-ID file must contain the published Chrome ID
+`lbmbdjjaodgipnleaggclnobbijpadee`. The
+script creates a detached worktree at the validated full SHA, verifies the
+committed pnpm version, installs the committed lockfile offline and frozen,
+builds the local protocol and store extension, verifies the published artifact and production compatibility contract, and performs the dry run and deployment from
+that immutable dependency snapshot. It refreshes `origin/master` and requires
+the source SHA to remain its current head before preparation, secret upload,
+and deployment. It also rechecks the original tree before secret upload and
+immediately before deployment. After
+confirmation, it uploads the validated `DEVICE_TOKENS` and `EXTENSION_ID` and
+deploys with `--strict --tag <full-sha> --message "source <full-sha>"`. Bounded
+health requests must return three matching reads before mode-0600 evidence is
+written with configuration hashes, the compatibility secret version, source
+release, pnpm version, lockfile SHA-256, active Worker version, active
+deployment, the pre-mutation deployment and version inventories, each
+secret-derived version, and any secret-derived active version separately. The
+evidence file exists before the first secret upload and is updated to `failed`
+or `verified` by an exit trap.
+The device-token upload helper applies Wrangler's trailing-whitespace
+normalization before hashing, passes those exact normalized bytes to Wrangler,
+and aborts before invoking it if the normalized source changed after preflight.
+
+A production code rollback does not by itself prove that `DEVICE_TOKENS` and
+`EXTENSION_ID` returned to their prior values. Retain the previously approved
+mode-0600 sources through the cutover. If evidence reports
+`secretMutationPossible: true`, compare `priorVersions`,
+`deviceTokensSecretVersion`, and `extensionIdSecretVersion`, restore the prior
+secret sources when required, and verify health and pairing before resuming.
+
+After the cutover, set `PRODUCTION_AUTODEPLOY_ENABLED=true` in the production GitHub environment. A later compatibility-contract change blocks automatic deployment and requires this wrapper again. Credential revocation, cloud-vault deletion, DNS changes, and HSTS ramp changes remain explicit operator actions. See the [production rollout](../../docs/unattended-production-rollout.md).

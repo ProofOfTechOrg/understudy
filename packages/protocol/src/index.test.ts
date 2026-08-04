@@ -1,8 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   A11yNodeSchema,
+  ATTENDED_PROTOCOL_CAPABILITIES,
   CommandSchema,
   CommandRequestSchema,
+  DeviceControlClientFrameSchema,
   DeviceControlServerFrameSchema,
   DialogRecordSchema,
   EventSchema,
@@ -12,6 +14,8 @@ import {
   SessionServerFrameSchema,
   WS_CLOSE_REPLACED,
   WS_CLOSE_SESSION_TERMINAL,
+  isCommandResultEvent,
+  isCommandType,
   isWriteCommand,
   parseCommand,
   safeParseCommand,
@@ -24,6 +28,24 @@ describe("WebSocket close codes", () => {
   it("exports the stable replacement and terminal-session codes", () => {
     expect(WS_CLOSE_REPLACED).toBe(4001);
     expect(WS_CLOSE_SESSION_TERMINAL).toBe(4003);
+  });
+});
+
+describe("command result correlation", () => {
+  it("accepts only result types produced by the corresponding command", () => {
+    expect(isCommandResultEvent("snapshot", "snapshot_result")).toBe(true);
+    expect(isCommandResultEvent("snapshot", "screenshot_result")).toBe(true);
+    expect(isCommandResultEvent("capture_elements", "elements_result")).toBe(true);
+    expect(isCommandResultEvent("find_elements", "elements_result")).toBe(true);
+    expect(isCommandResultEvent("inspect_elements", "elements_result")).toBe(true);
+    expect(isCommandResultEvent("continue_elements", "elements_result")).toBe(true);
+    expect(isCommandResultEvent("get_tabs", "tabs_result")).toBe(true);
+    expect(isCommandResultEvent("list_cards", "cards_result")).toBe(true);
+    expect(isCommandResultEvent("submit_card", "card_submission_result")).toBe(true);
+    expect(isCommandResultEvent("submit_card", "action_result")).toBe(false);
+    expect(isCommandResultEvent("click", "cards_result")).toBe(false);
+    expect(isCommandResultEvent("fill_secret", "action_result")).toBe(false);
+    expect(isCommandType("fill_secret")).toBe(false);
   });
 });
 
@@ -52,20 +74,106 @@ describe("CommandSchema", () => {
     expect(CommandSchema.parse(cmd)).toEqual(cmd);
   });
 
-  it("parses a valid fill_secret command", () => {
+  it("parses bounded semantic element commands", () => {
+    const commands = [
+      {
+        type: "capture_elements",
+        commandId: "capture",
+        scope: "viewport",
+        view: "interactive",
+        limit: 200,
+        changesOnly: true,
+      },
+      {
+        type: "find_elements",
+        commandId: "find",
+        query: "Pay now",
+        roles: ["button", "link"],
+        match: "contains",
+        includeHidden: false,
+        limit: 50,
+      },
+      {
+        type: "inspect_elements",
+        commandId: "inspect",
+        ref: "opaque-ref",
+        depth: 8,
+        limit: 200,
+        includeBounds: true,
+      },
+      { type: "continue_elements", commandId: "next", cursor: "opaque-cursor" },
+    ];
+    for (const command of commands) expect(parseCommand(command)).toEqual(command);
+  });
+
+  it("enforces semantic query, role, depth, and result limits strictly", () => {
+    expect(
+      safeParseCommand({
+        type: "find_elements",
+        commandId: "find",
+        query: "😀".repeat(65),
+        roles: [],
+        match: "contains",
+        includeHidden: false,
+        limit: 20,
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({
+        type: "find_elements",
+        commandId: "find",
+        query: "Pay",
+        roles: Array.from({ length: 9 }, (_, index) => `role-${index}`),
+        match: "contains",
+        includeHidden: false,
+        limit: 20,
+      }).success,
+    ).toBe(false);
+    expect(
+      safeParseCommand({
+        type: "inspect_elements",
+        commandId: "inspect",
+        ref: "ref",
+        depth: 9,
+        limit: 80,
+        includeBounds: false,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("parses a valid card submission command", () => {
     const cmd = {
-      type: "fill_secret",
+      type: "submit_card",
       commandId: "c1",
-      ref: "opaque-ref",
-      secretRef: "vault://x",
-      submit: true,
+      cardAlias: "travel-card",
+      numberRef: "number-ref",
+      expiry: { kind: "split", monthRef: "month-ref", yearRef: "year-ref" },
+      cvvRef: "cvv-ref",
+      cardholderNameRef: "name-ref",
+      submitRef: "submit-ref",
     };
     expect(parseCommand(cmd)).toEqual(cmd);
   });
 
-  it("rejects fill_secret missing secretRef", () => {
+  it("leaves duplicate card refs to the fixed-result executor and rejects fill_secret", () => {
     expect(
-      safeParseCommand({ type: "fill_secret", commandId: "c1", ref: "opaque-ref" }).success,
+      safeParseCommand({
+        type: "submit_card",
+        commandId: "c1",
+        cardAlias: "travel-card",
+        numberRef: "same-ref",
+        expiry: { kind: "combined", ref: "expiry-ref" },
+        cvvRef: "cvv-ref",
+        submitRef: "same-ref",
+      }).success,
+    ).toBe(true);
+    expect(
+      safeParseCommand({
+        type: "fill_secret",
+        commandId: "c1",
+        ref: "opaque-ref",
+        secretRef: "vault://x",
+      }).success,
     ).toBe(false);
   });
 
@@ -84,7 +192,7 @@ describe("CommandSchema", () => {
     ).toBe(false);
   });
 
-  it("enforces bounded IDs, refs, text, keys, URLs, and secret references", () => {
+  it("enforces bounded IDs, refs, text, keys, URLs, and card aliases", () => {
     expect(safeParseCommand({ type: "get_tabs", commandId: "x".repeat(129) }).success).toBe(false);
     expect(
       safeParseCommand({ type: "click", commandId: "c", ref: "r".repeat(257) }).success,
@@ -109,10 +217,13 @@ describe("CommandSchema", () => {
     ).toBe(false);
     expect(
       safeParseCommand({
-        type: "fill_secret",
+        type: "submit_card",
         commandId: "c",
-        ref: "r",
-        secretRef: "s".repeat(513),
+        cardAlias: "s".repeat(65),
+        numberRef: "number",
+        expiry: { kind: "combined", ref: "expiry" },
+        cvvRef: "cvv",
+        submitRef: "submit",
       }).success,
     ).toBe(false);
   });
@@ -171,14 +282,18 @@ describe("isWriteCommand", () => {
     expect(isWriteCommand(snap)).toBe(false);
   });
 
-  it("classifies fill_secret as a write", () => {
-    const fillSecret: Command = {
-      type: "fill_secret",
+  it("classifies submit_card as a write and list_cards as a read", () => {
+    const submitCard: Command = {
+      type: "submit_card",
       commandId: "c1",
-      ref: "opaque-ref",
-      secretRef: "vault://x",
+      cardAlias: "travel-card",
+      numberRef: "number",
+      expiry: { kind: "combined", ref: "expiry" },
+      cvvRef: "cvv",
+      submitRef: "submit",
     };
-    expect(isWriteCommand(fillSecret)).toBe(true);
+    expect(isWriteCommand(submitCard)).toBe(true);
+    expect(isWriteCommand({ type: "list_cards", commandId: "c2" })).toBe(false);
   });
 
   it("classifies resolve_ref as a read - the dry-run probe must run freely", () => {
@@ -203,7 +318,16 @@ describe("isWriteCommand", () => {
       { type: "navigate", commandId: "c", url: "https://example.com/" },
       { type: "click", commandId: "c", ref: "r" },
       { type: "type", commandId: "c", ref: "r", text: "t" },
-      { type: "fill_secret", commandId: "c", ref: "r", secretRef: "vault://x" },
+      { type: "list_cards", commandId: "c" },
+      {
+        type: "submit_card",
+        commandId: "c",
+        cardAlias: "travel-card",
+        numberRef: "number",
+        expiry: { kind: "combined", ref: "expiry" },
+        cvvRef: "cvv",
+        submitRef: "submit",
+      },
       { type: "key", commandId: "c", keys: "Enter" },
       { type: "scroll", commandId: "c", dy: 10 },
       { type: "wait", commandId: "c", for: "load" },
@@ -258,6 +382,88 @@ describe("EventSchema", () => {
     expect(EventSchema.parse(ev)).toEqual(ev);
   });
 
+  it("round-trips fixed protocol-3 action metadata", () => {
+    const event = {
+      type: "action_result",
+      commandId: "c1",
+      ok: false,
+      reason: "target_changed",
+      generation: 7,
+      refsStale: true,
+      refreshRecommended: true,
+    };
+    expect(EventSchema.parse(event)).toEqual(event);
+  });
+
+  it("round-trips a strict bounded semantic result", () => {
+    const event = {
+      type: "elements_result",
+      commandId: "capture",
+      operation: "snapshot",
+      status: "ok",
+      tabId: 7,
+      url: "https://example.com/",
+      snapshot: {
+        id: "snapshot-1",
+        generation: 3,
+        capturedAt: "2026-08-03T00:00:00.000Z",
+        scope: "viewport",
+        view: "interactive",
+        coverage: "complete",
+      },
+      elements: [
+        {
+          ref: "opaque-ref",
+          role: "button",
+          category: "interactive",
+          name: "Pay",
+          depth: 1,
+          visibility: "viewport",
+          actions: ["click", "key", "inspect"],
+          states: { disabled: false, pressed: "mixed" },
+        },
+      ],
+      page: { returned: 1, available: 1, hasMore: false },
+      delta: { requested: true, applied: false, added: 0, changed: 0, removed: 0 },
+    };
+    expect(EventSchema.parse(event)).toEqual(event);
+  });
+
+  it("rejects semantic results with mismatched pagination or unbounded output", () => {
+    const base = {
+      type: "elements_result",
+      commandId: "capture",
+      operation: "snapshot",
+      status: "ok",
+      tabId: 7,
+      url: "https://example.com/",
+      snapshot: {
+        id: "snapshot-1",
+        generation: 3,
+        capturedAt: "2026-08-03T00:00:00.000Z",
+        scope: "document",
+        view: "all",
+        coverage: "partial",
+      },
+      elements: [],
+      page: { returned: 1, available: 1, hasMore: false },
+    };
+    expect(EventSchema.safeParse(base).success).toBe(false);
+    expect(
+      EventSchema.safeParse({
+        ...base,
+        elements: Array.from({ length: 201 }, () => ({
+          role: "button",
+          category: "interactive",
+          depth: 0,
+          visibility: "viewport",
+          actions: ["inspect"],
+        })),
+        page: { returned: 201, available: 201, hasMore: false },
+      }).success,
+    ).toBe(false);
+  });
+
   it("round-trips an action_result with simulated:true", () => {
     const ev = { type: "action_result", commandId: "c1", ok: true, simulated: true };
     expect(EventSchema.parse(ev)).toEqual(ev);
@@ -285,19 +491,51 @@ describe("EventSchema", () => {
     expect(safeParseEvent({ type: "tabs_result", commandId: "c1" }).success).toBe(false);
   });
 
-  it("requires a protocol-v2 hello to expose exactly one owned tab", () => {
+  it("requires a protocol-v3 hello to expose exactly one owned tab", () => {
     const hello = {
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
       capabilities: [...PROTOCOL_CAPABILITIES],
       browser: "Chrome/125",
       extVersion: "0.1.0",
+      attachmentId: "attachment-1",
       tabs: [
         { tabId: 1, url: "about:blank", title: "", active: false },
         { tabId: 2, url: "about:blank", title: "", active: false },
       ],
     };
     expect(EventSchema.safeParse(hello).success).toBe(false);
+  });
+
+  it("represents an idle attended protocol-v3 connection without a tab", () => {
+    const hello = {
+      type: "hello",
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: [...ATTENDED_PROTOCOL_CAPABILITIES],
+      browser: "Chrome/125",
+      extVersion: "0.2.0",
+      attachmentId: null,
+      tabs: [],
+    };
+    expect(EventSchema.parse(hello)).toEqual(hello);
+  });
+
+  it("allows a provisional owned-window record without tab metadata", () => {
+    const frame = {
+      type: "heartbeat",
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      browserEpoch: "browser-epoch-1",
+      assignments: [],
+      ownedWindows: [{
+        sessionId: "session-1",
+        leaseId: "lease-1",
+        leaseEpoch: 1,
+        browserEpoch: "browser-epoch-1",
+        tabId: null,
+        windowId: 3,
+      }],
+    };
+    expect(DeviceControlClientFrameSchema.parse(frame)).toEqual(frame);
   });
 
   it("keeps a bounded multi-tab protocol-1 hello parseable during rollout", () => {
@@ -340,6 +578,26 @@ describe("EventSchema", () => {
       disposition: "accept",
     };
     expect(EventSchema.parse(ev)).toEqual(ev);
+  });
+
+  it("accepts only fixed card submission result combinations", () => {
+    expect(EventSchema.parse({
+      type: "card_submission_result",
+      commandId: "c1",
+      status: "not_started",
+      reason: "stale_ref",
+    })).toEqual({
+      type: "card_submission_result",
+      commandId: "c1",
+      status: "not_started",
+      reason: "stale_ref",
+    });
+    expect(EventSchema.safeParse({
+      type: "card_submission_result",
+      commandId: "c1",
+      status: "not_started",
+      reason: "submission_attempted",
+    }).success).toBe(false);
   });
 
   it("rejects a dialog with an unknown dialogType", () => {

@@ -1,5 +1,5 @@
 /**
- * Dashboard auth, CSRF, vault upload, and the full OAuth consent flow
+ * Dashboard auth, CSRF, pairing, and the full OAuth consent flow
  * (PR 4 of the MCP surface). All requests go through the module fetch
  * directly (the pool's exports wrapper rewrites hosts, and the dashboard's
  * origin checks are host-sensitive). Fresh users per test — storage is
@@ -9,14 +9,13 @@
 import { env } from "cloudflare:workers";
 import { PROTOCOL_CAPABILITIES } from "@understudy/protocol";
 import { describe, expect, it, vi } from "vitest";
-import { revokeDeviceForOwner } from "../src/api/sessions";
+import { revokeDeviceForOwner, updateOriginPolicyForOwner } from "../src/api/sessions";
 import { sha256Hex, taggedHmacHex } from "../src/auth";
 import type { RevokeCredentialOutcome } from "../src/device";
 import { safeNext, sameOriginRequest } from "../src/dashboard/auth";
 import { base64urlEncode } from "../src/base64url";
 import { sendOtpEmail } from "../src/dashboard/email";
 import type { Env } from "../src/types";
-import { createVault, listVaultSecretNames } from "../src/vault";
 import {
   CANONICAL,
   connectTicketRequest,
@@ -347,15 +346,13 @@ describe("dashboard CSRF + account cards", () => {
     expect(wrong.status).toBe(403);
   });
 
-  it("round-trips allowed origins and gates pairing on them", async () => {
+  it("allows an empty default policy and applies saved origins to later browsers", async () => {
     const user = await signedInUser();
-    // Pairing before any origin exists mints no code and returns the user to
-    // the dashboard, where the remedy (the Allowed origins card) lives.
     const early = await fetchApp(
       formPost("/dashboard/pair", { cookie: user.cookie, form: { csrf: user.csrf } }),
     );
-    expect(early.status).toBe(303);
-    expect(early.headers.get("Location")).toBe("/dashboard?notice=no-origins");
+    expect(early.status).toBe(200);
+    expect(await early.text()).toMatch(/data-offer="[A-Za-z0-9_-]{43}"/);
 
     const saved = await fetchApp(
       formPost("/dashboard/origins", {
@@ -372,8 +369,62 @@ describe("dashboard CSRF + account cards", () => {
     );
     expect(pair.status).toBe(200);
     const pairHtml = await pair.text();
-    expect(pairHtml).toMatch(/[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}/);
+    expect(pairHtml).toMatch(/data-offer="[A-Za-z0-9_-]{43}"/);
     expect(pairHtml).toContain("data-expires");
+  });
+
+  it("keeps the directory authoritative update pending until every coordinator accepts it", async () => {
+    const user = await signedInUser();
+    await pairDevice(user.userId);
+    const before = await directory().getUser(user.userId);
+    const unavailable = {
+      ...env,
+      TENANT_CONTROL: {
+        getByName: () => ({ updateDevicePolicy: async () => false }),
+      },
+    } as unknown as Env;
+
+    await expect(
+      updateOriginPolicyForOwner(
+        unavailable,
+        { userId: user.userId, tenantId: user.tenantId },
+        ["https://shop.example"],
+      ),
+    ).resolves.toEqual({
+      kind: "invalid",
+      message: "browser policies are still reconciling; retry",
+    });
+    expect((await directory().getUser(user.userId))?.allowedOrigins).toEqual(
+      before?.allowedOrigins,
+    );
+
+    await expect(
+      updateOriginPolicyForOwner(
+        env,
+        { userId: user.userId, tenantId: user.tenantId },
+        ["https://shop.example"],
+      ),
+    ).resolves.toMatchObject({ kind: "ok", origins: ["https://shop.example"] });
+    expect((await directory().getUser(user.userId))?.allowedOrigins).toEqual([
+      "https://shop.example",
+    ]);
+  });
+
+  it("commits canonical duplicate origins without retrying policy versions", async () => {
+    const user = await signedInUser();
+    const device = await pairDevice(user.userId);
+
+    await expect(
+      updateOriginPolicyForOwner(
+        env,
+        { userId: user.userId, tenantId: user.tenantId },
+        ["https://shop.example/", "https://shop.example"],
+      ),
+    ).resolves.toMatchObject({
+      kind: "ok",
+      origins: ["https://shop.example"],
+      devices: [{ deviceId: device.deviceId, policyVersion: 2 }],
+    });
   });
 
   it("resolves both card anchors, so card order carries no correctness weight", async () => {
@@ -386,25 +437,26 @@ describe("dashboard CSRF + account cards", () => {
     // #then each anchor has exactly one target, and no id is duplicated.
     for (const id of ["origins", "browsers"]) {
       expect(html.split(`id="${id}"`).length - 1).toBe(1);
-      expect(html.split(`href="#${id}"`).length - 1).toBe(1);
     }
   });
 
   it("creates a show-once token that verifies by digest, and revokes it", async () => {
     const user = await signedInUser();
+    const device = await pairDevice(user.userId);
     const created = await fetchApp(
       formPost("/dashboard/tokens/create", {
         cookie: user.cookie,
-        form: { csrf: user.csrf, label: "laptop" },
+        form: { csrf: user.csrf, label: "laptop", deviceId: device.deviceId },
       }),
     );
     expect(created.status).toBe(200);
     const createdHtml = await created.text();
-    const token = /usk_v1_[0-9A-Za-z]{16}_[A-Za-z0-9_-]{43}/.exec(createdHtml)?.[0];
+    const token = /usk_v2_[0-9A-Za-z]{16}_[A-Za-z0-9_-]{43}/.exec(createdHtml)?.[0];
     expect(token).toBeDefined();
     if (token === undefined) return;
     expect(await directory().verifyMcpToken(await sha256Hex(token))).toMatchObject({
       tenantId: user.tenantId,
+      deviceId: device.deviceId,
     });
 
     const listed = await directory().listMcpTokens(user.userId);
@@ -474,9 +526,8 @@ describe("dashboard device revoke kill switch", () => {
     } as unknown as Env;
   }
 
-  it("beats the warm positive credential cache", async () => {
-    // #given a paired device whose credential is cached positive (the first
-    // ticket request warms both the Worker cache and the DeviceAgent authority)
+  it("invalidates the credential immediately after revocation", async () => {
+    // #given a paired device with an established DeviceAgent authority
     const user = await signedInUser();
     const device = await pairDevice(user.userId);
     expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
@@ -486,17 +537,13 @@ describe("dashboard device revoke kill switch", () => {
     expect(revoked.status).toBe(303);
     expect(revoked.headers.get("location")).toBe("/dashboard?notice=device-revoked");
 
-    // #then the very next ticket request fails WITHOUT clearing the cache.
-    // 404, not 401: composite auth still resolves from the warm cache, so it
-    // is the DeviceAgent's persisted marker — not credential expiry — that
-    // refuses. Deleting the marker turns this back into a 200.
+    // #then directory revalidation rejects the very next ticket request.
     const retry = await fetchApp(connectTicketRequest(device.deviceCredential));
-    expect(retry.status).toBe(404);
+    expect(retry.status).toBe(401);
   });
 
   it("re-pushes on a second click without changing the notice", async () => {
-    // #given a device already revoked once, its credential still cached
-    // positive (so a 404 below can only come from the marker, not from auth)
+    // #given a device already revoked once
     const user = await signedInUser();
     const device = await pairDevice(user.userId);
     expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
@@ -510,7 +557,7 @@ describe("dashboard device revoke kill switch", () => {
     // idempotent teardown leaves the device refused
     expect(second.status).toBe(303);
     expect(second.headers.get("location")).toBe("/dashboard?notice=device-missing");
-    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(404);
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(401);
   });
 
   it("distinguishes an instant kill from an offline revoke in telemetry", async () => {
@@ -579,8 +626,7 @@ describe("dashboard device revoke kill switch", () => {
   });
 
   it("reports a failed coordinator leg without losing the agent teardown", async () => {
-    // #given a push whose coordinator leg throws after the agent leg succeeded,
-    // with the credential cached positive so the 404 below can only be the marker
+    // #given a push whose coordinator leg throws after the agent leg succeeded
     const user = await signedInUser();
     const device = await pairDevice(user.userId);
     expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(200);
@@ -604,7 +650,7 @@ describe("dashboard device revoke kill switch", () => {
       "device_revoke/cleanup_failed",
       "device_revoke/revoked_by_owner_offline",
     ]);
-    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(404);
+    expect((await fetchApp(connectTicketRequest(device.deviceCredential))).status).toBe(401);
   });
 
   it("disables the device in its own tenant's coordinator", async () => {
@@ -621,7 +667,12 @@ describe("dashboard device revoke kill switch", () => {
       credentialDigest: await sha256Hex(device.deviceCredential),
       credentialVersion: 1,
       allowedOrigins: ["https://example.com"],
+      policyVersion: device.policyVersion,
+      authoritySource: "directory",
+      acknowledgedPolicyVersion: device.policyVersion,
       capabilities: [...PROTOCOL_CAPABILITIES],
+      assignments: [],
+      ownedWindows: [],
     });
     expect(await coordinator.listDevices()).toContainEqual(
       expect.objectContaining({ deviceId: device.deviceId, status: "online" }),
@@ -675,113 +726,14 @@ describe("dashboard device revoke kill switch", () => {
   });
 });
 
-describe("dashboard vault upload", () => {
-  /** The client-side sealer, mirroring pages.ts's VAULT_UPLOAD_JS exactly. */
-  async function seal(
-    jwk: JsonWebKey,
-    plaintext: string,
-  ): Promise<{ epk: string; iv: string; ct: string }> {
-    const serverKey = await crypto.subtle.importKey(
-      "jwk",
-      jwk,
-      { name: "ECDH", namedCurve: "P-256" },
-      false,
-      [],
-    );
-    const ephemeral = (await crypto.subtle.generateKey(
-      { name: "ECDH", namedCurve: "P-256" },
-      true,
-      ["deriveBits"],
-    )) as CryptoKeyPair;
-    const shared = await crypto.subtle.deriveBits(
-      { name: "ECDH", public: serverKey } as unknown as SubtleCryptoDeriveKeyAlgorithm,
-      ephemeral.privateKey,
-      256,
-    );
-    const hkdf = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
-    const aes = await crypto.subtle.deriveKey(
-      {
-        name: "HKDF",
-        hash: "SHA-256",
-        salt: new Uint8Array(0),
-        info: new TextEncoder().encode("understudy-vault-upload-v1"),
-      },
-      hkdf,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["encrypt"],
-    );
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: iv as BufferSource },
-      aes,
-      new TextEncoder().encode(plaintext),
-    );
-    const epk = (await crypto.subtle.exportKey("raw", ephemeral.publicKey)) as ArrayBuffer;
-    return {
-      epk: base64urlEncode(new Uint8Array(epk)),
-      iv: base64urlEncode(iv),
-      ct: base64urlEncode(new Uint8Array(ciphertext)),
-    };
-  }
-
-  it("stores a browser-sealed secret as a decryptable vault envelope", async () => {
-    // #given the served upload key
+describe("retired dashboard vault routes", () => {
+  it("fails closed instead of exposing cloud-vault endpoints", async () => {
     const user = await signedInUser();
-    const keyRes = await fetchApp(pageGet("/dashboard/vault/pubkey", user.cookie));
-    expect(keyRes.status).toBe(200);
-    const jwk = (await keyRes.json()) as JsonWebKey;
-
-    // #when a client-sealed value is posted
-    const name = `secret-${crypto.randomUUID()}`;
-    const sealed = await seal(jwk, "hunter2");
-    const res = await fetchApp(
-      formPost("/dashboard/vault/put", {
-        cookie: user.cookie,
-        form: { csrf: user.csrf, name, ...sealed },
-      }),
-    );
-
-    // #then the standard envelope round-trips through the decrypting vault
-    expect(res.status).toBe(303);
-    expect(await createVault(env).get(`vault://${user.tenantId}/${name}`)).toBe("hunter2");
-    expect(await listVaultSecretNames(env, user.tenantId)).toContain(name);
-  });
-
-  it("rejects a garbage ciphertext without writing", async () => {
-    const user = await signedInUser();
-    const name = `secret-${crypto.randomUUID()}`;
-    const bad = await fetchApp(
-      formPost("/dashboard/vault/put", {
-        cookie: user.cookie,
-        form: { csrf: user.csrf, name, epk: "AAAA", iv: "AAAA", ct: "AAAA" },
-      }),
-    );
-    expect(await bad.text()).toContain("could not be read");
-    // Nothing was written under this tenant's namespace.
-    expect(await listVaultSecretNames(env, user.tenantId)).not.toContain(name);
-  });
-
-  it("rejects a hostile name via the name guard specifically, with a VALID payload", async () => {
-    // A validly-sealed payload isolates the name guard: only
-    // VAULT_SECRET_NAME_PATTERN can reject this, so the test fails if that
-    // guard is removed (the previous version passed on the unseal failure).
-    const user = await signedInUser();
-    const keyRes = await fetchApp(pageGet("/dashboard/vault/pubkey", user.cookie));
-    const jwk = (await keyRes.json()) as JsonWebKey;
-    const sealed = await seal(jwk, "value");
-    const res = await fetchApp(
-      formPost("/dashboard/vault/put", {
-        cookie: user.cookie,
-        form: { csrf: user.csrf, name: "../other-tenant/key", ...sealed },
-      }),
-    );
-    expect(await res.text()).toContain("Names use letters");
-    // The traversal-shaped name never became a KV key in any namespace.
-    const list = env.VAULT.list;
-    if (list === undefined) throw new Error("VAULT.list unavailable");
-    const listed = await list.call(env.VAULT, { prefix: "vault://" });
-    expect(listed.keys.map((k) => k.name).join("\n")).not.toContain("other-tenant/key");
+    expect((await fetchApp(pageGet("/dashboard/vault/pubkey", user.cookie))).status).toBe(404);
+    expect((await fetchApp(formPost("/dashboard/vault/put", {
+      cookie: user.cookie,
+      form: { csrf: user.csrf },
+    }))).status).toBe(404);
   });
 });
 
@@ -807,8 +759,37 @@ describe("OAuth consent flow end to end", () => {
     return registered.client_id;
   }
 
+  it("rejects every authorization request that does not carry exact S256 PKCE", async () => {
+    const user = await signedInUser();
+    const clientId = await registerClient();
+    const base = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: "https://client.example/cb",
+      scope: "mcp",
+      state: "pkce-negative",
+    });
+    const cases = [
+      { code_challenge_method: "S256" },
+      { code_challenge: "A".repeat(43) },
+      { code_challenge: "A".repeat(43), code_challenge_method: "plain" },
+      { code_challenge: "too-short", code_challenge_method: "S256" },
+      { code_challenge: `${"A".repeat(42)}+`, code_challenge_method: "S256" },
+    ];
+    for (const values of cases) {
+      const params = new URLSearchParams(base);
+      for (const [name, value] of Object.entries(values)) params.set(name, value);
+      const response = await fetchApp(
+        pageGet(`/oauth/authorize?${params.toString()}`, user.cookie),
+      );
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe("invalid authorization request");
+    }
+  });
+
   it("runs register → consent → code → token → authenticated MCP call", async () => {
     const user = await signedInUser();
+    const device = await pairDevice(user.userId);
     const clientId = await registerClient();
     const verifier = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
     const challenge = b64uOfBytes(
@@ -838,7 +819,13 @@ describe("OAuth consent flow end to end", () => {
     const approved = await fetchApp(
       formPost("/oauth/authorize", {
         cookie: user.cookie,
-        form: { csrf: user.csrf, authreq, sig, decision: "approve" },
+        form: {
+          csrf: user.csrf,
+          authreq,
+          sig,
+          decision: "approve",
+          deviceId: device.deviceId,
+        },
       }),
     );
     expect(approved.status).toBe(302);
@@ -847,6 +834,22 @@ describe("OAuth consent flow end to end", () => {
     expect(redirect.searchParams.get("state")).toBe("xyz");
     const code = redirect.searchParams.get("code") ?? "";
     expect(code.length).toBeGreaterThan(0);
+
+    // A wrong verifier fails without consuming the authorization code.
+    const wrongVerifier = await fetchApp(
+      new Request(`${CANONICAL}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: "https://client.example/cb",
+          client_id: clientId,
+          code_verifier: `${verifier.slice(0, -1)}${verifier.endsWith("A") ? "B" : "A"}`,
+        }),
+      }),
+    );
+    expect(wrongVerifier.status).toBe(400);
 
     // Exchange the code (PKCE, public client).
     const tokenRes = await fetchApp(
@@ -889,10 +892,61 @@ describe("OAuth consent flow end to end", () => {
     );
     expect(mcp.status).toBe(200);
     expect(await mcp.text()).toContain("understudy");
+
+    const dashboard = await fetchApp(pageGet("/dashboard", user.cookie));
+    const dashboardHtml = await dashboard.text();
+    expect(dashboardHtml).toContain("Test MCP Client");
+    const grantId = /name="grantId" value="([^"]+)"/.exec(dashboardHtml)?.[1] ?? "";
+    expect(grantId.length).toBeGreaterThan(0);
+    const revoked = await fetchApp(
+      formPost("/dashboard/oauth/revoke", {
+        cookie: user.cookie,
+        form: { csrf: user.csrf, grantId },
+      }),
+    );
+    expect(revoked.status).toBe(303);
+
+    const replay = await fetchApp(
+      new Request(`${CANONICAL}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: "https://client.example/cb",
+          client_id: clientId,
+          code_verifier: verifier,
+        }),
+      }),
+    );
+    expect(replay.status).toBe(400);
+
+    const afterRevoke = await fetchApp(
+      new Request(`${CANONICAL}/mcp`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${tokens.access_token}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "oauth-test", version: "0.0.0" },
+          },
+        }),
+      }),
+    );
+    expect(afterRevoke.status).toBe(401);
   });
 
   it("redirects a denial with access_denied and no grant", async () => {
     const user = await signedInUser();
+    const device = await pairDevice(user.userId);
     const clientId = await registerClient();
     const verifier = base64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
     const challenge = b64uOfBytes(
@@ -912,7 +966,13 @@ describe("OAuth consent flow end to end", () => {
     const denied = await fetchApp(
       formPost("/oauth/authorize", {
         cookie: user.cookie,
-        form: { csrf: user.csrf, authreq, sig, decision: "deny" },
+        form: {
+          csrf: user.csrf,
+          authreq,
+          sig,
+          decision: "deny",
+          deviceId: device.deviceId,
+        },
       }),
     );
     expect(denied.status).toBe(302);

@@ -11,12 +11,12 @@ Read [`docs/technical-plan.md`](docs/technical-plan.md) for the architecture, sa
 | Path | Purpose |
 |---|---|
 | `packages/protocol` | Published Zod 4 command, event, control-frame, and status contracts |
-| `packages/connector` | Published breakwater connectors for observe, act, and vaulted credential fill |
+| `packages/connector` | Published Breakwater connectors for browser observation and governed non-secret actions |
 | `apps/backend` | Hono Worker, session and device Agents, tenant coordinator, quotas, and telemetry |
-| `apps/extension` | WXT and React extension with attended and two-tab unattended hosting |
+| `apps/extension` | WXT and React extension with attended control, two-session unattended hosting, and a local payment-card vault |
 | `apps/cdp-spike` | Historical Manifest V3 CDP capability harness |
 
-`@understudy/protocol@0.8.0` and `@understudy/connector@0.5.1` are the current published versions. A local build does not publish them.
+`@understudy/protocol@0.8.0` and `@understudy/connector@0.5.1` are the current published versions. The pending coordinated changeset releases protocol 0.9.0 and connector 0.6.0; a local build does not publish them.
 
 ## Understand the isolation boundary
 
@@ -31,7 +31,7 @@ Understudy never:
 - Records video, GIF, Document Object Model history, or session content
 - Replaces consumer approval or durable audit
 
-Protocol 2 provides at-most-once write execution with explicit pending and unknown outcomes.
+Protocol 3 provides at-most-once write execution with explicit pending and unknown outcomes. It removes the cloud secret oracle. Payment cards remain encrypted inside the extension and are submitted through a dedicated sensitive boundary that returns no page-derived result.
 
 ## Develop the repository
 
@@ -50,12 +50,16 @@ pnpm typecheck
 pnpm test
 ```
 
-Dependencies use a 7-day minimum release age through `pnpm-workspace.yaml`. First-party `@proofoftech/*` packages are exempt.
+Dependencies use a 7-day minimum release age through `pnpm-workspace.yaml`.
+`@proofoftech/breakwater` is exempt because the workspace consumes its
+first-party releases immediately. Emergency security-patch exceptions use
+exact package-version selectors, so later releases remain quarantined.
 
 For the production extension:
 
 ```bash
 pnpm --filter @understudy/extension build
+pnpm --filter @understudy/extension test:e2e
 ```
 
 Load `apps/extension/.output/chrome-mv3/` through `chrome://extensions`. Follow the [real-Chromium acceptance runbook](apps/extension/RUNBOOK.md).
@@ -78,7 +82,9 @@ The Release workflow publishes the promoted versions with npm provenance. It rej
 
 Do not merge `master` back into `dev`. `NPM_TOKEN` needs publish access to the `@understudy` scope.
 
-Backend deployment remains a separate Wrangler operation. The tenant allowlists live in `apps/backend/wrangler.jsonc`, which is authoritative — enable a tenant only once its canary device is enrolled and reporting protocol 2, and name tenants explicitly, never `"*"`. Follow the [unattended production rollout runbook](docs/unattended-production-rollout.md) for deployment order, evidence gates, and rollback.
+The Deploy workflow updates staging after every `dev` push. After the one-time protocol-3 cutover, it updates production after every `master` push. Production deployment first rebuilds the store extension and requires its normalized contents to match `apps/extension/store-release.json` in the `published` state.
+
+Use the guarded production wrapper for the first protocol-3 cutover and any later compatibility-contract change. It validates the protocol-3 device map, published extension, canary credential, immutable source snapshot, Worker provenance, and deployment evidence. Follow the [production rollout runbook](docs/unattended-production-rollout.md).
 
 ## Preserve attended proof history
 

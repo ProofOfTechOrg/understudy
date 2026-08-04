@@ -195,11 +195,14 @@ describe("CfSessionCoordinator", () => {
     const host = createFakeHost();
     const coordinator = new CfSessionCoordinator(host);
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const fillSecret: Command = {
-      type: "fill_secret",
+    const submitCard: Command = {
+      type: "submit_card",
       commandId: "c4",
-      ref: "s1e2",
-      secretRef: "vault://super-secret-password",
+      cardAlias: "work",
+      numberRef: "s1e2",
+      expiry: { kind: "combined", ref: "s1e3" },
+      cvvRef: "s1e4",
+      submitRef: "s1e5",
     };
     const typeCmd: Command = {
       type: "type",
@@ -211,8 +214,13 @@ describe("CfSessionCoordinator", () => {
     let second: Promise<Event> | undefined;
     try {
       // #when both commands are sent one at a time
-      const first = send(coordinator, fillSecret);
-      coordinator.resolvePending({ type: "action_result", commandId: "c4", ok: true });
+      const first = send(coordinator, submitCard);
+      coordinator.resolvePending({
+        type: "card_submission_result",
+        commandId: "c4",
+        status: "outcome_unknown",
+        reason: "submission_attempted",
+      });
       await first;
       second = send(coordinator, typeCmd);
 

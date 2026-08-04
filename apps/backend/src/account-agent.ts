@@ -3,13 +3,13 @@
  * the MCP layer's session brain. The LLM is not a session manager: no tool
  * takes or returns a sessionId, so this object owns
  *
- *  1. the current session binding (survives MCP client reconnects, which
+ *  1. each device's current session binding (survives MCP client reconnects, which
  *     kill the per-connection UnderstudyMcp instance),
- *  2. the ref-staleness guard (refsValid/refsEpoch) — the dominant LLM
- *     failure mode is reusing a single-use ref after navigation, and this
- *     guard turns that into a zero-latency, self-correcting error without
- *     touching the device,
- *  3. the one-command-at-a-time mutex plus the retry/poll recovery loops
+ *  2. the exact semantic snapshot binding and ref-staleness guard — the
+ *     dominant LLM failure mode is reusing a generation-scoped ref after
+ *     navigation, and this guard turns that into a zero-latency recovery
+ *     result without touching the device,
+ *  3. one command at a time per device plus the retry/poll recovery loops
  *     around the service layer's dispatch outcomes.
  *
  * Everything goes through src/api/sessions.ts — the same admission path the
@@ -21,6 +21,7 @@ import {
   CommandSchema,
   type Command,
   type DialogRecord,
+  type ElementSnapshot,
   type Event,
   type UnattendedSessionLifecycle,
 } from "@understudy/protocol";
@@ -53,13 +54,20 @@ import { canonicalizeOrigins, RequestBodyError, stableJson } from "./validation"
 const CANONICAL_URL = CANONICAL_BASE_URL;
 
 const BINDING_KEY = "binding";
+// Protocol-2 storage keys are read only for one-way migration. Their coarse
+// state is always invalidated rather than treated as a live semantic cache.
 const REFS_VALID_KEY = "refsValid";
 const REFS_EPOCH_KEY = "refsEpoch";
 const REFS_URL_KEY = "refsUrl";
+const SNAPSHOT_BINDING_KEY = "snapshotBinding";
 const PENDING_CREATE_KEY = "pendingCreate";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isConnectingLifecycle(status: UnattendedSessionLifecycle): boolean {
+  return status === "allocating" || status === "provisioning" || status === "suspended";
 }
 
 /**
@@ -70,6 +78,7 @@ function sleep(ms: number): Promise<void> {
  */
 export interface McpActorRef {
   actorId: string;
+  deviceId: string;
 }
 
 /** The device shape MCP tools render, re-exported from the service layer. */
@@ -100,6 +109,26 @@ export interface RunCommandInput {
   write: boolean;
   usesRef: boolean;
   idempotencyKey?: string;
+  /** Legacy no-argument snapshot fallback when semantic capture is unsupported. */
+  legacyFallback?: CommandDraft;
+}
+
+export interface SnapshotBinding extends ElementSnapshot {
+  url: string;
+  valid: boolean;
+}
+
+function elementsFailureInvalidatesSnapshot(
+  event: Extract<Event, { type: "elements_result"; status: "error" }>,
+): boolean {
+  if (
+    event.reason === "invalid_cursor" ||
+    event.reason === "cursor_expired" ||
+    event.reason === "unsupported"
+  ) {
+    return false;
+  }
+  return event.reason !== "page_too_large" || event.operation === "snapshot";
 }
 
 export interface RunCommandEnvelope {
@@ -119,6 +148,7 @@ export type RunCommandResult =
   | { kind: "id_conflict"; commandId: string }
   | { kind: "busy_exhausted" }
   | { kind: "not_connected" }
+  | { kind: "legacy_snapshot_required" }
   | { kind: "unsupported" }
   | { kind: "terminal_session" };
 
@@ -156,8 +186,7 @@ export type SessionReport =
       profile: string;
       status: string;
       url: string | null;
-      refsValid: boolean;
-      refsEpoch: number;
+      snapshot: SnapshotBinding | null;
       dialogs: DialogRecord[];
       allowedOrigins: string[];
     }
@@ -178,17 +207,25 @@ export type GetResultOutcome =
 
 export class AccountAgent extends DurableObject<Env> {
   /**
-   * One command at a time per tenant, across every MCP connection: tasks
-   * chain onto this tail, and a failed task never blocks the next one.
+   * One operation at a time per physical browser, across every MCP
+   * connection bound to it. Independent devices must not head-of-line block
+   * one another.
    */
-  private tail: Promise<unknown> = Promise.resolve();
+  private readonly deviceTails = new Map<string, Promise<void>>();
 
-  private serialize<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.tail.then(task, task);
-    this.tail = next.then(
+  private serialize<T>(actor: McpActorRef, task: () => Promise<T>): Promise<T> {
+    const previous = this.deviceTails.get(actor.deviceId) ?? Promise.resolve();
+    const next = previous.then(task, task);
+    const tail = next.then(
       () => undefined,
       () => undefined,
     );
+    this.deviceTails.set(actor.deviceId, tail);
+    void tail.then(() => {
+      if (this.deviceTails.get(actor.deviceId) === tail) {
+        this.deviceTails.delete(actor.deviceId);
+      }
+    });
     return next;
   }
 
@@ -213,43 +250,133 @@ export class AccountAgent extends DurableObject<Env> {
     return mergeDeviceViews(directoryDevices, await listDevices(this.env, svcActor));
   }
 
-  private getBinding(): Promise<BoundSession | undefined> {
-    return this.ctx.storage.get<BoundSession>(BINDING_KEY);
+  private key(base: string, actor: McpActorRef): string {
+    return `${base}:${actor.deviceId}`;
   }
 
-  private async clearBinding(): Promise<void> {
-    await this.ctx.storage.delete(BINDING_KEY);
-    await this.setRefsValid(false);
+  private async getBinding(actor: McpActorRef): Promise<BoundSession | undefined> {
+    const scopedKey = this.key(BINDING_KEY, actor);
+    const scoped = await this.ctx.storage.get<BoundSession>(scopedKey);
+    if (scoped !== undefined) return scoped;
+
+    // Protocol-2 AccountAgent state used one account-wide namespace. A live
+    // binding already records the physical device that owns it, so it can be
+    // migrated without guessing. Leave a different device's legacy binding
+    // alone so the correctly bound credential can claim it later.
+    const legacy = await this.ctx.storage.get<BoundSession>(BINDING_KEY);
+    if (legacy === undefined || legacy.deviceId !== actor.deviceId) return undefined;
+    const legacyState = await this.ctx.storage.get<unknown>([
+      REFS_VALID_KEY,
+      REFS_EPOCH_KEY,
+      REFS_URL_KEY,
+      PENDING_CREATE_KEY,
+    ]);
+    await this.ctx.storage.put({
+      [scopedKey]: legacy,
+      ...(legacyState.get(REFS_VALID_KEY) === undefined
+        ? {}
+        : { [this.key(REFS_VALID_KEY, actor)]: legacyState.get(REFS_VALID_KEY) }),
+      ...(legacyState.get(REFS_EPOCH_KEY) === undefined
+        ? {}
+        : { [this.key(REFS_EPOCH_KEY, actor)]: legacyState.get(REFS_EPOCH_KEY) }),
+      ...(legacyState.get(REFS_URL_KEY) === undefined
+        ? {}
+        : { [this.key(REFS_URL_KEY, actor)]: legacyState.get(REFS_URL_KEY) }),
+      ...(legacyState.get(PENDING_CREATE_KEY) === undefined
+        ? {}
+        : { [this.key(PENDING_CREATE_KEY, actor)]: legacyState.get(PENDING_CREATE_KEY) }),
+    });
+    await this.ctx.storage.delete([
+      BINDING_KEY,
+      REFS_VALID_KEY,
+      REFS_EPOCH_KEY,
+      REFS_URL_KEY,
+      PENDING_CREATE_KEY,
+    ]);
+    return legacy;
   }
 
-  private async setRefsValid(
-    valid: boolean,
-    bumpEpoch = false,
-    url: string | null = null,
+  private async clearBinding(actor: McpActorRef): Promise<void> {
+    await this.ctx.storage.delete([
+      this.key(BINDING_KEY, actor),
+      this.key(SNAPSHOT_BINDING_KEY, actor),
+      this.key(REFS_VALID_KEY, actor),
+      this.key(REFS_EPOCH_KEY, actor),
+      this.key(REFS_URL_KEY, actor),
+    ]);
+  }
+
+  private async setSnapshotBinding(
+    actor: McpActorRef,
+    binding: SnapshotBinding | null,
   ): Promise<void> {
-    await this.ctx.storage.put(REFS_VALID_KEY, valid);
-    // The URL the current refs were observed at, so a later click that
-    // navigates can be detected by URL change and invalidate them.
-    await this.ctx.storage.put(REFS_URL_KEY, url);
-    if (bumpEpoch) {
-      const epoch = (await this.ctx.storage.get<number>(REFS_EPOCH_KEY)) ?? 0;
-      await this.ctx.storage.put(REFS_EPOCH_KEY, epoch + 1);
+    const key = this.key(SNAPSHOT_BINDING_KEY, actor);
+    if (binding === null) await this.ctx.storage.delete(key);
+    else await this.ctx.storage.put(key, binding);
+  }
+
+  private async invalidateSnapshot(actor: McpActorRef): Promise<void> {
+    const current = await this.snapshotState(actor);
+    if (current !== null && current.valid) {
+      await this.setSnapshotBinding(actor, { ...current, valid: false });
     }
   }
 
-  private async refsState(): Promise<{ valid: boolean; epoch: number; url: string | null }> {
-    return {
-      valid: (await this.ctx.storage.get<boolean>(REFS_VALID_KEY)) ?? false,
-      epoch: (await this.ctx.storage.get<number>(REFS_EPOCH_KEY)) ?? 0,
-      url: (await this.ctx.storage.get<string | null>(REFS_URL_KEY)) ?? null,
+  private async snapshotState(actor: McpActorRef): Promise<SnapshotBinding | null> {
+    const key = this.key(SNAPSHOT_BINDING_KEY, actor);
+    const current = await this.ctx.storage.get<SnapshotBinding>(key);
+    if (current !== undefined) return current;
+
+    const legacy = await this.ctx.storage.get<unknown>([
+      this.key(REFS_VALID_KEY, actor),
+      this.key(REFS_EPOCH_KEY, actor),
+      this.key(REFS_URL_KEY, actor),
+    ]);
+    const valid = legacy.get(this.key(REFS_VALID_KEY, actor));
+    const epoch = legacy.get(this.key(REFS_EPOCH_KEY, actor));
+    const url = legacy.get(this.key(REFS_URL_KEY, actor));
+    if (valid === undefined && epoch === undefined && url === undefined) return null;
+    const migrated: SnapshotBinding = {
+      id: "legacy-invalidated",
+      generation: typeof epoch === "number" && Number.isInteger(epoch) ? epoch : 0,
+      capturedAt: new Date(0).toISOString(),
+      scope: "document",
+      view: "interactive",
+      coverage: "partial",
+      url: typeof url === "string" ? url : "about:blank",
+      valid: false,
     };
+    await this.ctx.storage.put(key, migrated);
+    await this.ctx.storage.delete([
+      this.key(REFS_VALID_KEY, actor),
+      this.key(REFS_EPOCH_KEY, actor),
+      this.key(REFS_URL_KEY, actor),
+    ]);
+    return migrated;
+  }
+
+  private async reconcileSnapshotUrl(
+    actor: McpActorRef,
+    currentUrl: string | null,
+  ): Promise<SnapshotBinding | null> {
+    const snapshot = await this.snapshotState(actor);
+    if (
+      snapshot !== null &&
+      snapshot.valid &&
+      currentUrl !== snapshot.url
+    ) {
+      const invalidated = { ...snapshot, valid: false };
+      await this.setSnapshotBinding(actor, invalidated);
+      return invalidated;
+    }
+    return snapshot;
   }
 
   async openBrowser(
     actor: McpActorRef,
     input: { profile?: string; origins?: string[] },
   ): Promise<OpenBrowserResult> {
-    return this.serialize(() => this.openBrowserLocked(actor, input));
+    return this.serialize(actor, () => this.openBrowserLocked(actor, input));
   }
 
   private async openBrowserLocked(
@@ -259,7 +386,7 @@ export class AccountAgent extends DurableObject<Env> {
     const svcActor = this.serviceActor(actor);
     const profile = input.profile ?? "default";
 
-    const binding = await this.getBinding();
+    const binding = await this.getBinding(actor);
     if (binding !== undefined) {
       const current = await getSessionStatus(this.env, svcActor, binding.sessionId);
       if (current.kind === "ok" && "mode" in current.status && current.status.mode === "unattended") {
@@ -278,7 +405,7 @@ export class AccountAgent extends DurableObject<Env> {
               recovering: status.status === "recovering",
             };
           }
-          if (status.status === "allocating" || status.status === "provisioning") {
+          if (isConnectingLifecycle(status.status)) {
             return { kind: "connecting", profile };
           }
           // "closing": the lease is shutting down; a new create would collide
@@ -287,30 +414,21 @@ export class AccountAgent extends DurableObject<Env> {
         }
       }
       // Terminal, attended-shaped, or gone: drop the stale binding and open fresh.
-      await this.clearBinding();
+      await this.clearBinding(actor);
     }
 
     const summaries = await this.deviceViews(svcActor);
-    if (summaries.length === 0) return { kind: "no_paired_devices" };
-
-    const online = summaries.filter(
-      (device) =>
-        device.status === "online" &&
-        device.used !== null &&
-        device.capacity !== null &&
-        device.used < device.capacity,
-    );
-    if (online.length === 0) {
-      return summaries.some((device) => device.status === "online")
+    const chosen = summaries.find((device) => device.deviceId === actor.deviceId);
+    if (chosen === undefined) return { kind: "no_paired_devices" };
+    if (
+      chosen.status !== "online" ||
+      chosen.used === null ||
+      chosen.capacity === null ||
+      chosen.used >= chosen.capacity
+    ) {
+      return chosen.status === "online"
         ? { kind: "device_busy" }
-        : { kind: "devices_offline", devices: summaries };
-    }
-    const chosen = online[0];
-    // Unreachable (online.length > 0), but noUncheckedIndexedAccess forces
-    // the guard. Reaching it means a device we just proved online vanished,
-    // which is a create failure, not "everything is offline".
-    if (chosen === undefined) {
-      return { kind: "create_failed", reason: "device state changed mid-open" };
+        : { kind: "devices_offline", devices: [chosen] };
     }
 
     let allowedOrigins = chosen.allowedOrigins;
@@ -348,9 +466,11 @@ export class AccountAgent extends DurableObject<Env> {
     // Reuse the stored create key for this profile so a re-entrant open
     // (e.g. the model retrying after a transport error) replays the same
     // lease instead of allocating a second one.
-    const pending = await this.ctx.storage.get<PendingCreate>(PENDING_CREATE_KEY);
+    const pendingKey = this.key(PENDING_CREATE_KEY, actor);
+    const bindingKey = this.key(BINDING_KEY, actor);
+    const pending = await this.ctx.storage.get<PendingCreate>(pendingKey);
     const createKey = pending?.profile === profile ? pending.key : crypto.randomUUID();
-    await this.ctx.storage.put(PENDING_CREATE_KEY, { profile, key: createKey });
+    await this.ctx.storage.put(pendingKey, { profile, key: createKey });
 
     const created = await createSession(this.env, svcActor, {
       // The attended/unattended footgun lives below this one call site: an
@@ -360,7 +480,7 @@ export class AccountAgent extends DurableObject<Env> {
         mode: "unattended",
         deviceId,
         allowedOrigins,
-        profileStateKey: `mcp/${tenantId}/${profile}`,
+        profileStateKey: `mcp/${tenantId}/${actor.deviceId}/${profile}`,
       },
       idempotencyKey: createKey,
       requestUrl: CANONICAL_URL,
@@ -375,10 +495,10 @@ export class AccountAgent extends DurableObject<Env> {
         allowedOrigins,
         createdAt: new Date().toISOString(),
       };
-      await this.ctx.storage.put(BINDING_KEY, binding);
-      await this.ctx.storage.delete(PENDING_CREATE_KEY);
+      await this.ctx.storage.put(bindingKey, binding);
+      await this.ctx.storage.delete(pendingKey);
       // The owned tab starts at about:blank — the model must snapshot first.
-      await this.setRefsValid(false);
+      await this.setSnapshotBinding(actor, null);
       return created.kind === "connected"
         ? { kind: "ready", adopted: false, profile, url: null, allowedOrigins, recovering: false }
         : { kind: "connecting", profile };
@@ -389,7 +509,7 @@ export class AccountAgent extends DurableObject<Env> {
     // the coordinator already failed, wedging the model on a dead session. A
     // genuine re-entrant retry mints a fresh key via the success path above,
     // so nothing legitimate is lost.
-    await this.ctx.storage.delete(PENDING_CREATE_KEY);
+    await this.ctx.storage.delete(pendingKey);
     switch (created.kind) {
       case "idempotency_conflict":
         // The stored key was used with a different fingerprint (e.g. the
@@ -413,16 +533,14 @@ export class AccountAgent extends DurableObject<Env> {
           reason:
             "another session already drives this profile (origin or profile-state collision)",
         };
-      case "provision_failed":
-        return { kind: "create_failed", reason: "device connection unavailable" };
       case "bad_request":
         return { kind: "create_failed", reason: created.message };
     }
   }
 
   async closeBrowser(actor: McpActorRef): Promise<CloseBrowserResult> {
-    return this.serialize(async () => {
-      const binding = await this.getBinding();
+    return this.serialize(actor, async () => {
+      const binding = await this.getBinding(actor);
       if (binding === undefined) return { kind: "no_session" };
       const result = await deleteSession(
         this.env,
@@ -430,16 +548,20 @@ export class AccountAgent extends DurableObject<Env> {
         binding.sessionId,
         CANONICAL_URL,
       );
-      await this.clearBinding();
+      await this.clearBinding(actor);
       return result.kind === "closing" ? { kind: "closing" } : { kind: "closed" };
     });
   }
 
   async status(actor: McpActorRef): Promise<StatusReport> {
+    return this.serialize(actor, () => this.statusLocked(actor));
+  }
+
+  private async statusLocked(actor: McpActorRef): Promise<StatusReport> {
     const svcActor = this.serviceActor(actor);
     const devices = await this.deviceViews(svcActor);
 
-    const binding = await this.getBinding();
+    const binding = await this.getBinding(actor);
     if (binding === undefined) return { devices, session: { state: "none" } };
     const current = await getSessionStatus(this.env, svcActor, binding.sessionId);
     if (
@@ -448,11 +570,11 @@ export class AccountAgent extends DurableObject<Env> {
       current.status.mode !== "unattended" ||
       current.terminal
     ) {
-      await this.clearBinding();
+      await this.clearBinding(actor);
       return { devices, session: { state: "none" } };
     }
     const status = current.status;
-    if (status.status === "allocating" || status.status === "provisioning") {
+    if (isConnectingLifecycle(status.status)) {
       return {
         devices,
         session: { state: "connecting", profile: binding.profile, status: status.status },
@@ -461,7 +583,7 @@ export class AccountAgent extends DurableObject<Env> {
     if (status.status === "closing") {
       return { devices, session: { state: "closing", profile: binding.profile } };
     }
-    const refs = await this.refsState();
+    const snapshot = await this.reconcileSnapshotUrl(actor, status.currentUrl);
     return {
       devices,
       session: {
@@ -469,8 +591,7 @@ export class AccountAgent extends DurableObject<Env> {
         profile: binding.profile,
         status: status.status,
         url: status.currentUrl,
-        refsValid: refs.valid,
-        refsEpoch: refs.epoch,
+        snapshot,
         dialogs: status.dialogs,
         allowedOrigins: binding.allowedOrigins,
       },
@@ -478,8 +599,8 @@ export class AccountAgent extends DurableObject<Env> {
   }
 
   async runCommand(actor: McpActorRef, input: RunCommandInput): Promise<RunCommandEnvelope> {
-    return this.serialize(async () => {
-      const binding = await this.getBinding();
+    return this.serialize(actor, async () => {
+      const binding = await this.getBinding(actor);
       const outcome = await this.runCommandLocked(actor, input, binding);
       return { outcome, allowedOrigins: binding?.allowedOrigins ?? null };
     });
@@ -492,15 +613,24 @@ export class AccountAgent extends DurableObject<Env> {
   ): Promise<RunCommandResult> {
     if (binding === undefined) return { kind: "no_session" };
 
+    const svcActor = this.serviceActor(actor);
     let lastUrl: string | null = null;
     if (input.usesRef) {
-      const refs = await this.refsState();
+      const current = await getSessionStatus(this.env, svcActor, binding.sessionId);
+      const knownUrl =
+        current.kind === "ok" &&
+        !current.terminal &&
+        "mode" in current.status &&
+        current.status.mode === "unattended" &&
+        current.status.status === "connected"
+          ? current.status.currentUrl
+          : null;
+      const refs = await this.reconcileSnapshotUrl(actor, knownUrl);
       // Zero-latency hard guard: never send a doomed ref to the device.
-      if (!refs.valid) return { kind: "stale_refs" };
+      if (refs?.valid !== true) return { kind: "stale_refs" };
       lastUrl = refs.url;
     }
 
-    const svcActor = this.serviceActor(actor);
     const salt = input.idempotencyKey ?? crypto.randomUUID();
     const command = await this.buildCommand(binding.sessionId, input, salt);
     const parsed = CommandSchema.safeParse(command);
@@ -514,6 +644,23 @@ export class AccountAgent extends DurableObject<Env> {
 
     const deps = this.dispatchDeps(svcActor, binding.sessionId);
     let result: RunCommandResult = await runDispatchLoop(parsed.data, deps);
+    if (
+      result.kind === "legacy_snapshot_required" &&
+      input.legacyFallback !== undefined
+    ) {
+      const fallback = await this.buildCommand(
+        binding.sessionId,
+        { ...input, draft: input.legacyFallback },
+        crypto.randomUUID(),
+      );
+      const parsedFallback = CommandSchema.safeParse(fallback);
+      if (parsedFallback.success) {
+        result = await runDispatchLoop(parsedFallback.data, deps);
+      }
+    }
+    if (result.kind === "legacy_snapshot_required") {
+      result = { kind: "unsupported" };
+    }
     if (result.kind === "id_conflict" && input.idempotencyKey !== undefined) {
       // The caller-chosen idempotency key collided with a different command
       // body. Retry exactly once under a fresh random identity.
@@ -524,7 +671,7 @@ export class AccountAgent extends DurableObject<Env> {
       }
     }
 
-    await this.applyRefBookkeeping(input, result, lastUrl);
+    await this.applyRefBookkeeping(actor, input, result, lastUrl);
     return result;
   }
 
@@ -569,6 +716,7 @@ export class AccountAgent extends DurableObject<Env> {
   }
 
   private async applyRefBookkeeping(
+    actor: McpActorRef,
     input: RunCommandInput,
     result: RunCommandResult,
     lastUrl: string | null = null,
@@ -577,20 +725,40 @@ export class AccountAgent extends DurableObject<Env> {
       // OUTCOME UNKNOWN: the page may have changed under us. Forcing a
       // snapshot before any further ref use makes the "do not retry,
       // observe" instruction enforced rather than merely requested.
-      await this.setRefsValid(false);
+      await this.invalidateSnapshot(actor);
+      return;
+    }
+    if (input.draft.type === "navigate" && result.kind === "pending_exhausted") {
+      await this.invalidateSnapshot(actor);
       return;
     }
     if (result.kind === "terminal_session") {
-      await this.clearBinding();
+      await this.clearBinding(actor);
       return;
     }
     if (result.kind !== "terminal") return;
     const event = result.event;
-    if (input.draft.type === "snapshot" && event.type === "snapshot_result") {
-      await this.setRefsValid(true, true, event.url);
+    if (input.draft.type === "submit_card" && event.type === "card_submission_result") {
+      await this.applyCardResultBookkeeping(actor, event);
       return;
     }
-    if (event.type !== "action_result" || !event.ok) return;
+    if (await this.applySnapshotResultBookkeeping(actor, event)) return;
+    if (event.type !== "action_result") return;
+    const snapshot = await this.snapshotState(actor);
+    if (
+      event.refsStale === true ||
+      (event.generation !== undefined &&
+        snapshot !== null &&
+        event.generation !== snapshot.generation) ||
+      ["stale_ref", "target_changed", "frame_changed", "page_changed"].includes(
+        event.reason ?? "",
+      ) ||
+      event.error?.startsWith("stale or unknown ref") === true
+    ) {
+      await this.invalidateSnapshot(actor);
+      return;
+    }
+    if (!event.ok) return;
     // Any successful action that CHANGED the URL invalidates every ref — not
     // just an explicit navigate. A click that navigates is the most common
     // way an LLM moves pages, so the guard must catch it too (D11). The
@@ -598,12 +766,19 @@ export class AccountAgent extends DurableObject<Env> {
     const navigated =
       input.draft.type === "navigate" ||
       (event.url !== undefined && lastUrl !== null && event.url !== lastUrl);
-    if (navigated) await this.setRefsValid(false);
+    if (navigated) await this.invalidateSnapshot(actor);
   }
 
-  /** Collects a command previously reported pending — read-only, no mutex. */
+  /** Collects a command previously reported pending and converges local bookkeeping. */
   async getResult(actor: McpActorRef, commandId: string): Promise<GetResultOutcome> {
-    const binding = await this.getBinding();
+    return this.serialize(actor, () => this.getResultLocked(actor, commandId));
+  }
+
+  private async getResultLocked(
+    actor: McpActorRef,
+    commandId: string,
+  ): Promise<GetResultOutcome> {
+    const binding = await this.getBinding(actor);
     if (binding === undefined) return { kind: "no_session" };
     const polled = await pollCommand(
       this.env,
@@ -613,17 +788,110 @@ export class AccountAgent extends DurableObject<Env> {
     );
     if (polled.kind !== "ok") return { kind: "not_found" };
     switch (polled.record.status) {
-      case "completed":
-        return polled.record.event !== undefined
-          ? { kind: "completed", event: polled.record.event }
-          : { kind: "unknown_outcome" };
+      case "completed": {
+        const event = polled.record.event;
+        if (event === undefined) {
+          await this.invalidateSnapshot(actor);
+          return { kind: "unknown_outcome" };
+        }
+        await this.applyPolledEventBookkeeping(actor, event);
+        return { kind: "completed", event };
+      }
       case "not_started":
       case "timed_out":
         return { kind: "did_not_run", status: polled.record.status };
       case "unknown":
+        await this.invalidateSnapshot(actor);
         return { kind: "unknown_outcome" };
       default:
         return { kind: "in_progress", status: polled.record.status };
     }
+  }
+
+  private async applyPolledEventBookkeeping(actor: McpActorRef, event: Event): Promise<void> {
+    if (event.type === "card_submission_result") {
+      await this.applyCardResultBookkeeping(actor, event);
+      return;
+    }
+    if (await this.applySnapshotResultBookkeeping(actor, event)) return;
+    if (event.type !== "action_result") return;
+    const snapshot = await this.snapshotState(actor);
+    if (
+      event.refsStale === true ||
+      (event.generation !== undefined &&
+        snapshot !== null &&
+        event.generation !== snapshot.generation) ||
+      (event.url !== undefined && snapshot !== null && event.url !== snapshot.url)
+    ) {
+      await this.invalidateSnapshot(actor);
+    }
+  }
+
+  private async applySnapshotResultBookkeeping(
+    actor: McpActorRef,
+    event: Event,
+  ): Promise<boolean> {
+    if (event.type === "elements_result") {
+      if (event.status === "ok") {
+        if (event.operation === "inspect" || event.operation === "next") {
+          const current = await this.snapshotState(actor);
+          if (
+            current === null ||
+            current.id !== event.snapshot.id ||
+            current.generation !== event.snapshot.generation ||
+            current.url !== event.url
+          ) {
+            await this.invalidateSnapshot(actor);
+          }
+        } else if (event.operation === "find") {
+          const current = await this.snapshotState(actor);
+          if (
+            current === null ||
+            current.id !== event.snapshot.id ||
+            current.generation !== event.snapshot.generation ||
+            current.url !== event.url
+          ) {
+            await this.setSnapshotBinding(actor, {
+              ...event.snapshot,
+              url: event.url,
+              valid: true,
+            });
+          }
+        } else {
+          await this.setSnapshotBinding(actor, {
+            ...event.snapshot,
+            url: event.url,
+            valid: true,
+          });
+        }
+      } else if (elementsFailureInvalidatesSnapshot(event)) {
+        await this.invalidateSnapshot(actor);
+      }
+      return true;
+    }
+    if (event.type !== "snapshot_result") return false;
+    const previous = await this.snapshotState(actor);
+    await this.setSnapshotBinding(actor, {
+      id: `legacy:${event.commandId}`,
+      generation: (previous?.generation ?? 0) + 1,
+      capturedAt: new Date().toISOString(),
+      scope: "document",
+      view: "interactive",
+      coverage: "partial",
+      url: event.url,
+      valid: true,
+    });
+    return true;
+  }
+
+  private async applyCardResultBookkeeping(
+    actor: McpActorRef,
+    event: Extract<Event, { type: "card_submission_result" }>,
+  ): Promise<void> {
+    if (event.status === "outcome_unknown") {
+      await this.clearBinding(actor);
+      return;
+    }
+    await this.invalidateSnapshot(actor);
   }
 }

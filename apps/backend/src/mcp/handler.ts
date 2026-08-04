@@ -6,6 +6,7 @@
  */
 
 import { authenticatedRateAllowed } from "../auth";
+import { getDirectory } from "../account-directory";
 import type { Env } from "../types";
 import { UnderstudyMcp } from "./mcp-agent";
 import { isUnderstudyMcpProps, mcpUnauthorized } from "./props";
@@ -16,6 +17,9 @@ export const guardedMcpHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const props = (ctx as { props?: unknown }).props;
     if (!isUnderstudyMcpProps(props)) {
+      return mcpUnauthorized(new URL(request.url).origin);
+    }
+    if (!(await getDirectory(env).authorizeMcpIdentity(props))) {
       return mcpUnauthorized(new URL(request.url).origin);
     }
     if (

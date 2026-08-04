@@ -1,9 +1,12 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 2 as const;
+export const PROTOCOL_VERSION = 3 as const;
 export const COMMAND_HTTP_BODY_MAX_BYTES = 128 * 1024;
 export const DEVICE_CONTROL_FRAME_MAX_BYTES = 64 * 1024;
 export const SESSION_RESULT_FRAME_MAX_BYTES = 16 * 1024 * 1024;
+export const ELEMENTS_RESULT_MAX_BYTES = 32 * 1024;
+export const MAX_ELEMENT_DESCRIPTORS = 200;
+export const MAX_SEMANTIC_NODES = 20_000;
 export const MAX_A11Y_NODES = 5_000;
 export const MAX_A11Y_DEPTH = 64;
 export const WS_CLOSE_REPLACED = 4001;
@@ -17,13 +20,19 @@ const utf8String = (maxBytes: number) =>
     }
   });
 const IdSchema = z.string().min(1).max(128);
-const RefSchema = z.string().min(1).max(256);
+export const RefSchema = z.string().min(1).max(256);
+export const CardAliasSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9._-]+$/);
 const UrlStringSchema = z.string().min(1).superRefine((value, ctx) => {
   if (utf8ByteLength(value) > 8 * 1024) {
     ctx.addIssue({ code: "custom", message: "URL exceeds 8192 bytes" });
   }
 });
 const AbsoluteUrlSchema = UrlStringSchema.pipe(z.url());
+export const AllowedOriginSchema = UrlStringSchema;
 const TimestampSchema = z.iso.datetime({ offset: true });
 const NonnegativeIntSchema = z.number().int().nonnegative();
 
@@ -88,6 +97,167 @@ export const SnapshotTargetSchema = strictObject({
 });
 export type SnapshotTarget = z.infer<typeof SnapshotTargetSchema>;
 
+export const ElementScopeSchema = z.enum(["viewport", "document"]);
+export type ElementScope = z.infer<typeof ElementScopeSchema>;
+
+export const ElementViewSchema = z.enum(["interactive", "content", "all"]);
+export type ElementView = z.infer<typeof ElementViewSchema>;
+
+export const ElementOperationSchema = z.enum(["snapshot", "find", "inspect", "next"]);
+export type ElementOperation = z.infer<typeof ElementOperationSchema>;
+
+export const ElementActionSchema = z.enum(["click", "type", "key", "scroll", "inspect"]);
+export type ElementAction = z.infer<typeof ElementActionSchema>;
+
+export const ElementVisibilitySchema = z.enum([
+  "viewport",
+  "offscreen",
+  "hidden",
+  "unknown",
+]);
+export type ElementVisibility = z.infer<typeof ElementVisibilitySchema>;
+
+const ElementStringSchema = utf8String(512);
+const OptionalBooleanOrMixedSchema = z.union([z.boolean(), z.literal("mixed")]);
+
+export const ElementDescriptorSchema = strictObject({
+  ref: RefSchema.optional(),
+  role: ElementStringSchema.min(1),
+  category: z.enum(["interactive", "content", "structure", "status"]),
+  name: ElementStringSchema.optional(),
+  description: ElementStringSchema.optional(),
+  depth: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+  visibility: ElementVisibilitySchema,
+  actions: z.array(ElementActionSchema).max(ElementActionSchema.options.length),
+  states: strictObject({
+    disabled: z.boolean().optional(),
+    readonly: z.boolean().optional(),
+    required: z.boolean().optional(),
+    invalid: z.boolean().optional(),
+    checked: OptionalBooleanOrMixedSchema.optional(),
+    selected: z.boolean().optional(),
+    expanded: z.boolean().optional(),
+    pressed: OptionalBooleanOrMixedSchema.optional(),
+    focused: z.boolean().optional(),
+    level: NonnegativeIntSchema.optional(),
+    modal: z.boolean().optional(),
+    hasPopup: utf8String(128).optional(),
+  }).optional(),
+  form: strictObject({
+    inputType: utf8String(128).optional(),
+    placeholder: ElementStringSchema.optional(),
+    autocomplete: ElementStringSchema.optional(),
+  }).optional(),
+  range: strictObject({
+    min: z.number().finite().optional(),
+    max: z.number().finite().optional(),
+    now: z.number().finite().optional(),
+    text: ElementStringSchema.optional(),
+  }).optional(),
+  bounds: strictObject({
+    x: z.number().finite(),
+    y: z.number().finite(),
+    width: z.number().finite().nonnegative(),
+    height: z.number().finite().nonnegative(),
+  }).optional(),
+  relation: z.enum(["match", "ancestor", "sibling", "descendant"]).optional(),
+  change: z.enum(["added", "changed", "removed", "unchanged_context"]).optional(),
+});
+export type ElementDescriptor = z.infer<typeof ElementDescriptorSchema>;
+
+export const ElementSnapshotSchema = strictObject({
+  id: IdSchema,
+  generation: NonnegativeIntSchema,
+  capturedAt: TimestampSchema,
+  scope: ElementScopeSchema,
+  view: ElementViewSchema,
+  coverage: z.enum(["complete", "partial"]),
+});
+export type ElementSnapshot = z.infer<typeof ElementSnapshotSchema>;
+
+export const ElementsFailureReasonSchema = z.enum([
+  "capture_failed",
+  "page_changed",
+  "page_too_large",
+  "stale_ref",
+  "target_changed",
+  "frame_changed",
+  "snapshot_expired",
+  "cursor_expired",
+  "invalid_cursor",
+  "sensitive_mode",
+  "unsupported",
+]);
+export type ElementsFailureReason = z.infer<typeof ElementsFailureReasonSchema>;
+
+const ElementsResultSuccessSchema = strictObject({
+  type: z.literal("elements_result"),
+  commandId: IdSchema,
+  operation: ElementOperationSchema,
+  status: z.literal("ok"),
+  tabId: NonnegativeIntSchema,
+  url: UrlStringSchema,
+  snapshot: ElementSnapshotSchema,
+  elements: z.array(ElementDescriptorSchema).max(MAX_ELEMENT_DESCRIPTORS),
+  page: strictObject({
+    returned: NonnegativeIntSchema.max(MAX_ELEMENT_DESCRIPTORS),
+    available: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+    hasMore: z.boolean(),
+    cursor: z.string().min(1).max(128).optional(),
+  }),
+  delta: strictObject({
+    requested: z.boolean(),
+    applied: z.boolean(),
+    added: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+    changed: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+    removed: NonnegativeIntSchema.max(MAX_SEMANTIC_NODES),
+  }).optional(),
+}).superRefine((result, ctx) => {
+  if (result.page.returned !== result.elements.length) {
+    ctx.addIssue({ code: "custom", path: ["page", "returned"], message: "returned mismatch" });
+  }
+  if (result.page.hasMore !== (result.page.cursor !== undefined)) {
+    ctx.addIssue({ code: "custom", path: ["page", "cursor"], message: "cursor/hasMore mismatch" });
+  }
+  if (result.delta !== undefined && result.operation !== "snapshot") {
+    ctx.addIssue({ code: "custom", path: ["delta"], message: "delta is snapshot-only" });
+  }
+  if (utf8ByteLength(JSON.stringify(result)) > ELEMENTS_RESULT_MAX_BYTES) {
+    ctx.addIssue({ code: "custom", message: `elements result exceeds ${ELEMENTS_RESULT_MAX_BYTES} bytes` });
+  }
+});
+
+const ElementsResultErrorSchema = strictObject({
+  type: z.literal("elements_result"),
+  commandId: IdSchema,
+  operation: ElementOperationSchema,
+  status: z.literal("error"),
+  reason: ElementsFailureReasonSchema,
+  retryable: z.boolean(),
+});
+
+export const ElementsResultSchema = z.discriminatedUnion("status", [
+  ElementsResultSuccessSchema,
+  ElementsResultErrorSchema,
+]);
+export type ElementsResult = z.infer<typeof ElementsResultSchema>;
+
+export const ActionFailureReasonSchema = z.enum([
+  "no_session",
+  "tab_mismatch",
+  "stale_ref",
+  "target_changed",
+  "frame_changed",
+  "sensitive_mode",
+  "unsupported",
+  "navigation_blocked",
+  "page_changed",
+  "timeout",
+  "action_failed",
+  "result_too_large",
+]);
+export type ActionFailureReason = z.infer<typeof ActionFailureReasonSchema>;
+
 export const DialogTypeSchema = z.enum(["alert", "confirm", "prompt", "beforeunload"]);
 export type DialogType = z.infer<typeof DialogTypeSchema>;
 
@@ -136,6 +306,36 @@ export const CommandSchema = z.discriminatedUnion("type", [
     tabId: NonnegativeIntSchema.optional(),
   }),
   strictObject({
+    type: z.literal("capture_elements"),
+    ...CommandBase,
+    scope: ElementScopeSchema,
+    view: ElementViewSchema,
+    limit: z.number().int().min(1).max(MAX_ELEMENT_DESCRIPTORS),
+    changesOnly: z.boolean(),
+  }),
+  strictObject({
+    type: z.literal("find_elements"),
+    ...CommandBase,
+    query: utf8String(256).min(1),
+    roles: z.array(utf8String(256).min(1)).max(8),
+    match: z.enum(["contains", "exact"]),
+    includeHidden: z.boolean(),
+    limit: z.number().int().min(1).max(50),
+  }),
+  strictObject({
+    type: z.literal("inspect_elements"),
+    ...CommandBase,
+    ref: RefSchema,
+    depth: z.number().int().min(0).max(8),
+    limit: z.number().int().min(1).max(MAX_ELEMENT_DESCRIPTORS),
+    includeBounds: z.boolean(),
+  }),
+  strictObject({
+    type: z.literal("continue_elements"),
+    ...CommandBase,
+    cursor: z.string().min(1).max(128),
+  }),
+  strictObject({
     type: z.literal("navigate"),
     ...CommandBase,
     url: AbsoluteUrlSchema,
@@ -149,12 +349,23 @@ export const CommandSchema = z.discriminatedUnion("type", [
     text: utf8String(64 * 1024),
     submit: z.boolean().optional(),
   }),
+  strictObject({ type: z.literal("list_cards"), ...CommandBase }),
   strictObject({
-    type: z.literal("fill_secret"),
+    type: z.literal("submit_card"),
     ...CommandBase,
-    ref: RefSchema,
-    secretRef: z.string().min(1).max(512),
-    submit: z.boolean().optional(),
+    cardAlias: CardAliasSchema,
+    numberRef: RefSchema,
+    expiry: z.discriminatedUnion("kind", [
+      strictObject({ kind: z.literal("combined"), ref: RefSchema }),
+      strictObject({
+        kind: z.literal("split"),
+        monthRef: RefSchema,
+        yearRef: RefSchema,
+      }),
+    ]),
+    cvvRef: RefSchema,
+    cardholderNameRef: RefSchema.optional(),
+    submitRef: RefSchema,
   }),
   strictObject({
     type: z.literal("key"),
@@ -181,7 +392,7 @@ export const WRITE_COMMAND_TYPES = [
   "type",
   "key",
   "navigate",
-  "fill_secret",
+  "submit_card",
   "scroll",
   "switch_tab",
 ] as const satisfies readonly CommandType[];
@@ -192,13 +403,25 @@ export const isWriteCommand = (
 ): command is Extract<Command, { type: WriteCommandType }> => WRITE_COMMANDS.has(command.type);
 
 export const PROTOCOL_CAPABILITIES = [
-  "safe-write-v2",
-  "command-status-v2",
-  "dialog-ack-v2",
-  "single-owned-tab-v2",
+  "safe-write-v3",
+  "command-status-v3",
+  "dialog-ack-v3",
+  "single-owned-tab-v3",
+  "local-card-vault-v1",
+  "device-policy-v1",
+  "owned-window-inventory-v1",
+  "semantic-elements-v1",
 ] as const;
 export const ProtocolCapabilitySchema = z.enum(PROTOCOL_CAPABILITIES);
 export type ProtocolCapability = z.infer<typeof ProtocolCapabilitySchema>;
+
+export const ATTENDED_PROTOCOL_CAPABILITIES = [
+  "safe-write-v3",
+  "command-status-v3",
+  "dialog-ack-v3",
+  "single-owned-tab-v3",
+  "semantic-elements-v1",
+] as const satisfies readonly ProtocolCapability[];
 
 const HelloEventSchema = strictObject({
   type: z.literal("hello"),
@@ -209,18 +432,53 @@ const HelloEventSchema = strictObject({
   browserEpoch: IdSchema.optional(),
   leaseId: IdSchema.optional(),
   leaseEpoch: NonnegativeIntSchema.optional(),
+  attachmentId: IdSchema.nullable().optional(),
   tabs: z.array(TabInfoSchema).max(128),
 }).superRefine((event, ctx) => {
-  if (event.protocolVersion === PROTOCOL_VERSION && event.tabs.length !== 1) {
+  if (event.protocolVersion !== PROTOCOL_VERSION) return;
+  const unattended = event.leaseId !== undefined;
+  const expectedTabs = unattended || event.attachmentId !== null ? 1 : 0;
+  if (event.tabs.length !== expectedTabs) {
     ctx.addIssue({
       code: "custom",
       path: ["tabs"],
-      message: "protocol-v2 hello requires exactly one owned tab",
+      message: `protocol-v3 hello requires exactly ${expectedTabs} owned tabs`,
+    });
+  }
+  if (!unattended && event.attachmentId === undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["attachmentId"],
+      message: "attended protocol-v3 hello requires an attachment state",
+    });
+  }
+  if (unattended && event.attachmentId !== undefined && event.attachmentId !== null) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["attachmentId"],
+      message: "unattended protocol-v3 hello cannot carry an attachmentId",
     });
   }
 });
 
-export const EventSchema = z.discriminatedUnion("type", [
+const ActionResultSchema = strictObject({
+  type: z.literal("action_result"),
+  ...CommandBase,
+  ok: z.boolean(),
+  reason: ActionFailureReasonSchema.optional(),
+  generation: NonnegativeIntSchema.optional(),
+  refsStale: z.boolean().optional(),
+  refreshRecommended: z.boolean().optional(),
+  error: utf8String(4 * 1024).optional(),
+  url: UrlStringSchema.optional(),
+  simulated: z.boolean().optional(),
+}).superRefine((result, ctx) => {
+  if (result.ok && result.reason !== undefined) {
+    ctx.addIssue({ code: "custom", path: ["reason"], message: "successful action cannot have a failure reason" });
+  }
+});
+
+export const EventSchema = z.union([
   HelloEventSchema,
   strictObject({
     type: z.literal("snapshot_result"),
@@ -240,13 +498,39 @@ export const EventSchema = z.discriminatedUnion("type", [
     ...CommandBase,
     tabs: z.array(TabInfoSchema).max(1),
   }),
+  ActionResultSchema,
+  ElementsResultSchema,
   strictObject({
-    type: z.literal("action_result"),
+    type: z.literal("cards_result"),
     ...CommandBase,
-    ok: z.boolean(),
-    error: utf8String(4 * 1024).optional(),
-    url: UrlStringSchema.optional(),
-    simulated: z.boolean().optional(),
+    aliases: z.array(CardAliasSchema).max(100),
+    approvedOrigins: z.array(AllowedOriginSchema).max(32),
+  }),
+  strictObject({
+    type: z.literal("card_submission_result"),
+    ...CommandBase,
+    status: z.enum(["not_started", "outcome_unknown"]),
+    reason: z.enum([
+      "card_not_found",
+      "origin_not_approved",
+      "stale_ref",
+      "invalid_mapping",
+      "input_failed",
+      "submission_attempted",
+    ]),
+  }).superRefine((result, ctx) => {
+    const prefillReasons = new Set([
+      "card_not_found",
+      "origin_not_approved",
+      "stale_ref",
+      "invalid_mapping",
+    ]);
+    if (
+      (prefillReasons.has(result.reason) && result.status !== "not_started") ||
+      (result.reason === "submission_attempted" && result.status !== "outcome_unknown")
+    ) {
+      ctx.addIssue({ code: "custom", message: "card result status/reason mismatch" });
+    }
   }),
   strictObject({
     type: z.literal("page_event"),
@@ -260,6 +544,39 @@ export const EventSchema = z.discriminatedUnion("type", [
 export type Event = z.infer<typeof EventSchema>;
 export type EventType = Event["type"];
 
+const COMMAND_RESULT_EVENT_TYPES = {
+  snapshot: ["snapshot_result", "screenshot_result", "action_result"],
+  capture_elements: ["elements_result"],
+  find_elements: ["elements_result"],
+  inspect_elements: ["elements_result"],
+  continue_elements: ["elements_result"],
+  navigate: ["action_result"],
+  click: ["action_result"],
+  type: ["action_result"],
+  list_cards: ["cards_result"],
+  submit_card: ["card_submission_result"],
+  key: ["action_result"],
+  scroll: ["action_result"],
+  wait: ["action_result"],
+  resolve_ref: ["action_result"],
+  get_tabs: ["tabs_result", "action_result"],
+  switch_tab: ["action_result"],
+} as const satisfies Record<CommandType, readonly EventType[]>;
+
+export function isCommandResultEvent(
+  commandType: string,
+  eventType: EventType,
+): boolean {
+  const accepted = (
+    COMMAND_RESULT_EVENT_TYPES as Partial<Record<string, readonly EventType[]>>
+  )[commandType];
+  return accepted?.includes(eventType) ?? false;
+}
+
+export function isCommandType(commandType: string): commandType is CommandType {
+  return Object.hasOwn(COMMAND_RESULT_EVENT_TYPES, commandType);
+}
+
 export const CommandRequestSchema = strictObject({
   command: CommandSchema,
   dryRun: z.boolean().optional(),
@@ -269,6 +586,7 @@ export type CommandRequest = z.infer<typeof CommandRequestSchema>;
 export const CommandFenceSchema = strictObject({
   attemptId: IdSchema,
   deadlineAt: TimestampSchema,
+  attachmentId: IdSchema.optional(),
   leaseId: IdSchema.optional(),
   leaseEpoch: NonnegativeIntSchema.optional(),
   browserEpoch: IdSchema.optional(),
@@ -325,6 +643,7 @@ export const SessionClientFrameSchema = z.discriminatedUnion("type", [
     type: z.literal("command_result"),
     attemptId: IdSchema,
     commandId: IdSchema,
+    attachmentId: IdSchema.optional(),
     leaseId: IdSchema.optional(),
     leaseEpoch: NonnegativeIntSchema.optional(),
     browserEpoch: IdSchema.optional(),
@@ -343,13 +662,17 @@ export const SessionClientFrameSchema = z.discriminatedUnion("type", [
   strictObject({ type: z.literal("dialog"), ...DialogRecordSchema.shape }),
   strictObject({ type: z.literal("pong") }),
   strictObject({
+    type: z.literal("attended_detached"),
+    attachmentId: IdSchema,
+    tabId: NonnegativeIntSchema,
+  }),
+  strictObject({
     type: z.literal("health"),
     dialogDelivery: z.enum(["ok", "interrupted", "overflow"]),
   }),
 ]);
 export type SessionClientFrame = z.infer<typeof SessionClientFrameSchema>;
 
-export const AllowedOriginSchema = UrlStringSchema;
 export const UnattendedSessionRequestSchema = strictObject({
   mode: z.literal("unattended"),
   deviceId: z.uuid().optional(),
@@ -369,6 +692,7 @@ export const UnattendedSessionLifecycleSchema = z.enum([
   "provisioning",
   "connected",
   "recovering",
+  "suspended",
   "closing",
   "closed",
   "expired",
@@ -381,7 +705,8 @@ export type DialogDelivery = z.infer<typeof DialogDeliverySchema>;
 
 export const AttendedSessionStatusSchema = strictObject({
   mode: z.literal("attended").optional(),
-  status: z.enum(["pending", "connected", "detached"]),
+  status: z.enum(["pending", "idle", "connected", "detached"]),
+  attachmentId: IdSchema.nullable(),
   browser: DeviceBrowserSchema.nullable(),
   tabs: z.array(TabInfoSchema),
   currentUrl: UrlStringSchema.nullable(),
@@ -417,6 +742,15 @@ export const DeviceStatusSchema = strictObject({
   used: z.number().int().min(0).max(2),
   browser: DeviceBrowserSchema.nullable(),
   lastSeenAt: TimestampSchema.nullable(),
+  serverUsed: z.number().int().min(0).max(2),
+  managedAssignments: z.number().int().min(0).max(2).nullable(),
+  ownedWindows: z.number().int().min(0).max(100).nullable(),
+  missingOnServer: z.array(IdSchema).max(100),
+  missingOnDevice: z.array(IdSchema).max(100),
+  diverged: z.boolean(),
+  comparedAt: TimestampSchema.nullable(),
+  policyVersion: NonnegativeIntSchema,
+  acknowledgedPolicyVersion: NonnegativeIntSchema.nullable(),
 });
 export type DeviceStatus = z.infer<typeof DeviceStatusSchema>;
 
@@ -447,6 +781,25 @@ export const CommandStatusResponseSchema = strictObject({
 });
 export type CommandStatusResponse = z.infer<typeof CommandStatusResponseSchema>;
 
+const OwnedLeaseFenceShape = {
+  sessionId: IdSchema,
+  leaseId: IdSchema,
+  leaseEpoch: NonnegativeIntSchema,
+  browserEpoch: IdSchema,
+};
+export const AssignmentInventorySchema = strictObject({
+  ...OwnedLeaseFenceShape,
+  tabId: NonnegativeIntSchema,
+  windowId: NonnegativeIntSchema,
+});
+export type AssignmentInventory = z.infer<typeof AssignmentInventorySchema>;
+export const OwnedWindowSchema = strictObject({
+  ...OwnedLeaseFenceShape,
+  tabId: NonnegativeIntSchema.nullable(),
+  windowId: NonnegativeIntSchema,
+});
+export type OwnedWindow = z.infer<typeof OwnedWindowSchema>;
+
 export const DeviceControlClientFrameSchema = z.discriminatedUnion("type", [
   strictObject({
     type: z.literal("device_hello"),
@@ -457,12 +810,22 @@ export const DeviceControlClientFrameSchema = z.discriminatedUnion("type", [
     browser: z.string().min(1).max(512),
     extVersion: z.string().min(1).max(64),
     allowedOrigins: z.array(AllowedOriginSchema).max(32),
+    policyVersion: NonnegativeIntSchema,
+    assignments: z.array(AssignmentInventorySchema).max(2),
+    ownedWindows: z.array(OwnedWindowSchema).max(100),
   }),
   strictObject({
     type: z.literal("heartbeat"),
     deviceId: z.uuid(),
     browserEpoch: IdSchema,
-    leaseIds: z.array(IdSchema).max(2),
+    assignments: z.array(AssignmentInventorySchema).max(2),
+    ownedWindows: z.array(OwnedWindowSchema).max(100),
+  }),
+  strictObject({
+    type: z.literal("policy_ack"),
+    deviceId: z.uuid(),
+    browserEpoch: IdSchema,
+    policyVersion: NonnegativeIntSchema,
   }),
   strictObject({
     type: z.literal("provisioned"),
@@ -498,7 +861,17 @@ export const DeviceControlServerFrameSchema = z.discriminatedUnion("type", [
     leaseEpoch: NonnegativeIntSchema,
     browserEpoch: IdSchema,
     allowedOrigins: z.array(AllowedOriginSchema).min(1).max(32),
+    policyVersion: NonnegativeIntSchema,
     sessionTicket: z.string().min(1).max(4 * 1024),
+  }),
+  strictObject({
+    type: z.literal("policy_update"),
+    policyVersion: NonnegativeIntSchema,
+    allowedOrigins: z.array(AllowedOriginSchema).max(32),
+  }),
+  strictObject({
+    type: z.literal("close_orphan"),
+    ...OwnedWindowSchema.shape,
   }),
   strictObject({
     type: z.literal("close_lease"),

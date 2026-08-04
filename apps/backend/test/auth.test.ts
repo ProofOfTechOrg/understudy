@@ -9,6 +9,7 @@ import {
   isValidTenantId,
   mintSessionId,
   mintWsTicket,
+  sha256Hex,
   scopeSession,
   tenantOf,
   verifyExtensionToken,
@@ -28,7 +29,7 @@ const EXTENSION_TOKENS: Record<string, string> = {
   "ext-tok-2": "tenantB",
 };
 
-function makeEnv(overrides: Partial<Env> = {}): Env {
+function makeEnv(overrides: Partial<Record<keyof Env, unknown>> = {}): Env {
   return {
     SESSION: {} as unknown as Env["SESSION"],
     DEVICE: {} as unknown as Env["DEVICE"],
@@ -42,7 +43,12 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
     MCP_AGENT: {} as unknown as Env["MCP_AGENT"],
     ACCOUNT: {} as unknown as Env["ACCOUNT"],
     OAUTH_KV: {} as unknown as Env["OAUTH_KV"],
-    VAULT: {} as unknown as Env["VAULT"],
+    VERSION: {
+      id: "test-version",
+      tag: "test-commit",
+      timestamp: "2026-08-02T00:00:00.000Z",
+    },
+    EXTENSION_ID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     AUTH_HMAC_SECRET: "test-hmac-secret-do-not-use-in-prod",
     CALLER_TOKENS: JSON.stringify(CALLER_TOKENS),
     EXTENSION_TOKENS: JSON.stringify(EXTENSION_TOKENS),
@@ -51,10 +57,8 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
     QUOTA_POLICY: "",
     UNATTENDED_ENABLED_TENANTS: "[]",
     SAFE_WRITE_REQUIRED_TENANTS: "[]",
-    VAULT_MASTER_KEY: "unused-by-auth-tests",
-    VAULT_UPLOAD_PRIVATE_KEY: "unused-by-auth-tests",
     ...overrides,
-  };
+  } as Env;
 }
 
 function rateLimitEnv(keys: string[]): Env {
@@ -70,7 +74,8 @@ function rateLimitEnv(keys: string[]): Env {
 
 async function deviceTokenEnv(
   credential: string,
-  identity: Pick<DeviceIdentity, "tenantId" | "deviceId" | "credentialVersion">,
+  identity: Pick<DeviceIdentity, "tenantId" | "deviceId" | "credentialVersion"> &
+    Partial<Pick<DeviceIdentity, "allowedOrigins" | "policyVersion">>,
   overrides: Partial<Env> = {},
 ): Promise<Env> {
   const digest = Array.from(
@@ -80,7 +85,13 @@ async function deviceTokenEnv(
     (byte) => byte.toString(16).padStart(2, "0"),
   ).join("");
   return makeEnv({
-    DEVICE_TOKENS: JSON.stringify({ [digest]: identity }),
+    DEVICE_TOKENS: JSON.stringify({
+      [digest]: {
+        ...identity,
+        allowedOrigins: identity.allowedOrigins ?? ["https://example.com"],
+        policyVersion: identity.policyVersion ?? 1,
+      },
+    }),
     ...overrides,
   });
 }
@@ -184,7 +195,7 @@ describe("mintSessionId / scopeSession", () => {
   );
 
   it.each(["acme/eu", "", "/", "a/b"])(
-    "refuses to mint a sessionId for an unsafe tenantId %j (empty or slash-bearing would straddle the vault namespace)",
+    "refuses to mint a sessionId for an unsafe non-flat tenantId %j",
     async (badTenant) => {
       const env = makeEnv();
       await expect(mintSessionId(badTenant, env)).rejects.toThrow(/invalid tenantId/);
@@ -198,7 +209,7 @@ describe("isValidTenantId", () => {
   });
 
   it.each(["", "acme/eu", "/", "a/b/c"])(
-    "rejects an empty or slash-bearing tenantId %j - it must not straddle a vault://<tenant>/ prefix",
+    "rejects an empty or slash-bearing tenantId %j",
     (t) => {
       expect(isValidTenantId(t)).toBe(false);
     },
@@ -403,6 +414,8 @@ describe("device authentication and WebSocket tickets", () => {
           tenantId: "tenantA",
           deviceId: "00000000-0000-4000-8000-000000000001",
           credentialVersion: 2,
+          allowedOrigins: ["https://example.com"],
+          policyVersion: 1,
         },
       }),
     });
@@ -422,6 +435,46 @@ describe("device authentication and WebSocket tickets", () => {
     await expect(deviceCredentialExists(digest, identity, env)).resolves.toBe(true);
     await expect(
       deviceCredentialExists(digest, identity, makeEnv({ DEVICE_TOKENS: "{}" })),
+    ).resolves.toBe(false);
+  });
+
+  it.each([
+    ["an extra field", { extra: true }, ["https://example.com"]],
+    ["a noncanonical origin", {}, ["https://example.com/"]],
+  ])("rejects static device configuration with %s", async (_label, extra, origins) => {
+    const credential = "malformed-device-secret";
+    const digest = await sha256Hex(credential);
+    const identity = {
+      tenantId: "tenantA",
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      credentialVersion: 1,
+      credentialDigest: digest,
+      allowedOrigins: origins,
+      policyVersion: 1,
+    } satisfies DeviceIdentity;
+    const malformedEnv = makeEnv({
+      DEVICE_TOKENS: JSON.stringify({
+        [digest]: {
+          tenantId: identity.tenantId,
+          deviceId: identity.deviceId,
+          credentialVersion: identity.credentialVersion,
+          allowedOrigins: origins,
+          policyVersion: identity.policyVersion,
+          ...extra,
+        },
+      }),
+    });
+
+    await expect(
+      authenticateDevice(
+        new Request("https://understudy.example/v1/device/connect-ticket", {
+          headers: { authorization: `Bearer ${credential}` },
+        }),
+        malformedEnv,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      deviceCredentialExists(digest, identity, malformedEnv),
     ).resolves.toBe(false);
   });
 
@@ -502,7 +555,12 @@ describe("device authentication and WebSocket tickets", () => {
       agentName: "00000000-0000-4000-8000-000000000001",
     };
     const versioned = await mintWsTicket(
-      { ...deviceClaims, credentialVersion: 2 },
+      {
+        ...deviceClaims,
+        credentialVersion: 2,
+        allowedOrigins: ["https://example.com"],
+        policyVersion: 1,
+      },
       env,
       now,
     );
@@ -547,5 +605,59 @@ describe("device authentication and WebSocket tickets", () => {
         now,
       ),
     ).resolves.toBeNull();
+  });
+
+  it("validates device-ticket origins with the runtime canonical policy", async () => {
+    const env = makeEnv();
+    const now = 1_000_000;
+    const claims = {
+      aud: "device-control" as const,
+      tenantId: "tenantA",
+      deviceId: "00000000-0000-4000-8000-000000000001",
+      credentialVersion: 1,
+      policyVersion: 1,
+      leaseEpoch: 0,
+      browserEpoch: "browser-1",
+      agentName: "00000000-0000-4000-8000-000000000001",
+    };
+    const loopback = await mintWsTicket(
+      {
+        ...claims,
+        allowedOrigins: ["http://127.0.0.1:8787", "http://localhost:8787"],
+      },
+      env,
+      now,
+    );
+    await expect(
+      verifyWsTicket(
+        loopback,
+        { aud: "device-control", agentName: claims.agentName },
+        env,
+        now,
+      ),
+    ).resolves.toMatchObject({
+      allowedOrigins: ["http://127.0.0.1:8787", "http://localhost:8787"],
+    });
+
+    for (const allowedOrigins of [
+      ["http://example.com"],
+      ["https://example.com/"],
+      ["https://z.example", "https://a.example"],
+      ["https://example.com", "https://example.com"],
+    ]) {
+      const ticket = await mintWsTicket(
+        { ...claims, allowedOrigins },
+        env,
+        now,
+      );
+      await expect(
+        verifyWsTicket(
+          ticket,
+          { aud: "device-control", agentName: claims.agentName },
+          env,
+          now,
+        ),
+      ).resolves.toBeNull();
+    }
   });
 });

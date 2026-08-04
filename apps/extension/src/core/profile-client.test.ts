@@ -8,6 +8,7 @@ const CONFIG: ProfileConfig = {
   deviceId: "00000000-0000-4000-8000-000000000001",
   deviceCredential: "old-credential",
   originPolicy: ["https://app.example"],
+  policyVersion: 1,
 };
 const EPOCH = "browser-epoch-1";
 
@@ -66,6 +67,7 @@ interface BrowserFixture {
   localArea: ReturnType<typeof storageArea>;
   sessionArea: ReturnType<typeof storageArea>;
   removeTab: ReturnType<typeof vi.fn>;
+  removeWindow: ReturnType<typeof vi.fn>;
   getTab: ReturnType<typeof vi.fn>;
   createWindow: ReturnType<typeof vi.fn>;
 }
@@ -81,6 +83,7 @@ function installBrowser(
   const localArea = storageArea(local);
   const sessionArea = storageArea(session);
   const removeTab = vi.fn(async () => {});
+  const removeWindow = vi.fn(async () => {});
   const getTab = vi.fn(async (tabId: number) => ({
     id: tabId,
     url: "about:blank",
@@ -91,7 +94,10 @@ function installBrowser(
   const attachedTabs = new Set<number>();
   vi.stubGlobal("browser", {
     storage: { local: localArea, session: sessionArea },
-    runtime: { getManifest: () => ({ version: "0.1.0" }) },
+    runtime: {
+      getManifest: () => ({ version: "0.1.0" }),
+      getURL: (path: string) => new URL(path, "chrome-extension://understudy/").toString(),
+    },
     debugger: {
       attach: vi.fn(async (target: { tabId: number }) => {
         attachedTabs.add(target.tabId);
@@ -121,8 +127,16 @@ function installBrowser(
         },
       ),
     },
-    tabs: { remove: removeTab, get: getTab },
-    windows: { create: createWindow },
+    tabs: {
+      remove: removeTab,
+      get: getTab,
+      update: vi.fn(async (tabId: number) => ({ id: tabId, url: "about:blank" })),
+    },
+    windows: {
+      create: createWindow,
+      remove: removeWindow,
+      getAll: vi.fn(async () => [{ id: 3 }]),
+    },
   });
   return {
     local,
@@ -130,6 +144,7 @@ function installBrowser(
     localArea,
     sessionArea,
     removeTab,
+    removeWindow,
     getTab,
     createWindow,
   };
@@ -160,6 +175,8 @@ function ticketResponse(
   json: () => Promise<unknown> = async () => ({
     ticket: crypto.randomUUID(),
     websocketPath: "/agents/device/device",
+    allowedOrigins: ["https://app.example"],
+    policyVersion: 1,
   }),
 ): Response {
   return {
@@ -191,6 +208,26 @@ afterEach(() => {
 });
 
 describe("ProfileClient generation fencing", () => {
+  it("migrates a protocol-2 profile without rotating its device identity", async () => {
+    const legacy = persistedConfig(CONFIG);
+    delete legacy.policyVersion;
+    const fixture = installBrowser({
+      local: legacy,
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+
+    const client = new ProfileClient();
+    await client.start();
+
+    expect(client.publicConfig()).toMatchObject({
+      deviceId: CONFIG.deviceId,
+      policyVersion: 1,
+    });
+    await expect(client.pairingCredential()).resolves.toBe(CONFIG.deviceCredential);
+    expect(fixture.local.policyVersion).toBe(1);
+  });
+
   it("does not construct a socket when disable supersedes a pending ticket fetch", async () => {
     installBrowser();
     let resolveFetch!: (response: Response) => void;
@@ -266,6 +303,49 @@ describe("ProfileClient generation fencing", () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(1);
     expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("abandons a blackholed ticket request and retries from the durable backoff path", async () => {
+    installBrowser();
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+      .mockResolvedValue(ticketResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+
+    const configuring = client.configure(CONFIG);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(15_000);
+    await configuring;
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("sends neither hello nor heartbeat inventory while sensitive mode is active", async () => {
+    installBrowser();
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    const inventory = vi.spyOn(client.sessions, "controlInventory").mockReturnValue(null);
+
+    await client.configure(CONFIG);
+    const first = FakeWebSocket.instances[0];
+    first?.open();
+    expect(first?.sent).toEqual([]);
+    expect(first?.closeCount).toBe(1);
+
+    inventory.mockReturnValue({ assignments: [], ownedWindows: [] });
+    await vi.advanceTimersByTimeAsync(500);
+    const second = FakeWebSocket.instances[1];
+    second?.open();
+    expect(second?.sent).toContainEqual(expect.objectContaining({ type: "device_hello" }));
+
+    inventory.mockReturnValue(null);
+    const sentBeforeHeartbeat = second?.sent.length;
+    await vi.advanceTimersByTimeAsync(22_000);
+    expect(second?.sent).toHaveLength(sentBeforeHeartbeat ?? 0);
   });
 
   it("treats permanent ticket errors and replacement close as terminal", async () => {
@@ -348,6 +428,334 @@ describe("ProfileClient generation fencing", () => {
     expect(fixture.local.deviceCredential).toBe("replacement-credential");
     expect(fixture.local["understudy:controlBlock"]).toBeNull();
     expect(client.currentStatus()).toBe("connecting");
+  });
+
+  it("rotates a live device credential without releasing its assignments", async () => {
+    const assignment = {
+      sessionId: "session-rotation",
+      leaseId: "lease-rotation",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
+      tabId: 7,
+      windowId: 3,
+    };
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    fixture.createWindow.mockResolvedValue({ id: 3, tabs: [{ id: 7 }] });
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) => ticketResponse(),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const control = FakeWebSocket.instances[0];
+    control?.open();
+    control?.message({
+      type: "provision",
+      sessionId: assignment.sessionId,
+      leaseId: assignment.leaseId,
+      leaseEpoch: assignment.leaseEpoch,
+      browserEpoch: assignment.browserEpoch,
+      allowedOrigins: assignment.allowedOrigins,
+      policyVersion: assignment.policyVersion,
+      sessionTicket: "session-ticket",
+    });
+    await vi.waitFor(() =>
+      expect(control?.sent).toContainEqual(
+        expect.objectContaining({ type: "provisioned", leaseId: assignment.leaseId }),
+      ),
+    );
+    fixture.removeWindow.mockClear();
+
+    const replacement = { ...CONFIG, deviceCredential: "replacement-credential" };
+    await client.configurePaired(replacement, CONFIG.deviceCredential);
+
+    expect(fixture.removeWindow).not.toHaveBeenCalled();
+    expect(client.sessions.assignments()).toEqual([
+      expect.objectContaining({ leaseId: assignment.leaseId }),
+    ]);
+    expect(client.sessions.closureOutbox()).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toEqual({
+      authorization: "Bearer replacement-credential",
+      "content-type": "application/json",
+    });
+    expect(fixture.local.deviceCredential).toBe("replacement-credential");
+    expect(fixture.local["understudy:stagedProfile"]).toBeNull();
+  });
+
+  it("reconciles retained assignments to a newer policy during credential rotation", async () => {
+    const assignment = {
+      sessionId: "session-policy-rotation",
+      leaseId: "lease-policy-rotation",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
+      tabId: 7,
+      windowId: 3,
+    };
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    fixture.createWindow.mockResolvedValue({ id: 3, tabs: [{ id: 7 }] });
+    let ticketCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        ticketCount += 1;
+        return ticketResponse(200, async () => ({
+          ticket: crypto.randomUUID(),
+          websocketPath: "/agents/device/device",
+          allowedOrigins: ["https://app.example"],
+          policyVersion: ticketCount,
+        }));
+      }),
+    );
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const control = FakeWebSocket.instances[0];
+    control?.open();
+    control?.message({
+      type: "provision",
+      sessionId: assignment.sessionId,
+      leaseId: assignment.leaseId,
+      leaseEpoch: assignment.leaseEpoch,
+      browserEpoch: assignment.browserEpoch,
+      allowedOrigins: assignment.allowedOrigins,
+      policyVersion: assignment.policyVersion,
+      sessionTicket: "session-ticket",
+    });
+    await vi.waitFor(() =>
+      expect(control?.sent).toContainEqual(
+        expect.objectContaining({ type: "provisioned", leaseId: assignment.leaseId }),
+      ),
+    );
+
+    await client.configurePaired(
+      {
+        ...CONFIG,
+        deviceCredential: "replacement-credential",
+        policyVersion: 2,
+      },
+      CONFIG.deviceCredential,
+    );
+
+    expect(fixture.removeWindow).not.toHaveBeenCalled();
+    expect(client.sessions.assignments()).toEqual([
+      expect.objectContaining({
+        leaseId: assignment.leaseId,
+        policyVersion: 2,
+      }),
+    ]);
+    expect(fixture.local).toEqual(
+      expect.objectContaining({
+        deviceCredential: "replacement-credential",
+        policyVersion: 2,
+      }),
+    );
+  });
+
+  it("does not let an in-flight policy update overwrite a paired replacement", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const control = FakeWebSocket.instances[0];
+    control?.open();
+
+    let releasePolicyWrite!: () => void;
+    const policyWrite = new Promise<void>((resolve) => {
+      releasePolicyWrite = resolve;
+    });
+    const priorSessionWrites = fixture.sessionArea.set.mock.calls.length;
+    fixture.sessionArea.set.mockImplementationOnce(async (values) => {
+      await policyWrite;
+      Object.assign(fixture.session, values);
+    });
+    control?.message({
+      type: "policy_update",
+      policyVersion: 2,
+      allowedOrigins: ["https://app.example"],
+    });
+    await vi.waitFor(() =>
+      expect(fixture.sessionArea.set.mock.calls.length).toBeGreaterThan(
+        priorSessionWrites,
+      ),
+    );
+
+    const replacement = {
+      ...CONFIG,
+      deviceId: "00000000-0000-4000-8000-000000000002",
+      deviceCredential: "fresh-credential",
+    };
+    const replacing = client.configurePaired(
+      replacement,
+      CONFIG.deviceCredential,
+    );
+    releasePolicyWrite();
+    await replacing;
+
+    expect(fixture.local).toEqual(
+      expect.objectContaining({
+        deviceId: replacement.deviceId,
+        deviceCredential: replacement.deviceCredential,
+        policyVersion: replacement.policyVersion,
+      }),
+    );
+    expect(fixture.local["understudy:stagedProfile"]).toBeNull();
+  });
+
+  it("reconnects when a policy transition cannot be persisted", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    let ticketCount = 0;
+    const fetchMock = vi.fn(async () => {
+      ticketCount += 1;
+      return ticketResponse(200, async () => ({
+        ticket: crypto.randomUUID(),
+        websocketPath: "/agents/device/device",
+        allowedOrigins: ["https://app.example"],
+        policyVersion: ticketCount === 1 ? 1 : 2,
+      }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const original = FakeWebSocket.instances[0];
+    original?.open();
+    fixture.sessionArea.set.mockRejectedValueOnce(new Error("policy write failed"));
+
+    original?.message({
+      type: "policy_update",
+      policyVersion: 2,
+      allowedOrigins: ["https://app.example"],
+    });
+
+    await vi.waitFor(() => expect(original?.closeCount).toBe(1));
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(fixture.local.policyVersion).toBe(2));
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it("rejects a paired rotation that Stop All supersedes", async () => {
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    let releaseProfileWrite!: () => void;
+    const profileWrite = new Promise<void>((resolve) => {
+      releaseProfileWrite = resolve;
+    });
+    const priorProfileWrites = fixture.localArea.set.mock.calls.length;
+    fixture.localArea.set.mockImplementationOnce(async (values) => {
+      await profileWrite;
+      Object.assign(fixture.local, values);
+    });
+
+    const replacement = {
+      ...CONFIG,
+      deviceCredential: "replacement-credential",
+    };
+    const rotating = client.configurePaired(
+      replacement,
+      CONFIG.deviceCredential,
+    );
+    const rotationFailure = rotating.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() =>
+      expect(fixture.localArea.set.mock.calls.length).toBeGreaterThan(
+        priorProfileWrites,
+      ),
+    );
+    const stopping = client.stopAll();
+    releaseProfileWrite();
+
+    expect(await rotationFailure).toEqual(
+      expect.objectContaining({
+        message: "paired profile configuration was superseded",
+      }),
+    );
+    await stopping;
+    expect(fixture.local).toEqual(
+      expect.objectContaining({
+        deviceCredential: "replacement-credential",
+        unattendedEnabled: false,
+      }),
+    );
+    await expect(
+      client.pairingTransitionPersisted(replacement),
+    ).resolves.toBe(true);
+  });
+
+  it("discards a stale revoked identity before activating its fresh device", async () => {
+    const assignment = {
+      sessionId: "session-revoked-offline",
+      leaseId: "lease-revoked-offline",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
+      tabId: 7,
+      windowId: 3,
+    };
+    const fixture = installBrowser({
+      session: { "understudy:browserEpoch": EPOCH },
+    });
+    fixture.createWindow.mockResolvedValue({ id: 3, tabs: [{ id: 7 }] });
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) => ticketResponse(),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const control = FakeWebSocket.instances[0];
+    control?.open();
+    control?.message({
+      type: "provision",
+      sessionId: assignment.sessionId,
+      leaseId: assignment.leaseId,
+      leaseEpoch: assignment.leaseEpoch,
+      browserEpoch: assignment.browserEpoch,
+      allowedOrigins: assignment.allowedOrigins,
+      policyVersion: assignment.policyVersion,
+      sessionTicket: "session-ticket",
+    });
+    await vi.waitFor(() =>
+      expect(control?.sent).toContainEqual(
+        expect.objectContaining({ type: "provisioned", leaseId: assignment.leaseId }),
+      ),
+    );
+
+    const replacement = {
+      ...CONFIG,
+      deviceId: "00000000-0000-4000-8000-000000000002",
+      deviceCredential: "fresh-credential",
+    };
+    await client.configurePaired(replacement, CONFIG.deviceCredential);
+
+    expect(fixture.removeWindow).toHaveBeenCalledWith(assignment.windowId);
+    expect(client.sessions.assignments()).toEqual([]);
+    expect(client.sessions.closureOutbox()).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]?.[1]?.headers).toEqual({
+      authorization: "Bearer fresh-credential",
+      "content-type": "application/json",
+    });
+    expect(fixture.local.deviceId).toBe(replacement.deviceId);
+    expect(fixture.local.unattendedEnabled).toBe(true);
+    expect(fixture.local["understudy:stagedProfile"]).toBeNull();
   });
 
   it("completes epoch initialization before a concurrent configure request", async () => {
@@ -435,7 +843,7 @@ describe("ProfileClient generation fencing", () => {
     await Promise.all([starting, stopping]);
 
     expect(client.browserEpoch()).toBe(EPOCH);
-    expect(fixture.removeTab).toHaveBeenCalledWith(assignment.tabId);
+    expect(fixture.removeWindow).toHaveBeenCalledWith(assignment.windowId);
     expect(client.sessions.assignments()).toEqual([]);
     expect(client.sessions.vacatedLeases()).toEqual([]);
     expect(client.sessions.closureOutbox()).toEqual([
@@ -457,6 +865,8 @@ describe("ProfileClient generation fencing", () => {
       ticketResponse(200, async () => ({
         ticket: crypto.randomUUID(),
         websocketPath: "https://attacker.example/agents/device/device",
+        allowedOrigins: ["https://app.example"],
+        policyVersion: 1,
       })),
     );
     vi.stubGlobal("fetch", fetchMock);
@@ -489,7 +899,20 @@ describe("ProfileClient generation fencing", () => {
 
     expect(fixture.local.unattendedEnabled).toBe(false);
     expect(fixture.local["understudy:credentialRevoked"]).toBe(true);
+    await expect(client.pairingCredential()).resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("treats a rejected installed credential as dead for fresh pairing", async () => {
+    const fixture = installBrowser();
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse(401)));
+    const client = new ProfileClient();
+
+    await client.configure(CONFIG);
+
+    expect(client.currentStatus()).toBe("error");
+    expect(fixture.local["understudy:credentialRevoked"]).toBe(true);
+    await expect(client.pairingCredential()).resolves.toBeUndefined();
   });
 
   it("releases a provision that finishes after Stop All without acknowledging provision", async () => {
@@ -516,6 +939,7 @@ describe("ProfileClient generation fencing", () => {
       leaseEpoch: 1,
       browserEpoch: EPOCH,
       allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
       sessionTicket: "session-ticket",
     });
     await vi.waitFor(() => expect(fixture.createWindow).toHaveBeenCalledOnce());
@@ -539,7 +963,6 @@ describe("ProfileClient generation fencing", () => {
         browserEpoch: EPOCH,
       }),
     );
-
     expect(hosting?.sent).not.toContainEqual(
       expect.objectContaining({ type: "provisioned" }),
     );
@@ -570,6 +993,7 @@ describe("ProfileClient generation fencing", () => {
       leaseEpoch: 1,
       browserEpoch: EPOCH,
       allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
       sessionTicket: "session-ticket",
     });
     await vi.waitFor(() =>
@@ -581,7 +1005,14 @@ describe("ProfileClient generation fencing", () => {
       socket.url.includes("/agents/session/"),
     );
     if (sessionSocket === undefined) throw new Error("session socket missing");
-    fixture.localArea.set.mockRejectedValue(new Error("profile write failed"));
+    const setLocal = fixture.localArea.set.getMockImplementation();
+    fixture.localArea.set.mockImplementation(async (values: Record<string, unknown>) => {
+      if ("understudy:durableManagerRecovery" in values) {
+        await setLocal?.(values);
+        return;
+      }
+      throw new Error("profile write failed");
+    });
 
     const stopping = client.stopAll();
 
@@ -622,6 +1053,7 @@ describe("ProfileClient generation fencing", () => {
       leaseEpoch: 1,
       browserEpoch: EPOCH,
       allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
       sessionTicket: "session-ticket",
     });
     await vi.waitFor(() =>
@@ -661,7 +1093,7 @@ describe("ProfileClient generation fencing", () => {
     await configuring;
   });
 
-  it("keeps a credential-revoked runtime fenced when profile persistence fails", async () => {
+  it("retries revocation persistence and completes local teardown", async () => {
     const fixture = installBrowser({
       session: { "understudy:browserEpoch": EPOCH },
     });
@@ -681,6 +1113,7 @@ describe("ProfileClient generation fencing", () => {
       leaseEpoch: 1,
       browserEpoch: EPOCH,
       allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
       sessionTicket: "session-ticket",
     });
     await vi.waitFor(() =>
@@ -697,9 +1130,9 @@ describe("ProfileClient generation fencing", () => {
     control?.message({ type: "credential_revoked" });
 
     await vi.waitFor(() => expect(sessionSocket.closeCount).toBe(1));
-    expect(client.sessions.assignments()).toEqual([
-      expect.objectContaining({ cleanupIntent: "discard" }),
-    ]);
+    await vi.waitFor(() => expect(client.sessions.assignments()).toEqual([]));
+    expect(fixture.local["understudy:credentialRevoked"]).toBe(true);
+    await expect(client.pairingCredential()).resolves.toBeUndefined();
   });
 });
 
@@ -782,6 +1215,7 @@ describe("ProfileClient startup cleanup", () => {
     await vi.waitFor(() =>
       expect(first?.sent).toContainEqual({ type: "closed", ...closure }),
     );
+    expect(first?.sent).not.toContainEqual(expect.objectContaining({ type: "device_hello" }));
     expect(client.sessions.closureOutbox()).toEqual([closure]);
 
     first?.emit("close", { code: 1006 });
@@ -804,6 +1238,144 @@ describe("ProfileClient startup cleanup", () => {
       ).closedOutbox,
     ).toEqual([]);
     await vi.waitFor(() => expect(client.currentStatus()).toBe("disabled"));
+  });
+
+  it("settles old-epoch closures before registering a new Chrome epoch", async () => {
+    const oldAssignment = {
+      sessionId: "session-old-epoch",
+      leaseId: "lease-old-epoch",
+      leaseEpoch: 3,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
+      tabId: 7,
+      windowId: 3,
+    };
+    const fixture = installBrowser({
+      local: {
+        ...persistedConfig(CONFIG),
+        "understudy:durableManagerRecovery": {
+          version: 4,
+          assignments: [oldAssignment],
+          ownedWindows: [oldAssignment],
+          closedOutbox: [],
+          vacatedLeases: [],
+        },
+      },
+    });
+    fixture.removeWindow.mockRejectedValueOnce(new Error("window still exists"));
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+
+    await client.start();
+    expect(fixture.removeWindow).toHaveBeenCalledWith(oldAssignment.windowId);
+    const cleanup = FakeWebSocket.instances[0];
+    cleanup?.open();
+
+    await vi.waitFor(() =>
+      expect(cleanup?.sent).toContainEqual({
+        type: "closed",
+        sessionId: oldAssignment.sessionId,
+        leaseId: oldAssignment.leaseId,
+        leaseEpoch: oldAssignment.leaseEpoch,
+        browserEpoch: EPOCH,
+      }),
+    );
+    expect(fixture.removeWindow).toHaveBeenCalledTimes(2);
+    expect(cleanup?.sent).not.toContainEqual(
+      expect.objectContaining({ type: "device_hello" }),
+    );
+
+    cleanup?.message({
+      type: "closed_ack",
+      sessionId: oldAssignment.sessionId,
+      leaseId: oldAssignment.leaseId,
+      leaseEpoch: oldAssignment.leaseEpoch,
+      browserEpoch: EPOCH,
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const hosting = FakeWebSocket.instances[1];
+    hosting?.open();
+    expect(hosting?.sent).toContainEqual(
+      expect.objectContaining({
+        type: "device_hello",
+        browserEpoch: expect.not.stringMatching(new RegExp(`^${EPOCH}$`)),
+      }),
+    );
+  });
+
+  it("flushes a durable closure instead of sending an empty heartbeat", async () => {
+    installBrowser({ session: { "understudy:browserEpoch": EPOCH } });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const hosting = FakeWebSocket.instances[0];
+    hosting?.open();
+    const closure = {
+      sessionId: "session-payment",
+      leaseId: "lease-payment",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+    };
+    vi.spyOn(client.sessions, "closureOutbox").mockReturnValue([closure]);
+    const before = hosting?.sent.length ?? 0;
+
+    await vi.advanceTimersByTimeAsync(22_000);
+
+    expect(hosting?.sent.slice(before)).toEqual([{ type: "closed", ...closure }]);
+  });
+
+  it("settles a pending closure before a hosting reconnect sends inventory", async () => {
+    const fixture = installBrowser({ session: { "understudy:browserEpoch": EPOCH } });
+    fixture.createWindow.mockResolvedValue({ id: 3, tabs: [{ id: 7 }] });
+    vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
+    const client = new ProfileClient();
+    await client.configure(CONFIG);
+    const first = FakeWebSocket.instances[0];
+    first?.open();
+    const assignment = {
+      sessionId: "session-hosting-reconnect",
+      leaseId: "lease-hosting-reconnect",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+    };
+    first?.message({
+      type: "provision",
+      ...assignment,
+      allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
+      sessionTicket: "session-ticket",
+    });
+    await vi.waitFor(() =>
+      expect(first?.sent).toContainEqual(
+        expect.objectContaining({ type: "provisioned", leaseId: assignment.leaseId }),
+      ),
+    );
+    first?.message({ type: "close_lease", ...assignment });
+    await vi.waitFor(() =>
+      expect(first?.sent).toContainEqual({ type: "closed", ...assignment }),
+    );
+
+    first?.emit("close", { code: 1006 });
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.waitFor(() =>
+      expect(
+        FakeWebSocket.instances.filter((socket) =>
+          socket.url.includes("/agents/device/"),
+        ),
+      ).toHaveLength(2),
+    );
+    const reconnect = FakeWebSocket.instances
+      .filter((socket) => socket.url.includes("/agents/device/"))
+      .at(-1);
+    reconnect?.open();
+
+    await vi.waitFor(() =>
+      expect(reconnect?.sent).toContainEqual({ type: "closed", ...assignment }),
+    );
+    expect(reconnect?.sent).not.toContainEqual(
+      expect.objectContaining({ type: "device_hello" }),
+    );
   });
 
   it("consumes a vacated lease only after its replacement runtime is installed", async () => {
@@ -839,6 +1411,7 @@ describe("ProfileClient startup cleanup", () => {
       type: "provision",
       ...vacated,
       allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
       sessionTicket: "session-ticket",
     });
 
@@ -949,11 +1522,71 @@ describe("ProfileClient startup cleanup", () => {
 
     await client.start();
 
-    expect(fixture.removeTab).toHaveBeenCalledWith(assignment.tabId);
+    expect(fixture.removeWindow).toHaveBeenCalledWith(assignment.windowId);
     expect(client.sessions.assignments()).toEqual([]);
     expect(client.sessions.closureOutbox()).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(client.currentStatus()).toBe("error");
+    await expect(client.pairingCredential()).resolves.toBeUndefined();
+  });
+
+  it("resumes a crash-fenced identity replacement only after local ownership closes", async () => {
+    const assignment = {
+      sessionId: "session-transition",
+      leaseId: "lease-transition",
+      leaseEpoch: 1,
+      browserEpoch: EPOCH,
+      allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
+      tabId: 7,
+      windowId: 3,
+    };
+    const replacement: ProfileConfig = {
+      ...CONFIG,
+      deviceId: "00000000-0000-4000-8000-000000000002",
+      deviceCredential: "fresh-credential",
+    };
+    const fixture = installBrowser({
+      local: {
+        ...persistedConfig({ ...replacement, unattendedEnabled: false }),
+        "understudy:stagedProfile": replacement,
+        "understudy:credentialRevoked": true,
+      },
+      session: {
+        "understudy:browserEpoch": EPOCH,
+        "understudy:assignments": {
+          version: 4,
+          assignments: [assignment],
+          ownedWindows: [assignment],
+          closedOutbox: [],
+          vacatedLeases: [],
+        },
+      },
+    });
+    fixture.removeWindow.mockRejectedValueOnce(new Error("window still exists"));
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) => ticketResponse(),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ProfileClient();
+
+    await client.start();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fixture.local["understudy:credentialRevoked"]).toBe(true);
+    expect(fixture.local["understudy:stagedProfile"]).toEqual(replacement);
+
+    await client.ensureConnection();
+
+    expect(client.sessions.assignments()).toEqual([]);
+    expect(client.sessions.ownedWindows()).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual({
+      authorization: "Bearer fresh-credential",
+      "content-type": "application/json",
+    });
+    expect(fixture.local.unattendedEnabled).toBe(true);
+    expect(fixture.local["understudy:credentialRevoked"]).toBe(false);
+    expect(fixture.local["understudy:stagedProfile"]).toBeNull();
   });
 
   it("releases same-epoch assignments while the persisted profile is disabled", async () => {
@@ -977,7 +1610,7 @@ describe("ProfileClient startup cleanup", () => {
     const client = new ProfileClient();
 
     await client.start();
-    expect(fixture.removeTab).toHaveBeenCalledWith(7);
+    expect(fixture.removeWindow).toHaveBeenCalledWith(assignment.windowId);
     expect(FakeWebSocket.instances).toHaveLength(1);
     FakeWebSocket.instances[0]?.open();
     await vi.waitFor(() =>
@@ -1019,7 +1652,7 @@ describe("ProfileClient startup cleanup", () => {
         "understudy:assignments": [assignment],
       },
     });
-    fixture.removeTab.mockRejectedValue(new Error("tab still exists"));
+    fixture.removeWindow.mockRejectedValue(new Error("window still exists"));
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(ticketResponse())
@@ -1029,7 +1662,7 @@ describe("ProfileClient startup cleanup", () => {
     await client.start();
     expect(FakeWebSocket.instances).toHaveLength(1);
 
-    fixture.removeTab.mockResolvedValue(undefined);
+    fixture.removeWindow.mockResolvedValue(undefined);
     const replacement: ProfileConfig = {
       ...CONFIG,
       serviceOrigin: "https://new.example",
@@ -1069,7 +1702,7 @@ describe("ProfileClient startup cleanup", () => {
         "understudy:assignments": [assignment],
       },
     });
-    fixture.removeTab.mockRejectedValueOnce(new Error("tab still exists"));
+    fixture.removeWindow.mockRejectedValueOnce(new Error("window still exists"));
     const fetchMock = vi.fn(async (_input: RequestInfo | URL) =>
       ticketResponse(),
     );
@@ -1077,7 +1710,7 @@ describe("ProfileClient startup cleanup", () => {
     const client = new ProfileClient();
     await client.start();
 
-    fixture.removeTab.mockResolvedValue(undefined);
+    fixture.removeWindow.mockResolvedValue(undefined);
     const replacement: ProfileConfig = {
       ...CONFIG,
       serviceOrigin: "https://new.example",
@@ -1162,7 +1795,7 @@ describe("ProfileClient startup cleanup", () => {
         },
       },
     });
-    fixture.removeTab.mockRejectedValue(new Error("tab still exists"));
+    fixture.removeWindow.mockRejectedValue(new Error("window still exists"));
     vi.stubGlobal("fetch", vi.fn(async () => ticketResponse()));
     const client = new ProfileClient();
 
@@ -1176,6 +1809,7 @@ describe("ProfileClient startup cleanup", () => {
       leaseEpoch: 1,
       browserEpoch: EPOCH,
       allowedOrigins: ["https://app.example"],
+      policyVersion: 1,
       sessionTicket: "session-ticket-2",
     });
     cleanup?.message({
@@ -1186,9 +1820,15 @@ describe("ProfileClient startup cleanup", () => {
       browserEpoch: EPOCH,
       sessionTicket: "replacement-ticket",
     });
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(22_000);
 
     expect(fixture.createWindow).not.toHaveBeenCalled();
+    expect(cleanup?.sent).not.toContainEqual(
+      expect.objectContaining({ type: "device_hello" }),
+    );
+    expect(cleanup?.sent).not.toContainEqual(
+      expect.objectContaining({ type: "heartbeat" }),
+    );
     expect(
       FakeWebSocket.instances.filter((socket) =>
         socket.url.includes("/agents/session/"),

@@ -2,12 +2,13 @@ import { Agent } from "agents";
 import type { AgentContext, Connection, ConnectionContext, WSMessage } from "agents";
 import { z } from "zod";
 import {
-  PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
   SESSION_RESULT_FRAME_MAX_BYTES,
   WRITE_COMMAND_TYPES,
   WS_CLOSE_REPLACED,
   WS_CLOSE_SESSION_TERMINAL,
+  isCommandType,
+  isCommandResultEvent,
   isWriteCommand,
   safeParseEvent,
   safeParseSessionClientFrame,
@@ -17,7 +18,6 @@ import type {
   Command,
   CommandState,
   Event,
-  ProtocolCapability,
   SessionClientFrame,
   SessionServerFrame,
   TabInfo,
@@ -39,8 +39,6 @@ import {
   SESSION_TERMINAL,
 } from "./coordinator";
 import { CfSessionCoordinator } from "./coordinator-cf";
-import { resolveSecret } from "./secrets";
-import { createVault } from "./vault";
 import type {
   CommandStatusRecord,
   CompletedLegacyWrite,
@@ -57,8 +55,6 @@ import type { LeaseResource, TenantDeviceCoordinator } from "./tenant-coordinato
 import { parseQuotaPolicy } from "./quota";
 import { requestFingerprint } from "./validation";
 import { emitTelemetry, type TelemetryEvent } from "./telemetry";
-
-type FillSecretCommand = Extract<Command, { type: "fill_secret" }>;
 
 // Bounds SessionState.completedWrites by both count and serialized event size.
 // The FIFO cap covers retries without allowing late results to grow state
@@ -97,6 +93,7 @@ interface CommandRow {
   created_at: number;
   updated_at: number;
   is_write: number;
+  attachment_id: string | null;
 }
 
 interface AuthorizedConnectionState {
@@ -113,6 +110,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     awaitingCommandIds: [],
     awaitingCommands: [],
     status: "pending",
+    attachmentId: null,
     activeConnectionId: null,
     completedWrites: [],
     dialogs: [],
@@ -169,6 +167,10 @@ export class SessionAgent extends Agent<Env, SessionState> {
       CREATE UNIQUE INDEX IF NOT EXISTS command_attempt_id
       ON command_journal(attempt_id)
     `;
+    const commandColumns = this.sql<{ name: string }>`PRAGMA table_info(command_journal)`;
+    if (!commandColumns.some((column) => column.name === "attachment_id")) {
+      this.sql`ALTER TABLE command_journal ADD COLUMN attachment_id TEXT`;
+    }
     this.sql`
       CREATE TABLE IF NOT EXISTS consumed_session_ticket (
         jti_hash TEXT PRIMARY KEY,
@@ -187,6 +189,10 @@ export class SessionAgent extends Agent<Env, SessionState> {
         value TEXT NOT NULL
       )
     `;
+  }
+
+  async onStart(): Promise<void> {
+    await this.reconcileCommandDeadlines();
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
@@ -275,7 +281,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
    * safeParseEvent/safeParseCommand), so suppressing the SDK's own frames
    * unconditionally costs nothing for a real connection.
    */
-  shouldSendProtocolMessages(connection: Connection, ctx: ConnectionContext): boolean {
+  shouldSendProtocolMessages(_connection: Connection, _ctx: ConnectionContext): boolean {
     return false;
   }
 
@@ -288,7 +294,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
    * this class's own writes always go through the default "server"
    * source), so any other source is rejected outright.
    */
-  validateStateChange(nextState: SessionState, source: Connection | "server"): void {
+  validateStateChange(_nextState: SessionState, source: Connection | "server"): void {
     if (source !== "server") {
       throw new Error("session state is server-driven; rejecting a client-initiated update");
     }
@@ -316,9 +322,9 @@ export class SessionAgent extends Agent<Env, SessionState> {
       return;
     }
 
-    const v2 = safeParseSessionClientFrame(parsed);
-    if (v2.success) {
-      await this.handleV2Frame(connection, v2.data);
+    const frame = safeParseSessionClientFrame(parsed);
+    if (frame.success) {
+      await this.handleSessionFrame(connection, frame.data);
       return;
     }
 
@@ -343,33 +349,50 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
     switch (ev.type) {
       case "snapshot_result":
+      case "elements_result":
       case "screenshot_result":
       case "tabs_result":
       case "action_result":
+      case "cards_result":
+      case "card_submission_result":
       case "pong":
         this.coordinator.resolvePending(ev);
         return;
       case "hello":
         if (ev.protocolVersion === PROTOCOL_VERSION) {
+          const unattended = this.state.mode === "unattended";
           if (
-            ev.tabs.length !== 1 ||
             ev.capabilities === undefined ||
-            (this.state.mode === "unattended" &&
+            (!unattended && ev.attachmentId === undefined) ||
+            (unattended &&
               (ev.browserEpoch !== this.state.unattended?.browserEpoch ||
                 ev.leaseId !== this.state.unattended?.leaseId ||
-                ev.leaseEpoch !== this.state.unattended?.leaseEpoch))
+                ev.leaseEpoch !== this.state.unattended?.leaseEpoch ||
+                ev.tabs.length !== 1))
           ) {
-            connection.close(1008, "protocol-v2 hello fence mismatch");
+            connection.close(1008, "protocol-v3 hello fence mismatch");
             return;
           }
         }
+        if (
+          this.state.mode === "attended" &&
+          this.state.attachmentId !== null &&
+          this.state.attachmentId !== ev.attachmentId
+        ) {
+          this.terminalizeActiveAttempts();
+        }
         this.coordinator.abandonInFlight(`${SESSION_RESYNCED}: hello`);
+        const attendedIdle = this.state.mode === "attended" && ev.attachmentId === null;
         this.setState({
           ...this.state,
-          browser: { browser: ev.browser, extVersion: ev.extVersion },
-          tabs: ev.tabs,
+          browser: attendedIdle ? null : { browser: ev.browser, extVersion: ev.extVersion },
+          tabs: attendedIdle ? [] : ev.tabs,
+          currentUrl: attendedIdle ? null : this.state.currentUrl,
+          dialogs: attendedIdle ? [] : this.dialogs(),
           generation: this.state.generation + 1,
-          status: "connected",
+          status: attendedIdle ? "idle" : "connected",
+          attachmentId:
+            this.state.mode === "unattended" ? null : (ev.attachmentId ?? null),
           protocolVersion: ev.protocolVersion ?? 1,
           capabilities: ev.capabilities ?? [],
           ...(this.state.unattended === undefined
@@ -381,16 +404,16 @@ export class SessionAgent extends Agent<Env, SessionState> {
                 },
               }),
         });
-        const safeV2 =
+        const safeV3 =
           ev.protocolVersion === PROTOCOL_VERSION &&
-          (ev.capabilities ?? []).includes("safe-write-v2");
-        if (safeV2 && this.writesBlocked()) {
+          (ev.capabilities ?? []).includes("safe-write-v3");
+        if (safeV3 && this.writesBlocked()) {
           this.trySendSessionFrame({
             type: "writes_blocked",
             reason: "session write authority requires reconciliation",
           });
         }
-        for (const resolve of [...this.connectionWaiters]) resolve(safeV2);
+        for (const resolve of [...this.connectionWaiters]) resolve(safeV3);
         this.connectionWaiters.clear();
         return;
       case "page_event":
@@ -407,7 +430,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     }
   }
 
-  private async handleV2Frame(
+  private async handleSessionFrame(
     connection: Connection,
     frame: SessionClientFrame,
   ): Promise<void> {
@@ -419,6 +442,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
           row.command_id !== frame.commandId ||
           row.fingerprint !== frame.requestFingerprint ||
           row.state !== "preparing" ||
+          row.attachment_id !== (frame.attachmentId ?? null) ||
           row.ready_deadline_at <= Date.now() ||
           !this.frameMatchesCurrentLease(frame)
         ) {
@@ -443,11 +467,30 @@ export class SessionAgent extends Agent<Env, SessionState> {
         const row = this.commandByAttempt(frame.attemptId);
         const now = Date.now();
         if (
+          row?.state === "granted" &&
+          row.command_id === frame.commandId &&
+          row.attachment_id === (frame.attachmentId ?? null) &&
+          this.frameMatchesCurrentLease(frame) &&
+          !isCommandType(row.command_type)
+        ) {
+          this.terminalizeAttempt(row);
+          connection.send(
+            JSON.stringify({
+              type: "result_ack",
+              attemptId: frame.attemptId,
+              commandId: frame.commandId,
+            } satisfies SessionServerFrame),
+          );
+          return;
+        }
+        if (
           row !== undefined &&
           row.command_id === frame.commandId &&
           row.state === "granted" &&
           row.execution_deadline_at !== null &&
           row.execution_deadline_at > now &&
+          row.attachment_id === (frame.attachmentId ?? null) &&
+          isCommandResultEvent(row.command_type, frame.event.type) &&
           this.frameMatchesCurrentLease(frame)
         ) {
           const event =
@@ -505,10 +548,35 @@ export class SessionAgent extends Agent<Env, SessionState> {
         return;
       case "pong":
         return;
+      case "attended_detached":
+        if (
+          this.state.mode === "unattended" ||
+          this.state.attachmentId !== frame.attachmentId ||
+          this.state.tabs[0]?.tabId !== frame.tabId
+        ) {
+          return;
+        }
+        this.coordinator.abandonInFlight(`${SESSION_RESYNCED}: attended detached`);
+        this.terminalizeActiveAttempts();
+        this.setState({
+          ...this.state,
+          browser: null,
+          tabs: [],
+          currentUrl: null,
+          dialogs: [],
+          status: "idle",
+          attachmentId: null,
+        });
+        return;
     }
   }
 
-  async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
+  async onClose(
+    connection: Connection,
+    _code: number,
+    _reason: string,
+    _wasClean: boolean,
+  ): Promise<void> {
     if (!this.isAuthorizedConnection(connection)) return;
 
     const activeConnectionId = this.persistedActiveConnectionId();
@@ -574,96 +642,6 @@ export class SessionAgent extends Agent<Env, SessionState> {
     }
   }
 
-  async fillSecret(cmd: FillSecretCommand, dryRun?: boolean): Promise<DispatchOutcome> {
-    try {
-      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-      const fingerprint = await requestFingerprint(cmd, dryRun === true);
-      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-      const tombstone = legacyTombstone(cmd, fingerprint);
-      const replay = this.legacyReplay(tombstone);
-      if (replay.kind === "conflict") return this.idConflictDispatchOutcome();
-      if (replay.kind === "replay") return { ok: true, event: replay.event };
-
-      if (dryRun === true) {
-        // A dry-run the real call would refuse for tenant scoping simulates
-        // that refusal (before the DOM ref probe), so a governance pre-approval
-        // preview is honest rather than reporting ok:true for a fill that can
-        // never dispatch. Still zero vault access and no wire traffic:
-        // secretRefInTenant only reads the signed sessionId (this.name).
-        if (!(await this.secretRefInTenant(cmd.secretRef))) {
-          if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-          return {
-            ok: true,
-            event: this.simulatedResult(cmd.commandId, {
-              ok: false,
-              reason: "secret could not be resolved",
-            }),
-          };
-        }
-        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-        const probe = await this.checkRefResolves(cmd.ref);
-        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-        return {
-          ok: true,
-          event: this.simulatedResult(cmd.commandId, probe),
-        };
-      }
-
-      // Exact replay/conflict binding runs before external work. For a new
-      // request, tenant scoping precedes the connection gate and vault: a
-      // secretRef resolves only within this session's OWN tenant, derived from
-      // the HMAC-signed
-      // sessionId (this.name) - never a caller claim - so tenantB driving its
-      // own session can never read vault://tenantA/... understudy owns one
-      // shared vault across tenants, so this check lives here, not in a
-      // consumer's breakwater. A ref outside the tenant namespace collapses to
-      // the SAME scrubbed ok:false an absent secret returns: no vault read, no
-      // dispatch, and no oracle telling "not yours" from "does not exist"
-      // (DL-008).
-      if (!(await this.secretRefInTenant(cmd.secretRef))) {
-        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-        return { ok: true, event: this.unresolvableSecretResult(cmd.commandId) };
-      }
-      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-
-      // Gate BEFORE the vault: resolving a secret for a command that cannot
-      // dispatch would materialize plaintext (and emit a vault access) for
-      // nothing - fail-fast matters most exactly here (DL-004).
-      if (!this.hasAuthorizedConnection()) {
-        return {
-          ok: false,
-          reason: "not_connected",
-          message: `${SESSION_NOT_CONNECTED}: no authorized extension connection`,
-        };
-      }
-
-      let secret: string;
-      try {
-        secret = await resolveSecret(createVault(this.env), cmd.secretRef);
-      } catch {
-        if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-        return { ok: true, event: this.unresolvableSecretResult(cmd.commandId) };
-      }
-      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-
-      const event = await this.coordinator.send(
-        {
-          type: "type",
-          commandId: cmd.commandId,
-          ref: cmd.ref,
-          text: secret,
-          submit: cmd.submit,
-        },
-        tombstone,
-      );
-      if (this.isTerminalSession()) return this.terminalDispatchOutcome();
-      this.rememberCompletedWrite(tombstone, event);
-      return { ok: true, event };
-    } catch (err) {
-      return this.dispatchFailure(err);
-    }
-  }
-
   async dispatchV2(
     command: Command,
     dryRun: boolean,
@@ -671,6 +649,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     statusUrl: string,
   ): Promise<V2DispatchOutcome> {
     const startedAt = Date.now();
+    await this.reconcileCommandDeadlines();
     if (this.isTerminalSession()) {
       return { kind: "terminal_session", commandId: command.commandId };
     }
@@ -688,15 +667,41 @@ export class SessionAgent extends Agent<Env, SessionState> {
       }
     }
 
-    if (!this.hasAuthorizedConnection()) {
+    if (
+      !this.hasAuthorizedConnection() ||
+      (this.state.mode === "attended" && this.state.attachmentId === null)
+    ) {
       return { kind: "not_connected", commandId: command.commandId };
     }
     if (
       isWriteCommand(command) &&
       !dryRun &&
       (this.state.protocolVersion !== PROTOCOL_VERSION ||
-        !(this.state.capabilities ?? []).includes("safe-write-v2"))
+        !(this.state.capabilities ?? []).includes("safe-write-v3"))
     ) {
+      return { kind: "unsupported", commandId: command.commandId };
+    }
+    if (
+      (command.type === "list_cards" || command.type === "submit_card") &&
+      !(this.state.capabilities ?? []).includes("local-card-vault-v1")
+    ) {
+      return { kind: "unsupported", commandId: command.commandId };
+    }
+    if (
+      [
+        "capture_elements",
+        "find_elements",
+        "inspect_elements",
+        "continue_elements",
+      ].includes(command.type) &&
+      !(this.state.capabilities ?? []).includes("semantic-elements-v1")
+    ) {
+      if (
+        command.type === "capture_elements" &&
+        (this.state.protocolVersion ?? 1) < 3
+      ) {
+        return { kind: "legacy_snapshot_required", commandId: command.commandId };
+      }
       return { kind: "unsupported", commandId: command.commandId };
     }
     if (isWriteCommand(command) && !dryRun && this.writesBlocked()) {
@@ -729,11 +734,12 @@ export class SessionAgent extends Agent<Env, SessionState> {
         INSERT INTO command_journal (
           command_id, fingerprint, command_type, dry_run, state, attempt_id,
           ready_deadline_at, execution_deadline_at, result_json, created_at,
-          updated_at, is_write
+          updated_at, is_write, attachment_id
         ) VALUES (
           ${command.commandId}, ${fingerprint}, ${command.type}, ${dryRun ? 1 : 0},
           'preparing', ${attemptId}, ${readyDeadlineAt}, NULL, NULL,
-          ${Date.now()}, ${Date.now()}, ${isWriteCommand(command) ? 1 : 0}
+          ${Date.now()}, ${Date.now()}, ${isWriteCommand(command) ? 1 : 0},
+          ${this.state.mode === "attended" ? this.state.attachmentId : null}
         )
       `;
     } else {
@@ -741,7 +747,8 @@ export class SessionAgent extends Agent<Env, SessionState> {
         UPDATE command_journal SET
           state = 'preparing', attempt_id = ${attemptId},
           ready_deadline_at = ${readyDeadlineAt}, execution_deadline_at = NULL,
-          result_json = NULL, updated_at = ${Date.now()}
+          result_json = NULL, updated_at = ${Date.now()},
+          attachment_id = ${this.state.mode === "attended" ? this.state.attachmentId : null}
         WHERE command_id = ${command.commandId}
           AND state IN ('not_started','timed_out')
       `;
@@ -754,11 +761,14 @@ export class SessionAgent extends Agent<Env, SessionState> {
       }
     }
 
+    if (!(await this.ensureAttemptDeadline(attemptId, readyDeadlineAt))) {
+      return { kind: "not_started", commandId: command.commandId, safeToRetry: true };
+    }
+
     if (this.state.mode === "unattended") {
       const admission = await this.tenantCoordinator().authorizeCommand({
         sessionId: this.name,
         actorPseudonym,
-        credentialFill: command.type === "fill_secret" && !dryRun,
       });
       const continuation = this.continuationOutcome(
         attemptId,
@@ -802,7 +812,6 @@ export class SessionAgent extends Agent<Env, SessionState> {
       const admitted = await this.env.TENANT_CONTROL.getByName(tenantId).authorizeAttendedCommand({
         sessionId: this.name,
         actorPseudonym,
-        credentialFill: command.type === "fill_secret" && !dryRun,
       });
       const admittedContinuation = this.continuationOutcome(
         attemptId,
@@ -818,24 +827,6 @@ export class SessionAgent extends Agent<Env, SessionState> {
     }
 
     if (dryRun && isWriteCommand(command)) {
-      if (command.type === "fill_secret") {
-        const scoped = await this.secretRefInTenant(command.secretRef);
-        const continuation = this.continuationOutcome(
-          attemptId,
-          "preparing",
-          command.commandId,
-          statusUrl,
-        );
-        if (continuation !== null) return continuation;
-        if (!scoped) {
-          const event = this.simulatedResult(command.commandId, {
-            ok: false,
-            reason: "secret could not be resolved",
-          });
-          this.completeAttempt(attemptId, event);
-          return { kind: "terminal", event };
-        }
-      }
       const ref = this.commandRef(command);
       if (ref === undefined) {
         const event = this.simulatedResult(command.commandId, { ok: true });
@@ -854,12 +845,6 @@ export class SessionAgent extends Agent<Env, SessionState> {
       return this.executeReadV2(command, attemptId, startedAt, statusUrl);
     }
 
-    await this.schedule(
-      new Date(readyDeadlineAt),
-      "expireAttempt",
-      { attemptId },
-      { idempotent: true },
-    );
     const prepareContinuation = this.continuationOutcome(
       attemptId,
       "preparing",
@@ -912,61 +897,10 @@ export class SessionAgent extends Agent<Env, SessionState> {
     }
     if (row.state !== "ready") return this.outcomeForRow(row, statusUrl);
 
-    let grantedCommand: Command = command;
-    if (command.type === "fill_secret") {
-      const scoped = await this.secretRefInTenant(command.secretRef);
-      const scopedContinuation = this.continuationOutcome(
-        attemptId,
-        "ready",
-        command.commandId,
-        statusUrl,
-      );
-      if (scopedContinuation !== null) return scopedContinuation;
-      if (!scoped) {
-        const event = this.unresolvableSecretResult(command.commandId);
-        const completed = this.completeAttempt(attemptId, event, "ready");
-        this.trySendSessionFrame({ type: "attempt_cancel", attemptId, commandId: command.commandId });
-        return completed
-          ? { kind: "terminal", event }
-          : this.outcomeForRow(this.commandByAttempt(attemptId)!, statusUrl);
-      }
-      const resolution = await resolveBeforeDeadline(
-        resolveSecret(createVault(this.env), command.secretRef),
-        readyDeadlineAt,
-      );
-      const vaultContinuation = this.continuationOutcome(
-        attemptId,
-        "ready",
-        command.commandId,
-        statusUrl,
-      );
-      if (vaultContinuation !== null) return vaultContinuation;
-      if (resolution.kind === "timeout") {
-        const won = this.markAttempt(attemptId, "not_started", "ready");
-        this.trySendSessionFrame({ type: "attempt_cancel", attemptId, commandId: command.commandId });
-        return won
-          ? { kind: "not_started", commandId: command.commandId, safeToRetry: true }
-          : this.outcomeForRow(this.commandByAttempt(attemptId)!, statusUrl);
-      }
-      if (resolution.kind === "error") {
-        const event = this.unresolvableSecretResult(command.commandId);
-        const completed = this.completeAttempt(attemptId, event, "ready");
-        this.trySendSessionFrame({ type: "attempt_cancel", attemptId, commandId: command.commandId });
-        return completed
-          ? { kind: "terminal", event }
-          : this.outcomeForRow(this.commandByAttempt(attemptId)!, statusUrl);
-      }
-      const secret = resolution.value;
-      grantedCommand = {
-        type: "type",
-        commandId: command.commandId,
-        ref: command.ref,
-        text: secret,
-        submit: command.submit,
-      };
-    }
-
     const executionDeadlineAt = Date.now() + EXECUTION_DEADLINE_MS;
+    if (!(await this.ensureAttemptDeadline(attemptId, executionDeadlineAt))) {
+      return { kind: "not_started", commandId: command.commandId, safeToRetry: true };
+    }
     this.sql`
       UPDATE command_journal
       SET state = 'granted', execution_deadline_at = ${executionDeadlineAt},
@@ -994,12 +928,6 @@ export class SessionAgent extends Agent<Env, SessionState> {
     if (grantTelemetryContinuation !== null) {
       return grantTelemetryContinuation;
     }
-    await this.schedule(
-      new Date(executionDeadlineAt),
-      "expireAttempt",
-      { attemptId },
-      { idempotent: true },
-    );
     const grantContinuation = this.continuationOutcome(
       attemptId,
       "granted",
@@ -1011,7 +939,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
       this.sendSessionFrame({
         type: "write_grant",
         ...this.currentFence(attemptId, executionDeadlineAt),
-        command: grantedCommand,
+        command,
       });
     } catch {
       return this.pendingOutcome(command.commandId, statusUrl);
@@ -1025,6 +953,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   async getCommandStatus(commandId: string): Promise<CommandStatusRecord | null> {
+    await this.reconcileCommandDeadlines();
     const row = this.command(commandId);
     if (row === undefined) return null;
     return {
@@ -1078,6 +1007,20 @@ export class SessionAgent extends Agent<Env, SessionState> {
     tenantId: string,
     lease: LeaseResource,
   ): Promise<void> {
+    const current = this.state.unattended;
+    if (current !== undefined) {
+      if (
+        this.state.mode === "unattended" &&
+        current.tenantId === tenantId &&
+        current.deviceId === lease.deviceId &&
+        current.leaseId === lease.leaseId &&
+        current.leaseEpoch === lease.leaseEpoch &&
+        current.browserEpoch === lease.browserEpoch
+      ) {
+        return;
+      }
+      throw new Error("session is already initialized under a different lease fence");
+    }
     this.setState({
       ...this.state,
       mode: "unattended",
@@ -1086,7 +1029,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
       tabs: [],
       currentUrl: null,
       activeConnectionId: null,
-      protocolVersion: 2,
+      protocolVersion: 3,
       capabilities: [],
       unattended: {
         tenantId,
@@ -1112,12 +1055,17 @@ export class SessionAgent extends Agent<Env, SessionState> {
       unattended === undefined ||
       lease.sessionId !== this.name ||
       lease.leaseId !== unattended.leaseId ||
-      lease.leaseEpoch !== unattended.leaseEpoch ||
       lease.deviceId !== unattended.deviceId
     ) {
       return;
     }
     const epochChanged = lease.browserEpoch !== unattended.browserEpoch;
+    const sameFence = lease.leaseEpoch === unattended.leaseEpoch;
+    const adopted =
+      unattended.status === "suspended" &&
+      epochChanged &&
+      lease.leaseEpoch === unattended.leaseEpoch + 1;
+    if (!sameFence && !adopted) return;
     this.terminalizeGrantedAttempts();
     if (epochChanged) {
       this.sql`
@@ -1135,6 +1083,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
       currentUrl: epochChanged ? null : this.state.currentUrl,
       unattended: {
         ...unattended,
+        leaseEpoch: lease.leaseEpoch,
         browserEpoch: lease.browserEpoch,
         status: "recovering",
         needsReconciliation: true,
@@ -1142,6 +1091,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
           epochChanged && unattended.dialogDelivery !== "overflow"
             ? "interrupted"
             : unattended.dialogDelivery,
+        allowedOrigins: lease.allowedOrigins,
       },
     });
   }
@@ -1250,12 +1200,12 @@ export class SessionAgent extends Agent<Env, SessionState> {
     return this.isTerminalSession();
   }
 
-  async waitForProtocolV2Connection(timeoutMs: number): Promise<boolean> {
+  async waitForProtocolV3Connection(timeoutMs: number): Promise<boolean> {
     if (this.isTerminalSession()) return false;
     if (
       this.state.status === "connected" &&
       this.state.protocolVersion === PROTOCOL_VERSION &&
-      (this.state.capabilities ?? []).includes("safe-write-v2")
+      (this.state.capabilities ?? []).includes("safe-write-v3")
     ) {
       return true;
     }
@@ -1270,7 +1220,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     });
   }
 
-  async usesV2CommandProtocol(): Promise<boolean> {
+  async usesV3CommandProtocol(): Promise<boolean> {
     return (
       this.state.mode === "unattended" ||
       this.state.protocolVersion === PROTOCOL_VERSION
@@ -1291,18 +1241,15 @@ export class SessionAgent extends Agent<Env, SessionState> {
     );
     if (preparing !== null) return preparing;
     const executionDeadlineAt = Date.now() + EXECUTION_DEADLINE_MS;
+    if (!(await this.ensureAttemptDeadline(attemptId, executionDeadlineAt))) {
+      return { kind: "not_started", commandId: command.commandId, safeToRetry: true };
+    }
     this.sql`
       UPDATE command_journal
       SET state = 'granted', execution_deadline_at = ${executionDeadlineAt},
           updated_at = ${Date.now()}
       WHERE attempt_id = ${attemptId} AND state = 'preparing'
     `;
-    await this.schedule(
-      new Date(executionDeadlineAt),
-      "expireAttempt",
-      { attemptId },
-      { idempotent: true },
-    );
     const continuation = this.continuationOutcome(
       attemptId,
       "granted",
@@ -1426,6 +1373,71 @@ export class SessionAgent extends Agent<Env, SessionState> {
     return changed === 1;
   }
 
+  private terminalizeAttempt(row: CommandRow, terminal?: CommandState): void {
+    const next =
+      terminal ??
+      (row.state === "granted"
+        ? row.is_write === 1 && row.dry_run === 0
+          ? "unknown"
+          : "timed_out"
+        : "not_started");
+    if (!this.markAttempt(row.attempt_id, next, row.state)) return;
+    if (next === "unknown") {
+      this.sql`
+        INSERT INTO session_flag (key, value) VALUES ('writes_blocked', '1')
+        ON CONFLICT(key) DO UPDATE SET value = '1'
+      `;
+      try {
+        this.sendSessionFrame({
+          type: "writes_blocked",
+          reason: "a granted write could not be reconciled safely",
+        });
+      } catch {
+        // The durable unknown result and write block are authoritative.
+      }
+    }
+  }
+
+  private async ensureAttemptDeadline(
+    attemptId: string,
+    deadlineAt: number,
+  ): Promise<boolean> {
+    try {
+      await this.schedule(
+        new Date(deadlineAt),
+        "expireAttempt",
+        { attemptId },
+        { idempotent: true },
+      );
+      return true;
+    } catch {
+      const row = this.commandByAttempt(attemptId);
+      if (row !== undefined) this.terminalizeAttempt(row);
+      return false;
+    }
+  }
+
+  private async reconcileCommandDeadlines(): Promise<void> {
+    const active = this.sql<CommandRow>`
+      SELECT * FROM command_journal
+      WHERE state IN ('preparing','ready','granted')
+    `;
+    const now = Date.now();
+    for (const row of active) {
+      if (!isCommandType(row.command_type)) {
+        this.terminalizeAttempt(row);
+        continue;
+      }
+      const deadline =
+        row.state === "granted" ? row.execution_deadline_at : row.ready_deadline_at;
+      if (deadline === null || deadline <= now) {
+        this.terminalizeAttempt(row);
+        continue;
+      }
+      await this.ensureAttemptDeadline(row.attempt_id, deadline);
+    }
+  }
+
   private completeAttempt(
     attemptId: string,
     event: Event,
@@ -1497,7 +1509,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
       attemptId,
       deadlineAt: new Date(deadlineAt).toISOString(),
       ...(unattended === undefined
-        ? {}
+        ? { attachmentId: this.state.attachmentId ?? undefined }
         : {
             leaseId: unattended.leaseId,
             leaseEpoch: unattended.leaseEpoch,
@@ -1507,6 +1519,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
   }
 
   private frameMatchesCurrentLease(frame: {
+    attachmentId?: string;
     leaseId?: string;
     leaseEpoch?: number;
     browserEpoch?: string;
@@ -1514,6 +1527,7 @@ export class SessionAgent extends Agent<Env, SessionState> {
     const unattended = this.state.unattended;
     if (unattended === undefined) {
       return (
+        frame.attachmentId === (this.state.attachmentId ?? undefined) &&
         frame.leaseId === undefined &&
         frame.leaseEpoch === undefined &&
         frame.browserEpoch === undefined
@@ -1657,37 +1671,6 @@ export class SessionAgent extends Agent<Env, SessionState> {
       VALUES (${jtiHash}, ${claims.exp})
     `;
     return (this.sql<{ count: number }>`SELECT changes() AS count`[0]?.count ?? 0) === 1;
-  }
-
-  /**
-   * Whether `secretRef` lives in this session's own tenant namespace. The
-   * tenant is the one HMAC-signed into the sessionId (this.name) - the same
-   * authoritative source onConnect scopes the socket against - so it cannot be
-   * forged by a caller. Vault keys are canonically `vault://<tenantId>/<name>`
-   * (README "Design decisions"). tenantOf only returns a `/`-free, non-empty
-   * tenant (auth.ts::isValidTenantId), so the trailing slash makes the prefix
-   * exact and unambiguous: tenant "acme" reaches neither "acme-corp"'s nor a
-   * hypothetical "acme/eu"'s keys.
-   */
-  private async secretRefInTenant(secretRef: string): Promise<boolean> {
-    const tenant = await tenantOf(this.name, this.env);
-    return tenant !== null && secretRef.startsWith(`vault://${tenant}/`);
-  }
-
-  /**
-   * The one scrubbed ok:false a fill_secret returns when the secret cannot be
-   * produced - whether the ref is outside the caller's tenant, absent, or
-   * undecryptable. Byte-identical across those causes on purpose: the caller
-   * (and an attacker) learns only "could not be resolved", never which
-   * (DL-008), and no secret material appears in it (DL-004).
-   */
-  private unresolvableSecretResult(commandId: string): Event {
-    return {
-      type: "action_result",
-      commandId,
-      ok: false,
-      error: "fill_secret: secret could not be resolved",
-    };
   }
 
   /**
@@ -1972,11 +1955,13 @@ export class SessionAgent extends Agent<Env, SessionState> {
 
   async getStatus(): Promise<
     | {
+        mode: "attended";
         status: SessionStatus;
         browser: SessionState["browser"];
         tabs: SessionState["tabs"];
         currentUrl: string | null;
         dialogs: SessionState["dialogs"];
+        attachmentId: string | null;
       }
     | {
         mode: "unattended";
@@ -2026,7 +2011,9 @@ export class SessionAgent extends Agent<Env, SessionState> {
       };
     }
     return {
+      mode: "attended",
       status: this.state.status,
+      attachmentId: this.state.attachmentId ?? null,
       browser: this.state.browser,
       tabs: this.state.tabs,
       currentUrl: this.state.currentUrl,
@@ -2090,7 +2077,6 @@ export class SessionAgent extends Agent<Env, SessionState> {
     switch (command.type) {
       case "click":
       case "type":
-      case "fill_secret":
       case "key":
       case "scroll":
         // scroll.ref is optional (undefined => a window scroll): a ref-bearing
@@ -2263,22 +2249,6 @@ function sameLegacyCommand(
   );
 }
 
-function isCommandType(value: string): value is Command["type"] {
-  return (
-    value === "snapshot" ||
-    value === "navigate" ||
-    value === "click" ||
-    value === "type" ||
-    value === "fill_secret" ||
-    value === "key" ||
-    value === "scroll" ||
-    value === "wait" ||
-    value === "resolve_ref" ||
-    value === "get_tabs" ||
-    value === "switch_tab"
-  );
-}
-
 function isTerminalLifecycle(status: UnattendedSessionLifecycle): boolean {
   return status === "closed" || status === "expired" || status === "lost";
 }
@@ -2288,30 +2258,4 @@ async function sha256Hex(value: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("");
-}
-
-async function resolveBeforeDeadline<T>(
-  promise: Promise<T>,
-  deadlineAt: number,
-): Promise<
-  | { kind: "value"; value: T }
-  | { kind: "error" }
-  | { kind: "timeout" }
-> {
-  const remaining = deadlineAt - Date.now();
-  if (remaining <= 0) return { kind: "timeout" };
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise.then(
-        (value) => ({ kind: "value" as const, value }),
-        () => ({ kind: "error" as const }),
-      ),
-      new Promise<{ kind: "timeout" }>((resolve) => {
-        timer = setTimeout(() => resolve({ kind: "timeout" }), remaining);
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }

@@ -12,4 +12,4 @@ Understudy versions published packages on `dev` and publishes them from `master`
 
 If another changeset reaches `dev` before promotion, merge the regenerated `Version Packages` pull request and update the promotion. The release workflow rejects pending changesets on `master`.
 
-Do not merge `master` back into `dev`. The apps in `apps/backend` and `apps/extension` are private and never publish. Read the [Changesets documentation](https://github.com/changesets/changesets) for CLI details.
+Do not merge `master` back into `dev`. The apps in `apps/backend` and `apps/extension` are private, versioned directly in their manifests, and excluded from Changesets versioning and publishing. Read the [Changesets documentation](https://github.com/changesets/changesets) for CLI details.

@@ -8,6 +8,10 @@ interface MockSession {
   tabId: number;
   snapshotA11y: Mock;
   screenshot: Mock;
+  captureElements: Mock;
+  findElements: Mock;
+  inspectElements: Mock;
+  continueElements: Mock;
   click: Mock;
   type: Mock;
   key: Mock;
@@ -22,6 +26,10 @@ function createMockSession(): MockSession {
     tabId: 7,
     snapshotA11y: vi.fn(),
     screenshot: vi.fn(),
+    captureElements: vi.fn(),
+    findElements: vi.fn(),
+    inspectElements: vi.fn(),
+    continueElements: vi.fn(),
     click: vi.fn(),
     type: vi.fn(),
     key: vi.fn(),
@@ -93,6 +101,108 @@ describe("routeCommand", () => {
 
     expect(mock.screenshot).toHaveBeenCalledWith("c-shot");
     expect(result).toEqual(event);
+  });
+
+  it("routes every semantic operation with its bounded inputs", async () => {
+    const mock = createMockSession();
+    const response = {
+      type: "elements_result",
+      commandId: "semantic",
+      operation: "snapshot",
+      status: "error",
+      reason: "capture_failed",
+      retryable: true,
+    } as const;
+    mock.captureElements.mockResolvedValue(response);
+    mock.findElements.mockResolvedValue({ ...response, operation: "find" });
+    mock.inspectElements.mockResolvedValue({ ...response, operation: "inspect" });
+    mock.continueElements.mockResolvedValue({ ...response, operation: "next" });
+
+    await routeCommand(
+      {
+        type: "capture_elements",
+        commandId: "semantic",
+        scope: "viewport",
+        view: "interactive",
+        limit: 80,
+        changesOnly: false,
+      },
+      asSession(mock),
+    );
+    await routeCommand(
+      {
+        type: "find_elements",
+        commandId: "semantic",
+        query: "Pay",
+        roles: ["button"],
+        match: "contains",
+        includeHidden: false,
+        limit: 20,
+      },
+      asSession(mock),
+    );
+    await routeCommand(
+      {
+        type: "inspect_elements",
+        commandId: "semantic",
+        ref: "ref",
+        depth: 3,
+        limit: 80,
+        includeBounds: true,
+      },
+      asSession(mock),
+    );
+    await routeCommand(
+      { type: "continue_elements", commandId: "semantic", cursor: "cursor" },
+      asSession(mock),
+    );
+
+    expect(mock.captureElements).toHaveBeenCalledWith(
+      "semantic",
+      "viewport",
+      "interactive",
+      80,
+      false,
+    );
+    expect(mock.findElements).toHaveBeenCalledWith(
+      "semantic",
+      "Pay",
+      ["button"],
+      "contains",
+      false,
+      20,
+    );
+    expect(mock.inspectElements).toHaveBeenCalledWith(
+      "semantic",
+      "ref",
+      3,
+      80,
+      true,
+    );
+    expect(mock.continueElements).toHaveBeenCalledWith("semantic", "cursor");
+  });
+
+  it("returns a strict semantic failure when no CDP session is active", async () => {
+    await expect(
+      routeCommand(
+        {
+          type: "capture_elements",
+          commandId: "semantic",
+          scope: "viewport",
+          view: "interactive",
+          limit: 80,
+          changesOnly: false,
+        },
+        null,
+      ),
+    ).resolves.toEqual({
+      type: "elements_result",
+      commandId: "semantic",
+      operation: "snapshot",
+      status: "error",
+      reason: "capture_failed",
+      retryable: true,
+    });
   });
 
   it("rejects a result whose complete WebSocket frame exceeds the session limit", async () => {

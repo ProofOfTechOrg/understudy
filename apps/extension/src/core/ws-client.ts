@@ -84,6 +84,7 @@ export class ReconnectingWs {
     socket.addEventListener("open", () => {
       this.backoffMs = BACKOFF_BASE_MS;
       this.handlers.onOpen();
+      if (this.stopped || this.socket !== socket) return;
       this.startHeartbeat();
     });
 

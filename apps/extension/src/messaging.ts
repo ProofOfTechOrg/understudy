@@ -1,3 +1,5 @@
+import type { PaymentCardInput } from "./payment/card-validation";
+
 export type WsStatus = "idle" | "connecting" | "open" | "closed";
 
 export type LogLevel = "info" | "warn" | "error";
@@ -38,15 +40,31 @@ export interface ConfigureProfileMsg {
   deviceId: string;
   deviceCredential: string;
   originPolicy: string[];
+  policyVersion: number;
 }
 
 export interface StopAllMsg {
   type: "stopAll";
 }
 
-export interface PairMsg {
-  type: "pair";
-  code: string;
+export interface SaveCardMsg {
+  type: "saveCard";
+  requestId: string;
+  card: PaymentCardInput;
+}
+
+export interface DeleteCardMsg {
+  type: "deleteCard";
+  alias: string;
+}
+
+export interface DeleteCardVaultMsg {
+  type: "deleteCardVault";
+}
+
+export interface SetPaymentOriginsMsg {
+  type: "setPaymentOrigins";
+  origins: string[];
 }
 
 export type PanelMsg =
@@ -56,7 +74,10 @@ export type PanelMsg =
   | SetWsUrlMsg
   | ConfigureProfileMsg
   | StopAllMsg
-  | PairMsg;
+  | SaveCardMsg
+  | DeleteCardMsg
+  | DeleteCardVaultMsg
+  | SetPaymentOriginsMsg;
 
 export type PairingPhase = "pairing" | "success" | "error";
 
@@ -89,9 +110,16 @@ export interface StateMsg {
     unattendedEnabled: boolean;
     deviceId: string;
     originPolicy: string[];
+    policyVersion: number;
   } | null;
   /** Progress of the most recent side-panel pairing attempt, if any. */
   pairing?: PairingState;
+  cardVault: {
+    aliases: string[];
+    approvedOrigins: string[];
+    revision: number;
+    error?: string;
+  };
   /** Why profileStatus is "error", when the client knows the reason. */
   profileStatusReason?: ProfileBlockReason;
   logs: LogEntry[];
@@ -102,4 +130,17 @@ export interface LogMsg {
   entry: LogEntry;
 }
 
-export type SwMsg = StateMsg | LogMsg;
+export type CardVaultSaveResultMsg =
+  | {
+      type: "cardVaultSaveResult";
+      requestId: string;
+      ok: true;
+    }
+  | {
+      type: "cardVaultSaveResult";
+      requestId: string;
+      ok: false;
+      error: string;
+    };
+
+export type SwMsg = StateMsg | LogMsg | CardVaultSaveResultMsg;

@@ -3,16 +3,12 @@
  * service (Topology 1: understudy is a model-free substrate; the Mastra
  * agent, approvals, RBAC, and audit live in the CONSUMER importing this).
  *
- * Three connectors, one governance class each:
+ * Two connectors, one governance class each:
  *   observe          - read (snapshot / get_tabs / wait). No approval.
  *   act              - write (click / type / navigate / key / scroll /
  *                      switch_tab). Fails closed unless the request carries a
  *                      flowsafe-minted grant in
  *                      requestContext['breakwater.approvedConnectors'].
- *   fill_credential  - vaulted write. The model passes an opaque secretRef;
- *                      the understudy SERVICE resolves + types the plaintext,
- *                      which never enters this Worker, the model context, the
- *                      audit detail, or the flowsafe snapshot.
  *
  * Every execute() reaches understudy only through breakwater's egress-guarded
  * runtime.fetch, pinned (redirect hops included) to the UNDERSTUDY_URL
@@ -100,20 +96,17 @@ function understudyHost(env: BrowserConnectorEnv): string {
 
 export const BROWSER_OBSERVE_CONNECTOR = "browser.observe";
 export const BROWSER_ACT_CONNECTOR = "browser.act";
-export const BROWSER_FILL_CREDENTIAL_CONNECTOR = "browser.fill_credential";
 
 /** The write connectors an approval gate mints grants for (reads need none). */
 export const BROWSER_WRITE_CONNECTOR_IDS = [
   BROWSER_ACT_CONNECTOR,
-  BROWSER_FILL_CREDENTIAL_CONNECTOR,
 ] as const;
 
 // -- I/O schemas ---------------------------------------------------------------
 // Command shapes mirror @understudy/protocol MINUS commandId (assigned per
 // call below). The protocol's resolve_ref is deliberately absent: it is an
 // internal service<->extension probe - consumers express dry-run intent via
-// the service API's dryRun flag, which the act/fill_credential dryRunExecute
-// paths set.
+// the service API's dryRun flag, which the action dryRunExecute path sets.
 
 const ConnectorIdSchema = z.string().min(1).max(128);
 const ConnectorRefSchema = z.string().min(1).max(256);
@@ -168,14 +161,14 @@ export const observeOutput = z.object({
 }).strict();
 export type ObserveOutput = z.infer<typeof observeOutput>;
 
-// Write actions deliberately EXCLUDE secret entry: non-secret type.text (a
-// search query, a name) is fine and auditable; secrets go through
-// fill_credential's opaque secretRef. A breakwater piiSecrets policy at the
-// agent boundary can additionally reject high-entropy strings leaking into
-// type.text.
+// Write actions deliberately EXCLUDE secret and payment-card entry.
+// Non-secret type.text (a search query, a name) remains auditable, and a
+// breakwater piiSecrets policy can reject high-entropy strings at the agent
+// boundary. Card submission uses the extension-local vault contract.
 //
-// This union is exactly the protocol's write class minus fill_secret (which
-// fill_credential carries): click/type/navigate/key/scroll/switch_tab. Since
+// This union is the public non-payment write class:
+// click/type/navigate/key/scroll/switch_tab. Payment-card submission is
+// available only through the extension-local MCP contract. Since
 // the protocol reclassified scroll/switch_tab as writes (they are user-visible
 // side effects), there is no longer any divergence to reconcile - the
 // relationship is pinned at compile time AND runtime in index.test.ts, so a
@@ -217,23 +210,6 @@ export const actOutput = z.object({
   simulated: z.boolean().optional(),
 }).strict();
 export type ActOutput = z.infer<typeof actOutput>;
-
-export const fillCredentialInput = z.object({
-  sessionId: ConnectorIdSchema,
-  ref: ConnectorRefSchema,
-  /** Opaque vault handle (e.g. "vault://tenant/portal/password") - NEVER the plaintext. */
-  secretRef: z.string().min(1).max(512),
-  submit: z.boolean().optional(),
-}).strict();
-export type FillCredentialInput = z.infer<typeof fillCredentialInput>;
-
-export const fillCredentialOutput = z.object({
-  ok: z.boolean(),
-  filled: z.boolean(),
-  error: z.string().optional(),
-  simulated: z.boolean().optional(),
-}).strict();
-export type FillCredentialOutput = z.infer<typeof fillCredentialOutput>;
 
 // -- Service bridge ------------------------------------------------------------
 
@@ -401,7 +377,7 @@ async function getSessionStatus(
 // the retry re-runs execute() - under a random id the service could not
 // recognize the retry, and the write would run twice. Under the derived id
 // the service replays the recorded Event instead (its completedWrites
-// cache). Protocol 2 supplies at-most-once execution plus explicit pending
+// cache). Protocol 3 supplies at-most-once execution plus explicit pending
 // and unknown outcomes when an external result cannot be proven.
 function toCommand(fields: object, commandId?: string): Command {
   return parseCommand({ ...fields, commandId: commandId ?? crypto.randomUUID() });
@@ -502,7 +478,7 @@ export function createBrowserConnectors(
   const act = createConnector({
     id: BROWSER_ACT_CONNECTOR,
     description:
-      "Perform a state-changing browser action (click/type/navigate/key/scroll/switch_tab) in the session. Requires approval. Do NOT put secrets in type.text - use fill_credential.",
+      "Perform a state-changing browser action (click/type/navigate/key/scroll/switch_tab) in the session. Requires approval. Never put credentials or payment-card data in type.text.",
     inputSchema: actInput,
     outputSchema: actOutput,
     permissions: {
@@ -537,55 +513,7 @@ export function createBrowserConnectors(
     policies,
   });
 
-  // Write: fill a field with a vaulted credential. The model passes an opaque
-  // secretRef; the SERVICE resolves + types the plaintext. The secret never
-  // touches this Worker, the model, or the audit log (D-SEC).
-  const fillCredential = createConnector({
-    id: BROWSER_FILL_CREDENTIAL_CONNECTOR,
-    description:
-      "Fill a field with a vaulted secret referenced by secretRef (never the plaintext). Use for passwords/OTP logins into portals. Requires approval.",
-    inputSchema: fillCredentialInput,
-    outputSchema: fillCredentialOutput,
-    permissions: {
-      sideEffect: "write",
-      egress,
-      idempotencyKey: true,
-      requiresApproval: true,
-      dryRun: true,
-      rateLimit: "30/min",
-    },
-    execute: async (input, ctx, runtime): Promise<FillCredentialOutput> => {
-      const command = toCommand(
-        {
-          type: "fill_secret",
-          ref: input.ref,
-          secretRef: input.secretRef, // opaque handle; resolved service-side
-          ...(input.submit !== undefined ? { submit: input.submit } : {}),
-        },
-        await idempotencyCommandId(ctx),
-      );
-      const ev = await callUnderstudy(runtime, env, input.sessionId, command);
-      if (ev.type === "action_result") return { ok: ev.ok, filled: ev.ok, error: ev.error };
-      throw new Error(`fillCredential: unexpected event '${ev.type}'`);
-    },
-    // Dry-run confirms the field's ref resolves WITHOUT resolving the secret
-    // or typing anything (the service never touches the vault on a dry run).
-    dryRunExecute: async (input, _ctx, runtime): Promise<FillCredentialOutput> => {
-      const command = toCommand({
-        type: "fill_secret",
-        ref: input.ref,
-        secretRef: input.secretRef,
-      });
-      const ev = await callUnderstudy(runtime, env, input.sessionId, command, { dryRun: true });
-      if (ev.type === "action_result") {
-        return { ok: ev.ok, filled: false, error: ev.error, simulated: true };
-      }
-      throw new Error(`fillCredential(dryRun): unexpected event '${ev.type}'`);
-    },
-    policies,
-  });
-
-  return { observe, act, fillCredential };
+  return { observe, act };
 }
 
 // -- Caller-side helpers (mirror metamind's intake/connectors.ts) ----------------

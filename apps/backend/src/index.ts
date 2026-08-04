@@ -12,13 +12,14 @@ import {
   authenticateDeviceComposite,
   scopeSession,
   SESSION_IDEMPOTENCY_KEY_PATTERN,
+  sha256Hex,
   taggedHmacHex,
   unauthenticatedRateAllowed,
   verifyExtensionToken,
   verifyWsTicket,
 } from "./auth";
-import { getDirectory, normalizePairingCode } from "./account-directory";
-import { CANONICAL_ORIGIN } from "./canonical";
+import { getDirectory } from "./account-directory";
+import { CANONICAL_HOST, CANONICAL_ORIGIN } from "./canonical";
 import { dashboardApp } from "./dashboard/app";
 import {
   createAttendedSession,
@@ -29,6 +30,7 @@ import {
   listDevices,
   mintDeviceConnectTicket,
   pollCommand,
+  suspendDeviceForCredentialRotation,
 } from "./api/sessions";
 import { oauthProvider } from "./oauth";
 import { tryStaticMcpAuth } from "./mcp/static-auth";
@@ -54,9 +56,25 @@ const app = new Hono<{ Bindings: Env }>();
 const DeviceTicketRequestSchema = z
   .object({ browserEpoch: z.string().min(1).max(128) })
   .strict();
-const PairingClaimSchema = z.object({ code: z.string().min(1).max(64) }).strict();
+const PairingClaimSchema = z
+  .object({
+    offer: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    claimId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    previousCredential: z
+      .string()
+      .regex(/^udt_v[12]_[A-Za-z0-9_-]{43}$/)
+      .optional(),
+  })
+  .strict();
 
-app.get("/health", (c) => c.json({ ok: true }));
+app.get("/health", (c) =>
+  c.json({
+    ok: true,
+    commit: c.env.VERSION.tag,
+    versionId: c.env.VERSION.id,
+    deployedAt: c.env.VERSION.timestamp,
+  }),
+);
 
 app.post("/v1/sessions", async (c) => {
   const authentication = await authenticateCaller(c.req.raw, c.env);
@@ -125,8 +143,6 @@ app.post("/v1/sessions", async (c) => {
       return c.json({ error: "device capacity exhausted" }, 429);
     case "collision":
       return c.json({ error: "origin or profile-state collision" }, 409);
-    case "provision_failed":
-      return c.json({ error: "device connection unavailable" }, 503);
     case "pending":
       c.header("Location", result.location);
       c.header("Retry-After", "2");
@@ -215,7 +231,7 @@ app.post("/v1/sessions/:sessionId/commands", async (c) => {
         ? v2Outcome(c, result.outcome, sessionId)
         : compatibilityV2Outcome(c, result.outcome, sessionId);
     case "legacy_unsupported_write":
-      return c.json({ error: "extension lacks safe-write-v2" }, 426);
+      return c.json({ error: "extension lacks safe-write-v3" }, 426);
     case "legacy_quota_exceeded":
       return c.json({ code: "command_quota_exceeded" }, 429);
     case "legacy": {
@@ -284,15 +300,18 @@ app.post("/v1/device/connect-ticket", async (c) => {
         ticket: result.ticket,
         expiresIn: result.expiresIn,
         websocketPath: result.websocketPath,
+        allowedOrigins: result.allowedOrigins,
+        policyVersion: result.policyVersion,
       });
   }
 });
 
 /**
- * Extension pairing: the one-time code IS the credential, so this route is
- * unauthenticated by design. The device identity and udt_ credential are
- * minted at redeem time inside the directory's consume-once transaction;
- * every failure mode is the same 404 (no code-state oracle). Deliberately on
+ * Extension pairing: a short-lived, one-time offer authorizes credential
+ * minting, so this route is unauthenticated by design. The device identity and
+ * udt_v2 credential are minted at redeem time inside the directory's
+ * consume-once transaction; every failure mode is the same 404 (no offer-state
+ * oracle). Deliberately on
  * this Hono app, NOT delegated to the OAuth provider — it is device-facing
  * /v1 surface, a sibling of /v1/device/connect-ticket.
  */
@@ -306,16 +325,17 @@ app.post("/v1/pairing/claim", async (c) => {
   } catch (error) {
     return bodyError(c, error);
   }
-  const normalized = normalizePairingCode(body.code);
-  if (!/^[0-9A-Z]{8}$/.test(normalized)) {
-    return c.json({ error: "invalid_or_expired_code" }, 404);
-  }
-  const claimed = await getDirectory(c.env).claimPairingCode(
-    await taggedHmacHex(c.env, "pair-v1", normalized),
+  const claimed = await getDirectory(c.env).claimPairingOffer(
+    await taggedHmacHex(c.env, "pair-v2", body.offer),
+    await sha256Hex(body.claimId),
+    body.previousCredential === undefined
+      ? undefined
+      : await sha256Hex(body.previousCredential),
   );
   if (claimed.kind !== "ok") {
-    return c.json({ error: "invalid_or_expired_code" }, 404);
+    return c.json({ error: "invalid_or_expired_offer" }, 404);
   }
+  await suspendDeviceForCredentialRotation(c.env, claimed);
   await emitTelemetry(c.env, {
     event: "device_connect",
     outcome: "paired",
@@ -330,6 +350,7 @@ app.post("/v1/pairing/claim", async (c) => {
     deviceId: claimed.deviceId,
     deviceCredential: claimed.deviceCredential,
     originPolicy: claimed.originPolicy,
+    policyVersion: claimed.policyVersion,
     unattendedEnabled: true,
   });
 });
@@ -453,8 +474,10 @@ function v2Outcome(
       return c.json({ code: "session_busy", commandId: outcome.commandId }, 429);
     case "not_connected":
       return c.json({ error: "session connection unavailable", sessionId }, 503);
+    case "legacy_snapshot_required":
+      return c.json({ error: "legacy extension requires snapshot compatibility" }, 426);
     case "unsupported":
-      return c.json({ error: "extension lacks safe-write-v2" }, 426);
+      return c.json({ error: "extension lacks safe-write-v3" }, 426);
     case "terminal_session":
       return c.json({ error: "session is terminal" }, 410);
   }
@@ -656,70 +679,92 @@ function scrubbedError(pathname: string): Response {
       });
 }
 
+async function handleRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  if (
+    request.headers.get("content-length") !== null &&
+    Number(request.headers.get("content-length")) > SESSION_RESULT_FRAME_MAX_BYTES
+  ) {
+    return Response.json({ error: "request body too large" }, { status: 413 });
+  }
+  const url = new URL(request.url);
+  if (url.hostname === CANONICAL_HOST && url.protocol === "http:") {
+    return Response.redirect(`${CANONICAL_ORIGIN}${url.pathname}${url.search}`, 308);
+  }
+  if (isNewSurfacePath(url.pathname)) {
+    // Single OAuth issuer / one cookie host: the new surface exists only on
+    // the custom domain. workers.dev stays live for existing consumers but
+    // must not mint tokens or set __Host- cookies. Loopback is exempt so
+    // wrangler dev + the MCP inspector work — which holds only because
+    // wrangler.jsonc pins `dev.host` to localhost; the custom_domain route
+    // otherwise makes dev serve this code the canonical host over http, and
+    // every account-plane request 308s to https on a plaintext listener. On
+    // the real edge url.origin is built from the routed hostname, not a
+    // client-supplied Host header, so this is not a bypass.
+    //
+    // Origin, not host, so the scheme is pinned too: browsers send Fetch
+    // Metadata only to trustworthy URLs, so over plain http a request reaches
+    // the dashboard with no Sec-Fetch-* at all and its CSRF gate drops to the
+    // suppressible Origin fallback. Always-Use-HTTPS is an account setting,
+    // not a property of this repo, so the redirect enforces it here.
+    if (url.origin !== CANONICAL_ORIGIN && !isLoopback(url.hostname)) {
+      return Response.redirect(`${CANONICAL_ORIGIN}${url.pathname}${url.search}`, 308);
+    }
+    // No error boundary reaches this surface otherwise: the provider (0.8.2)
+    // has no top-level catch and dashboard page loads can throw, so one
+    // fault would return an unscrubbed 500 for the whole account plane.
+    try {
+      if (isAccountPagePath(url.pathname)) {
+        return await dashboardApp.fetch(request, env, ctx);
+      }
+      if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+        // usk_v2 bearers take the fast path; null means "not a usk_ bearer",
+        // so a MISSING token still reaches the provider for its
+        // discovery-grade 401.
+        const staticResult = await tryStaticMcpAuth(request, env, ctx);
+        if (staticResult !== null) return staticResult;
+      }
+      // Open DCR (RFC 7591) is unauthenticated by spec; per-IP limiting is
+      // the abuse backstop. Registration grants nothing — consent is always
+      // human-in-the-loop on /oauth/authorize.
+      if (
+        url.pathname === "/oauth/register" &&
+        !(await unauthenticatedRateAllowed(request, env, "dcr"))
+      ) {
+        return Response.json({ error: "rate_limited" }, { status: 429 });
+      }
+      return await oauthProvider.fetch(request, env, ctx);
+    } catch {
+      return scrubbedError(url.pathname);
+    }
+  }
+  const agentGate = await gateAgentPathBeforeResolution(request, env);
+  if (agentGate instanceof Response) return agentGate;
+  const agentResponse = await routeAgentRequest(request, env, {
+    onBeforeConnect: (req, lobby) => gateAgentRequest(req, lobby, env),
+    onBeforeRequest: (req, lobby) => gateAgentRequest(req, lobby, env),
+  });
+  if (agentResponse) return agentResponse;
+  return app.fetch(request, env, ctx);
+}
+
+function addCanonicalSecurityHeaders(request: Request, response: Response): Response {
+  const url = new URL(request.url);
+  if (url.origin !== CANONICAL_ORIGIN || response.status === 101) return response;
+  const headers = new Headers(response.headers);
+  headers.set("Strict-Transport-Security", "max-age=300");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (
-      request.headers.get("content-length") !== null &&
-      Number(request.headers.get("content-length")) > SESSION_RESULT_FRAME_MAX_BYTES
-    ) {
-      return Response.json({ error: "request body too large" }, { status: 413 });
-    }
-    const url = new URL(request.url);
-    if (isNewSurfacePath(url.pathname)) {
-      // Single OAuth issuer / one cookie host: the new surface exists only on
-      // the custom domain. workers.dev stays live for existing consumers but
-      // must not mint tokens or set __Host- cookies. Loopback is exempt so
-      // wrangler dev + the MCP inspector work — which holds only because
-      // wrangler.jsonc pins `dev.host` to localhost; the custom_domain route
-      // otherwise makes dev serve this code the canonical host over http, and
-      // every account-plane request 308s to https on a plaintext listener. On
-      // the real edge url.origin is built from the routed hostname, not a
-      // client-supplied Host header, so this is not a bypass.
-      //
-      // Origin, not host, so the scheme is pinned too: browsers send Fetch
-      // Metadata only to trustworthy URLs, so over plain http a request reaches
-      // the dashboard with no Sec-Fetch-* at all and its CSRF gate drops to the
-      // suppressible Origin fallback. Always-Use-HTTPS is an account setting,
-      // not a property of this repo, so the redirect enforces it here.
-      if (url.origin !== CANONICAL_ORIGIN && !isLoopback(url.hostname)) {
-        return Response.redirect(`${CANONICAL_ORIGIN}${url.pathname}${url.search}`, 308);
-      }
-      // No error boundary reaches this surface otherwise: the provider (0.8.2)
-      // has no top-level catch and dashboard page loads can throw (e.g. a
-      // malformed VAULT_UPLOAD_PRIVATE_KEY), so one fault would return an
-      // unscrubbed 500 for the whole account plane.
-      try {
-        if (isAccountPagePath(url.pathname)) {
-          return await dashboardApp.fetch(request, env, ctx);
-        }
-        if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
-          // usk_ bearers take the fast path; null means "not a usk_ bearer",
-          // so a MISSING token still reaches the provider for its
-          // discovery-grade 401.
-          const staticResult = await tryStaticMcpAuth(request, env, ctx);
-          if (staticResult !== null) return staticResult;
-        }
-        // Open DCR (RFC 7591) is unauthenticated by spec; per-IP limiting is
-        // the abuse backstop. Registration grants nothing — consent is always
-        // human-in-the-loop on /oauth/authorize.
-        if (
-          url.pathname === "/oauth/register" &&
-          !(await unauthenticatedRateAllowed(request, env, "dcr"))
-        ) {
-          return Response.json({ error: "rate_limited" }, { status: 429 });
-        }
-        return await oauthProvider.fetch(request, env, ctx);
-      } catch {
-        return scrubbedError(url.pathname);
-      }
-    }
-    const agentGate = await gateAgentPathBeforeResolution(request, env);
-    if (agentGate instanceof Response) return agentGate;
-    const agentResponse = await routeAgentRequest(request, env, {
-      onBeforeConnect: (req, lobby) => gateAgentRequest(req, lobby, env),
-      onBeforeRequest: (req, lobby) => gateAgentRequest(req, lobby, env),
-    });
-    if (agentResponse) return agentResponse;
-    return app.fetch(request, env, ctx);
+    return addCanonicalSecurityHeaders(request, await handleRequest(request, env, ctx));
   },
 };

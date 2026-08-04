@@ -14,7 +14,7 @@ import type { LegacyCommandTombstone, SessionStatus } from "./types";
 
 /**
  * send()'s delivery-failure vocabulary. These prefixes never cross the RPC
- * boundary as rejections: SessionAgent.dispatch/fillSecret catch coordinator
+ * boundary as rejections: SessionAgent.dispatch catches coordinator
  * rejections IN-ISOLATE and map each prefix to a typed DispatchOutcome
  * (types.ts), which the Worker maps to 503/504/409 (index.ts). Keeping the
  * rejection inside the Durable Object matters twice over - a structured

@@ -1,5 +1,16 @@
 # @understudy/backend
 
+## 0.2.0
+
+### Minor Changes
+
+- Remove the cloud vault and secret-fill oracle; reject legacy API and OAuth credentials through the protocol-3 authentication hard cut.
+- Add device-bound MCP/OAuth credentials, mandatory S256 PKCE, direct pairing offers, versioned per-device origin policy, OAuth connection revocation, and extension-local card MCP tools.
+- Add physical-window inventory, exact orphan cleanup, suspended-session adoption, attended idle detach, HSTS, and Worker deployment provenance.
+- Add structured MCP output schemas, bounded semantic find/inspect/pagination
+  tools, same-document deltas, fixed failure rendering, and exact snapshot
+  bindings for ref validity.
+
 ## 0.1.1
 
 ### Patch Changes

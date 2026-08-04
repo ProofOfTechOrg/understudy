@@ -1,246 +1,195 @@
 <!-- Content type: How-to -->
 
-# Verify unattended sessions in a real Chromium profile
+# Verify the Understudy extension in Chrome
 
-This runbook verifies the production extension against one tenant-dedicated Chrome profile. Automated tests do not prove Chrome focus behavior, paused-popup containment, restart recovery, or a real authenticated website session.
+This runbook covers the protocol-3 extension, pairing, policy reconciliation,
+owned-window recovery, and the extension-local payment-card vault. Use a
+dedicated Chrome profile. Chrome's debugger banner is process-wide and cannot
+be suppressed; dismissing it can detach a controlled tab.
 
-## Prepare the operator environment
+## Automated gate
 
-Before you start:
-
-- Use Chrome 125 or newer
-- Create or designate a profile used by one tenant only
-- Configure Chrome startup to **New Tab**, not **Continue where you left off**
-- Log into the required sites and complete Multi-Factor Authentication (MFA) or CAPTCHA
-- Keep the machine, Chrome, and network awake
-- Do not open DevTools on a controlled tab
-- Treat Chrome’s debugger banner as process-wide: it may appear in unrelated profiles or windows
-- Do not dismiss the debugger banner anywhere; doing so can detach the controlled tab
-- Do not use the banner as a per-tab diagnostic
-
-Two sessions in one profile share cookies, local storage, IndexedDB, and browser extensions. Use separate profiles when the sessions require different browser identities.
-
-## Build and load the extension
-
-From the repository root:
+From the repository root, with Node 22 or newer:
 
 ```bash
-pnpm --filter @understudy/protocol build
-pnpm --filter @understudy/extension typecheck
-pnpm --filter @understudy/extension test
-pnpm --filter @understudy/extension build
-```
-
-Then:
-
-1. Open `chrome://extensions`
-2. Enable **Developer mode**
-3. Select **Load unpacked**
-4. Choose `apps/extension/.output/chrome-mv3/`
-5. Approve debugger, storage, alarms, and host permissions
-
-Use this production build. Do not use WXT development mode for acceptance.
-
-## Enroll one device
-
-Provision a device UUID and credential in the backend’s `DEVICE_TOKENS` secret. Store only the credential’s SHA-256 digest in that mapping.
-
-Open the extension side panel and enter:
-
-1. The backend HTTPS origin
-2. The device UUID
-3. The raw device credential
-4. One exact allowed origin per line
-5. **Enable unattended hosting**
-
-Select **Save enrollment**. The status must become `connected`.
-
-Confirm the device through the caller API:
-
-```bash
-curl --fail-with-body \
-  -H 'Authorization: Bearer caller_token_here' \
-  https://understudy.example/v1/devices
-```
-
-Done means the response reports the device online with capacity 2, usage 0, current browser and extension versions, and a recent `lastSeenAt`.
-
-## Create two isolated runtimes
-
-Use disjoint origin sets and different profile keys:
-
-```bash
-curl --fail-with-body \
-  -X POST \
-  -H 'Authorization: Bearer caller_token_here' \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: 00000000-0000-4000-8000-000000000011' \
-  --data '{"mode":"unattended","allowedOrigins":["https://one.example"],"profileStateKey":"account_one"}' \
-  https://understudy.example/v1/sessions
-```
-
-Repeat with another UUID, `https://two.example`, and `account_two`.
-
-Done means:
-
-- Each response reaches `connected`, either immediately or through status polling
-- Chrome contains two extension-owned tabs
-- Each session status reports one tab only
-- `GET /v1/devices` reports usage 2
-
-Create a third session. It must fail with `429`.
-
-Try an overlapping origin and then a reused profile key. Each must fail with `409`.
-
-## Verify command routing
-
-Send concurrent reads to both session IDs. Confirm each result reports only its session-owned tab.
-
-Send input actions to both sessions. Confirm text and clicks never cross tabs. If inactive-tab `Input.*` fails or targets the wrong tab, stop rollout and add the planned profile-wide focus mutex for input operations.
-
-For one session:
-
-1. Navigate within its allowed origin and confirm success
-2. Trigger a redirect to another origin and confirm rejection
-3. Trigger JavaScript top-level navigation to another origin and confirm rejection
-4. Open a popup and confirm Chrome closes it before its first request
-5. Load a cross-origin image or frame and confirm it still works
-
-Paused-popup containment is a release gate. Do not weaken the exact-origin boundary if the production build cannot prove it.
-
-## Verify one-slot cleanup
-
-Delete one session:
-
-```bash
-curl --fail-with-body \
-  -X DELETE \
-  -H 'Authorization: Bearer caller_token_here' \
-  https://understudy.example/v1/sessions/session_id_here
-```
-
-Poll status if DELETE returns `202`.
-
-Done means Chrome closes exactly one leased tab, the other session remains functional, and device usage becomes 1.
-
-## Evict the service worker
-
-Open the extension’s service-worker inspection page from `chrome://extensions` and stop the worker. Do not inspect a controlled tab.
-
-Wake the extension by reopening the side panel or sending a command.
-
-Done means:
-
-- The same browser epoch restores assignments from session storage
-- The extension does not create duplicate tabs
-- A completed unacknowledged result replays
-- Unrelated tabs remain untouched
-
-## Restart Chrome
-
-Close and reopen Chrome within 90s. This is a deliberate destructive acceptance step for active browser execution.
-
-Done means:
-
-- Each still-live lease receives a fresh blank tab
-- Tab IDs, attachment generations, and accessibility refs change
-- No prior URL is restored
-- Restored ordinary tabs remain uncontrolled and open
-- Session status reports reconciliation
-- New writes remain blocked until DELETE and new session creation
-
-## Verify an ambiguous write
-
-Use a non-production test action with an observable idempotent marker. Stop Chrome after the write starts but before the result acknowledgement.
-
-Done means command polling returns `command_outcome_unknown`, `safeToRetry` is false, and the backend blocks further writes for that session. The extension must never execute that granted payload again.
-
-## Rotate the device credential
-
-Add the new credential digest with a higher `credentialVersion`, update the extension enrollment, then remove the old digest.
-
-Done means the old control socket closes, old tickets fail, the new credential reconnects, and no replayed ticket replaces the authoritative socket.
-
-## Run the 24-hour soak
-
-Create a read-only unattended session. Send a valid read less than every 2 hours to refresh idle expiry.
-
-During the soak:
-
-- Confirm the session expires at its exact 24-hour hard deadline despite activity
-- Confirm another idle session expires after 2 hours without a valid command
-- Compare Durable Object requests and duration before and after
-- Confirm billed duration scales with handler execution, not lease wall time
-- Confirm no unknown-write surprise, duplicate tab, or leaked capacity
-
-## Verify attended compatibility
-
-Use the side panel’s attended section:
-
-1. Enter the legacy session WebSocket URL
-2. Open the intended user-owned tab
-3. Select **Attach active tab**
-4. Run a snapshot and one approved test action
-5. Select **Detach tab**
-
-Done means the command path negotiates protocol 2 after attachment, reports only that tab, and detaching leaves the tab open.
-
-Chrome’s debugger banner is process-wide. Dismissing it in any Chrome profile or window can detach the controlled tab, and its presence does not identify which tab is controlled.
-
-## Run the automated store-release checks
-
-From the repository root:
-
-```bash
-pnpm --filter @understudy/protocol build
-pnpm --filter @understudy/extension typecheck
-pnpm --filter @understudy/extension test
-pnpm --filter @understudy/extension build
-pnpm --filter @understudy/extension build:store
-pnpm --filter @understudy/extension zip:store
-pnpm --filter @understudy/backend typecheck
-pnpm --filter @understudy/backend exec vitest run test/dashboard-auth.test.ts
 pnpm typecheck
 pnpm test
+pnpm build
+pnpm --filter @understudy/extension test:e2e
+pnpm --filter @understudy/extension build:staging
+pnpm --filter @understudy/extension verify:staging-build
+pnpm --filter @understudy/extension build:store
+pnpm --filter @understudy/extension zip:store
 ```
 
-Inspect the store output:
+`test:e2e` uses local Chrome and the existing `ws` package. It loads the store
+build, exercises bounded semantic discovery across large pages, frames, and
+shadow DOM, then exercises the real panel message boundary and IndexedDB. It
+verifies a non-extractable persisted key and encrypted record, reloads the
+extension, and deletes the vault. No card marker may appear in protocol frames,
+network, console, exception, storage, journal, or ordinary log output.
+
+## Verify semantic discovery
+
+1. Confirm `device_hello` advertises `semantic-elements-v1` before enabling the
+   new MCP tools for a canary.
+2. Capture the default viewport-interactive snapshot. It must return at most 80
+   descriptors and 32 KiB, even on the 10,000-element fixture.
+3. Find the late offscreen target by exact label. The result must not emit the
+   intervening fixture text.
+4. Inspect the target and continue the original cursor. Both operations must
+   preserve snapshot ID, generation, and refs without a full capture.
+5. Find targets inside a same-process iframe, a cross-origin OOPIF, and open
+   shadow DOM. An unresolved child frame must produce partial coverage and a
+   bounded placeholder.
+6. Trigger the fixture's custom click handler, then request `changesOnly`. The
+   same loader, URL, and frame topology must produce a structured delta; a
+   navigation must return a normal snapshot with `delta.applied: false`.
+7. Replace or rename a retained target. The old ref must return a fixed stale or
+   target-changed reason and must never dispatch to a replacement.
+8. Evict the extension worker. Old cursors must return `cursor_expired`; old
+   refs must not revive from the persisted generation.
+9. Confirm editable, password, and synthetic card values never appear in
+   protocol events, WSS, MCP output, logs, journals, storage, or analytics.
+10. Enter payment sensitive mode. Semantic capture, find, inspect,
+    continuation, screenshots, page-derived errors, and automatic retry remain
+    unavailable before any page data is read.
+
+## Load the release build
+
+1. Build with `pnpm --filter @understudy/extension build:store`.
+2. Open `chrome://extensions`, enable Developer mode, and choose Load unpacked.
+3. Select `apps/extension/.output/chrome-mv3-store/`.
+4. Confirm the manifest requests only the expected debugger, storage, alarms,
+   side-panel, and canonical-host permissions.
+
+Do not use WXT development mode for release acceptance.
+
+## Verify staging pairing
+
+Use the pinned staging build to test hosted changes before store submission:
+
+1. Build with `pnpm --filter @understudy/extension build:staging`.
+2. Run `pnpm --filter @understudy/extension verify:staging-build`.
+3. Load `apps/extension/.output/chrome-mv3-staging/` through `chrome://extensions`.
+4. Confirm Chrome reports extension ID `ebpcldlibljfjhcfknagjcdmhggeknfc`.
+5. Sign in at `https://staging.understudy.proofof.tech/dashboard` and pair the browser.
+6. Reject pairing messages from production, loopback, query-bearing, fragment-bearing, and trailing-slash sender URLs.
+7. Verify hosted control, OAuth, Model Context Protocol (MCP), dashboard, privacy, and side-panel links remain on staging.
+
+The staging extension retains internal controls and broad host permissions. Do not submit it to the Chrome Web Store.
+
+## Pair and reconcile policy
+
+1. Sign in at `https://understudy.proofof.tech/dashboard`.
+2. Set the default general origins. An empty default is valid but cannot open a
+   session.
+3. Select **Pair this browser**. The dashboard must send a one-time offer
+   directly to the extension; no offer appears in a URL or copy field.
+4. Confirm the side panel reports the device label, online state, policy
+   version, and zero owned windows.
+5. Add an exact origin. It must remain unavailable until the extension
+   acknowledges the new version, then become available without re-pairing.
+6. Remove an origin used by a controlled tab. The backend must fence the lease,
+   terminalize the session, and push the narrower policy immediately.
+7. Replay or alter the pairing offer and try it from another origin. Each must
+   fail. Pairing the same installation again must rotate its credential rather
+   than leave a live predecessor.
+
+## Exercise lifecycle convergence
+
+Use two sessions to reach the default capacity and verify profile and origin
+collisions independently.
+
+- After a control-socket interruption, the device becomes `recovering` at 75
+  seconds and the sessions remain pollable.
+- At 90 seconds, sessions become `suspended` and capacity is reclaimed. Their
+  profile and origin collisions still apply.
+- A same-browser-epoch inventory can recover the exact assignment.
+- A new browser epoch adopts by incrementing the lease fence only when current
+  capacity, profile, and policy permit it.
+- Failed adoption terminalizes the old session as `lost`.
+- After 15 minutes suspended, the lease becomes `lost` and exact orphan cleanup
+  is sent.
+
+Create a controlled window, terminate the extension worker immediately after
+Chrome creates it, then wake the worker. The `storage.session` checkpoint and
+content-free `storage.local` recovery mirror must contain the browser epoch,
+IDs, and full lease fence before the runtime assignment. Recovery may close
+registered unowned windows and server-reported exact orphans, but it must not
+close an ordinary restored tab.
+
+Then exit Chrome completely so `storage.session` is cleared, reopen the same
+profile, and wake the extension. It must reconstruct the exact assignment and
+owned-window registry from the local recovery mirror without closing the owned
+window or adopting an ordinary restored tab.
+
+For attended mode, detach deliberately and through Chrome's debugger banner.
+The extension must send the current attachment UUID and tab ID. The backend
+enters `idle`, clears browser data, tabs, URL, and dialogs, and ignores a stale
+detach from an older attachment. Socket loss remains `detached`.
+
+## Enroll and submit a synthetic card
+
+Use test data only.
+
+1. In the side panel, add a card alias containing only letters, digits, `.`,
+   `_`, or `-`. The alias must contain no card digits.
+2. Confirm invalid Luhn data, expired dates, and a CVV outside three or four
+   digits are rejected before storage.
+3. Save a valid synthetic card. Confirm the form is cleared.
+4. Add the checkout's exact top-level origin to the local payment-origin list.
+5. Open a session whose general policy includes the same origin.
+6. Call `browser_list_cards`. It may return only aliases and approved origins.
+7. Snapshot the form and map distinct refs for PAN, combined or split expiry,
+   CVV, optional cardholder name, and submit.
+8. Call `browser_submit_card` once. From sensitive-mode entry onward, no
+   snapshot, screenshot, dialog, URL, title, tab metadata, page error, console,
+   network artifact, generic command, clipboard, download, or arbitrary log may
+   escape. The payment tab closes on every exit path.
+9. A failure before any card byte is inserted returns `not_started`. Any later
+   result is `outcome_unknown`, including a completed submit. Never retry the
+   latter automatically or inspect the destroyed tab for approval.
+10. Delete the card, then delete the whole vault. Repeating deletion must be
+    harmless. Losing the key while records exist must fail closed as key loss,
+    not silently create a new key.
+
+## Network-blip diagnosis
+
+Run `scripts/network-blip-harness.sh` from the repository root. The credential
+file and evidence JSONL must be absolute paths outside Git and mode `0600`.
+Set the three required environment variables shown below and confirm no
+production soak is active. The harness asks for `BREAK` immediately before
+changing firewall or Tailscale state and restores state through traps.
+
+Required baseline cases remain:
 
 ```bash
-zipinfo -1 apps/extension/.output/understudyextension-0.1.2-chrome-store.zip
-unzip -p apps/extension/.output/understudyextension-0.1.2-chrome-store.zip manifest.json | jq
-rg -a "localhost:8787|Advanced: manual configuration|Attended session" \
-  apps/extension/.output/chrome-mv3-store
+UNDERSTUDY_DEVICE_ID='<device-uuid>' \
+UNDERSTUDY_TEST_ORIGIN='https://allowed.example' \
+UNDERSTUDY_SOAK_CONFIRMED_INACTIVE=yes \
+scripts/network-blip-harness.sh a 60 /absolute/credential.json /absolute/test-a-60.jsonl
+
+UNDERSTUDY_DEVICE_ID='<device-uuid>' \
+UNDERSTUDY_TEST_ORIGIN='https://allowed.example' \
+UNDERSTUDY_SOAK_CONFIRMED_INACTIVE=yes \
+scripts/network-blip-harness.sh a 120 /absolute/credential.json /absolute/test-a-120.jsonl
+
+UNDERSTUDY_DEVICE_ID='<device-uuid>' \
+UNDERSTUDY_TEST_ORIGIN='https://allowed.example' \
+UNDERSTUDY_SOAK_CONFIRMED_INACTIVE=yes \
+scripts/network-blip-harness.sh b 30 /absolute/credential.json /absolute/test-b-30.jsonl
 ```
 
-Done means the ZIP has `manifest.json` at its root; its icons and listing metadata are present; permissions are `debugger`, `storage`, `alarms`, and WXT’s `sidePanel`; the only host permission is `https://understudy.proofof.tech/*`; and the final `rg` prints nothing.
+Do not add a secondary control origin. Use the result table in
+`docs/network-blip-rollout-handoff.md` to select any retry change.
 
-## Accept the unlisted store build in Chrome
+## Acceptance record
 
-Use a fresh Chrome profile. Load `apps/extension/.output/chrome-mv3-store/` through `chrome://extensions` → **Load unpacked**; command-line extension loading is not an acceptance substitute.
+Record the source SHA, extension version, browser version, device ID, policy
+version, session/lease fences, observed timestamps, and fixed outcome enums.
+Keep card data, raw credentials, and raw outage evidence outside Git.
 
-1. Select the toolbar action. The Understudy side panel must open.
-2. Leave the extension unpaired for at least 65 seconds. The service-worker console must show no localhost request, WebSocket attempt, or connection error.
-3. Enter an invalid or expired pairing code. The field must retain and select the code, and the panel must show an actionable error.
-4. Pair with a valid hosted code. The status must progress through **Connecting** to **Connected**, then show controlled-tab capacity.
-5. Confirm **Manual configuration** and **Attended session** are absent.
-6. With an active hosted session, select **Stop hosting**. Confirm the warning, then verify the session ends and the panel shows **Paused** without claiming hosting is enabled.
-7. Confirm the Privacy and Support links open the intended HTTPS policy and public issue tracker.
-8. Confirm `store-assets/screenshot-first-run-1280x800.png` still matches this build. Capture a replacement from the accepted build if the panel changed.
-
-Do not submit the extension until `https://understudy.proofof.tech/privacy` returns `200`.
-
-## Record the release decision
-
-Enable additional tenants only when all conditions hold:
-
-- Two controlled tabs route reads and inputs correctly
-- Capacity, origin, and profile collisions fail with the expected statuses
-- Redirect and popup containment hold
-- Service-worker and browser restart behavior matches this runbook
-- Credential rotation fences the predecessor
-- The 24-hour and 2-hour expiries hold
-- Durable Object duration does not scale with lease wall time
-- No granted write executes twice
-
-On failure, disable new leases, close or terminalize active leases and granted commands, and roll back application code. Keep migration `v2`.
+Release only when automated checks pass, the physical-window and sensitive-mode
+negative paths pass in real Chrome, and all three independent review lanes are
+clean.

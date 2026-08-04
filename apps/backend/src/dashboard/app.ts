@@ -8,7 +8,7 @@
 
 import { Hono, type Context } from "hono";
 import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
-import { getDirectory } from "../account-directory";
+import { AUTH_CONTRACT_VERSION, getDirectory } from "../account-directory";
 import {
   sha256Hex,
   taggedHmacHex,
@@ -19,11 +19,12 @@ import {
   listDevices as listLiveDevices,
   mergeDeviceViews,
   revokeDeviceForOwner,
+  updateOriginPolicyForOwner,
 } from "../api/sessions";
 import { base64urlDecode, base64urlEncode } from "../base64url";
 import { emitTelemetry } from "../telemetry";
 import type { Env } from "../types";
-import { listVaultSecretNames, VAULT_SECRET_NAME_PATTERN, writeVaultSecret } from "../vault";
+import { canonicalizeOrigins, RequestBodyError } from "../validation";
 import {
   clearedSessionCookie,
   csrfValid,
@@ -41,14 +42,12 @@ import {
   layout,
   loginPage,
   messagePage,
-  pairingCodePage,
+  pairingOfferPage,
   privacyPage,
   tokenRevealPage,
   verifyPage,
-  VAULT_UPLOAD_JS,
   type HomeDevice,
 } from "./pages";
-import { unsealUpload, uploadPublicJwk } from "./vault-upload";
 
 type Variables = { cspNonce: string };
 type DashboardContext = { Bindings: Env; Variables: Variables };
@@ -57,15 +56,11 @@ export const dashboardApp = new Hono<DashboardContext>();
 
 const NOTICES: Record<string, string> = {
   "origins-saved": "Allowed origins saved.",
-  "secret-saved": "Vault secret saved.",
   "token-revoked": "API token revoked.",
   "token-missing": "That API token was already gone.",
-  "device-revoked": "Browser revoked. Pair again with a fresh code to reconnect it.",
+  "device-revoked": "Browser revoked. Generate a fresh pairing offer to reconnect it.",
   "device-missing": "That browser was already gone.",
-  // Lands on the dashboard rather than an interstitial precisely because the
-  // remedy — the Allowed origins card — is on the dashboard. The pairing card's
-  // own hint states the prerequisite; this only explains the refused click.
-  "no-origins": "No pairing code: add an allowed origin first.",
+  "grant-revoked": "OAuth connection revoked.",
 };
 
 dashboardApp.use("*", async (c, next) => {
@@ -87,6 +82,7 @@ dashboardApp.use("*", async (c, next) => {
     await next();
   }
   c.header("Cache-Control", "no-store");
+  c.header("Strict-Transport-Security", "max-age=300");
   // `same-origin`, not `no-referrer`. The privacy goal — never leak a dashboard
   // URL to a third party — is met identically by both: neither sends anything
   // cross-origin, including on the consent redirect that carries the
@@ -108,9 +104,21 @@ const directory = getDirectory;
 // A dashboard form value, bounded BEFORE it crosses into the singleton
 // directory DO — an oversized field from one account must not be buffered and
 // processed inside the object every other account's auth depends on. 16 KB
-// clears the largest legitimate field (a sealed vault ciphertext, ≤ ~11 KB
-// base64; the origins textarea and a serialized auth request are far smaller).
+// clears the largest legitimate fields (the origins textarea and serialized
+// authorization requests are far smaller).
 const MAX_FIELD_BYTES = 16384;
+
+const S256_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
+
+function requireS256Pkce(request: AuthRequest): void {
+  if (
+    request.codeChallengeMethod !== "S256" ||
+    request.codeChallenge === undefined ||
+    !S256_CHALLENGE.test(request.codeChallenge)
+  ) {
+    throw new Error("S256 PKCE is required");
+  }
+}
 
 function field(body: Record<string, unknown>, name: string): string {
   const value = body[name];
@@ -124,8 +132,8 @@ function consentSig(env: Env, authreq: string, cookieToken: string): Promise<str
 
 type Ctx = Context<DashboardContext>;
 
-function render(c: Ctx, title: string, body: Parameters<typeof layout>[2], extraJs = "") {
-  return c.html(layout(title, c.get("cspNonce"), body, extraJs));
+function render(c: Ctx, title: string, body: Parameters<typeof layout>[2]) {
+  return c.html(layout(title, c.get("cspNonce"), body));
 }
 
 /** Session + CSRF for every authed POST; a Response means refusal. The
@@ -152,12 +160,12 @@ dashboardApp.get("/dashboard", async (c) => {
   if (user === null) {
     return render(c, "Sign in — Understudy", loginPage(next));
   }
-  const [directoryDevices, tokens, secretNames, liveDevices, uploadKey] = await Promise.all([
+  const [directoryDevices, tokens, liveDevices, grantPage] = await Promise.all([
     directory(c.env).listDevices(user.userId),
     directory(c.env).listMcpTokens(user.userId),
-    listVaultSecretNames(c.env, user.tenantId),
     listLiveDevices(c.env, { actor: `dashboard:${user.userId}`, tenantId: user.tenantId }),
-    uploadPublicJwk(c.env),
+    c.env.OAUTH_PROVIDER?.listUserGrants(user.userId, { limit: 100 }) ??
+      Promise.resolve({ items: [] }),
   ]);
   const devices: HomeDevice[] = mergeDeviceViews(directoryDevices, liveDevices).map((view) => ({
     deviceId: view.deviceId,
@@ -173,18 +181,26 @@ dashboardApp.get("/dashboard", async (c) => {
     "Understudy dashboard",
     homePage({
       email: user.email,
-      tenantId: user.tenantId,
       csrf: await csrfTokenFor(c.env, user.cookieToken),
       origins: user.allowedOrigins,
       devices,
       tokens,
-      secretNames,
-      uploadKeyJson: JSON.stringify(uploadKey),
+      grants: grantPage.items.map((grant) => ({
+        grantId: grant.id,
+        clientId: grant.clientId,
+        label:
+          typeof grant.metadata?.label === "string"
+            ? grant.metadata.label
+            : grant.clientId,
+        deviceId:
+          typeof grant.metadata?.deviceId === "string"
+            ? grant.metadata.deviceId
+            : null,
+      })),
       ...(noticeKey !== undefined && NOTICES[noticeKey] !== undefined
         ? { notice: NOTICES[noticeKey] }
         : {}),
     }),
-    VAULT_UPLOAD_JS,
   );
 });
 
@@ -261,7 +277,26 @@ dashboardApp.post("/dashboard/origins", async (c) => {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-  const result = await directory(c.env).setAllowedOrigins(user.userId, origins);
+  let canonical: string[];
+  try {
+    canonical = canonicalizeOrigins(origins);
+  } catch (error) {
+    return render(
+      c,
+      "Origins — Understudy",
+      messagePage(
+        "Origins not saved",
+        `Invalid origin list: ${
+          error instanceof RequestBodyError ? error.message : "invalid origin"
+        }.`,
+      ),
+    );
+  }
+  const result = await updateOriginPolicyForOwner(
+    c.env,
+    { userId: user.userId, tenantId: user.tenantId },
+    canonical,
+  );
   if (result.kind === "invalid") {
     return render(
       c,
@@ -276,14 +311,23 @@ dashboardApp.post("/dashboard/pair", async (c) => {
   const body = await c.req.parseBody();
   const user = await authedPost(c, body);
   if (user instanceof Response) return user;
-  const created = await directory(c.env).createPairingCode(user.userId);
-  if (created.kind === "no_origins") {
-    return c.redirect("/dashboard?notice=no-origins", 303);
+  const created = await directory(c.env).createPairingOffer(user.userId);
+  if (!/^[a-p]{32}$/.test(c.env.EXTENSION_ID)) {
+    return render(
+      c,
+      "Pair browser — Understudy",
+      messagePage("Pairing unavailable", "The production extension ID is not configured."),
+    );
   }
   return render(
     c,
-    "Pairing code — Understudy",
-    pairingCodePage(await csrfTokenFor(c.env, user.cookieToken), created.code, created.expiresAt),
+    "Pair browser — Understudy",
+    pairingOfferPage(
+      await csrfTokenFor(c.env, user.cookieToken),
+      created.offer,
+      created.expiresAt,
+      c.env.EXTENSION_ID,
+    ),
   );
 });
 
@@ -294,6 +338,7 @@ dashboardApp.post("/dashboard/tokens/create", async (c) => {
   const label = field(body, "label").trim();
   const created = await directory(c.env).createMcpToken(
     user.userId,
+    field(body, "deviceId"),
     label.length === 0 ? null : label,
   );
   if (created === null) return c.text("account unavailable", 403);
@@ -312,6 +357,16 @@ dashboardApp.post("/dashboard/tokens/revoke", async (c) => {
   return c.redirect(`/dashboard?notice=${revoked ? "token-revoked" : "token-missing"}`, 303);
 });
 
+dashboardApp.post("/dashboard/oauth/revoke", async (c) => {
+  const body = await c.req.parseBody();
+  const user = await authedPost(c, body);
+  if (user instanceof Response) return user;
+  const helpers = c.env.OAUTH_PROVIDER;
+  if (helpers === undefined) return c.text("oauth unavailable", 500);
+  await helpers.revokeGrant(field(body, "grantId"), user.userId);
+  return c.redirect("/dashboard?notice=grant-revoked", 303);
+});
+
 dashboardApp.post("/dashboard/devices/revoke", async (c) => {
   const body = await c.req.parseBody();
   const user = await authedPost(c, body);
@@ -326,46 +381,6 @@ dashboardApp.post("/dashboard/devices/revoke", async (c) => {
   );
 });
 
-dashboardApp.get("/dashboard/vault/pubkey", async (c) => {
-  const user = await sessionFromRequest(c.req.raw, c.env);
-  if (user === null) return c.json({ error: "unauthorized" }, 401);
-  return c.json(await uploadPublicJwk(c.env));
-});
-
-dashboardApp.post("/dashboard/vault/put", async (c) => {
-  const body = await c.req.parseBody();
-  const user = await authedPost(c, body);
-  if (user instanceof Response) return user;
-  const name = field(body, "name");
-  if (!VAULT_SECRET_NAME_PATTERN.test(name)) {
-    return render(
-      c,
-      "Vault — Understudy",
-      messagePage(
-        "Secret not saved",
-        "Names use letters, digits, dot, dash, and underscore (up to 200 characters).",
-      ),
-    );
-  }
-  const plaintext = await unsealUpload(c.env, {
-    epk: field(body, "epk"),
-    iv: field(body, "iv"),
-    ct: field(body, "ct"),
-  });
-  if (plaintext === null || plaintext.length === 0) {
-    return render(
-      c,
-      "Vault — Understudy",
-      messagePage(
-        "Secret not saved",
-        "The encrypted payload could not be read. JavaScript must be enabled — the value is sealed in your browser before upload.",
-      ),
-    );
-  }
-  await writeVaultSecret(c.env, user.tenantId, name, plaintext);
-  return c.redirect("/dashboard?notice=secret-saved", 303);
-});
-
 // ── OAuth consent (the provider routes /oauth/authorize to this app) ────────
 
 dashboardApp.get("/oauth/authorize", async (c) => {
@@ -374,6 +389,7 @@ dashboardApp.get("/oauth/authorize", async (c) => {
   let oauthReq: AuthRequest;
   try {
     oauthReq = await helpers.parseAuthRequest(c.req.raw);
+    requireS256Pkce(oauthReq);
   } catch {
     return c.text("invalid authorization request", 400);
   }
@@ -387,6 +403,17 @@ dashboardApp.get("/oauth/authorize", async (c) => {
   }
   const client = await helpers.lookupClient(oauthReq.clientId);
   if (client === null) return c.text("unknown client", 400);
+  const devices = await directory(c.env).listDevices(user.userId);
+  if (devices.length === 0) {
+    return render(
+      c,
+      "Pair a browser — Understudy",
+      messagePage(
+        "Pair a browser first",
+        "OAuth access must be bound to one active browser. Pair a browser, then restart authorization.",
+      ),
+    );
+  }
   // DCR metadata is untrusted display data: the name is escaped by the
   // template, and no client-supplied images or links are ever rendered.
   const clientName = client.clientName ?? oauthReq.clientId;
@@ -410,6 +437,10 @@ dashboardApp.get("/oauth/authorize", async (c) => {
       // so it cannot be swapped between render and submit or replayed under a
       // different login.
       sig: await consentSig(c.env, authreq, user.cookieToken),
+      devices: devices.map((device) => ({
+        deviceId: device.deviceId,
+        label: device.label,
+      })),
     }),
   );
 });
@@ -431,6 +462,7 @@ dashboardApp.post("/oauth/authorize", async (c) => {
   let oauthReq: AuthRequest;
   try {
     oauthReq = JSON.parse(new TextDecoder().decode(base64urlDecode(authreq))) as AuthRequest;
+    requireS256Pkce(oauthReq);
   } catch {
     return c.text("stale consent form", 403);
   }
@@ -447,10 +479,20 @@ dashboardApp.post("/oauth/authorize", async (c) => {
   }
 
   const client = await helpers.lookupClient(oauthReq.clientId);
+  const deviceId = field(body, "deviceId");
+  const userDevices = await directory(c.env).listDevices(user.userId);
+  if (!userDevices.some((device) => device.deviceId === deviceId)) {
+    return c.text("select an active browser", 400);
+  }
   const { redirectTo } = await helpers.completeAuthorization({
     request: oauthReq,
     userId: user.userId,
-    metadata: { label: client?.clientName ?? oauthReq.clientId },
+    metadata: {
+      label: client?.clientName ?? oauthReq.clientId,
+      deviceId,
+      authEpoch: user.authEpoch,
+      contractVersion: AUTH_CONTRACT_VERSION,
+    },
     scope: ["mcp"],
     props: {
       userId: user.userId,
@@ -458,6 +500,9 @@ dashboardApp.post("/oauth/authorize", async (c) => {
       actorId: `oauth:${oauthReq.clientId}`,
       authMethod: "oauth",
       scopes: ["mcp"],
+      deviceId,
+      authEpoch: user.authEpoch,
+      contractVersion: AUTH_CONTRACT_VERSION,
     },
   });
   await emitTelemetry(c.env, {
@@ -475,8 +520,8 @@ dashboardApp.all("*", (c) => {
 
 // Scrubbed error boundary for the whole dashboard/consent plane, mirroring
 // the /v1 app's onError. Without it a throw (a directory RPC fault, a
-// malformed upload key) would surface as an unscrubbed 500 for sign-in,
-// pairing, and revocation alike.
+// template failure) would surface as an unscrubbed 500 for sign-in, pairing,
+// and revocation alike.
 dashboardApp.onError((_error, c) => {
   console.error("unhandled dashboard error");
   c.header("Cache-Control", "no-store");

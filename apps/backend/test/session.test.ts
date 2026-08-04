@@ -89,6 +89,8 @@ function unattendedLease(sessionId: string): LeaseResource {
     hardExpiresAt: now + 120_000,
     needsReconciliation: false,
     dialogDelivery: "ok",
+    policyVersion: 1,
+    adoptionExpiresAt: null,
   };
 }
 
@@ -102,9 +104,10 @@ function seedAttempt(
   instance: SessionAgent,
   input: {
     state: SeededAttempt["state"];
-    commandType: Command["type"];
+    commandType: Command["type"] | "fill_secret";
     dryRun: boolean;
     isWrite: boolean;
+    deadlineOffsetMs?: number;
   },
 ): SeededAttempt {
   const commandId = crypto.randomUUID();
@@ -118,7 +121,7 @@ function seedAttempt(
     ) VALUES (
       ${commandId}, ${crypto.randomUUID()}, ${input.commandType},
       ${input.dryRun ? 1 : 0}, ${input.state}, ${attemptId},
-      ${now + 60_000}, ${input.state === "granted" ? now + 60_000 : null},
+      ${now + (input.deadlineOffsetMs ?? 60_000)}, ${input.state === "granted" ? now + (input.deadlineOffsetMs ?? 60_000) : null},
       NULL, ${now}, ${now}, ${input.isWrite ? 1 : 0}
     )
   `;
@@ -924,7 +927,271 @@ describe("hello resync", () => {
   });
 });
 
+describe("protocol-v3 command result correlation", () => {
+  it("permits legacy snapshot fallback only for a protocol-1/2 peer", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      instance.setState({
+        ...instance.state,
+        mode: "attended",
+        status: "connected",
+        activeConnectionId: FAKE_CONNECTION.id,
+        attachmentId: "attachment",
+        protocolVersion: 2,
+        capabilities: [],
+      });
+      Object.assign(instance, { getConnections: () => [FAKE_CONNECTION] });
+      const dispatchV2 = (
+        instance as unknown as {
+          dispatchV2(
+            command: Command,
+            dryRun: boolean,
+            statusUrl: string,
+          ): Promise<{ kind: string; commandId: string }>;
+        }
+      ).dispatchV2.bind(instance);
+
+      await expect(
+        dispatchV2(
+          {
+            type: "capture_elements",
+            commandId: "legacy-semantic",
+            scope: "viewport",
+            view: "interactive",
+            limit: 80,
+            changesOnly: false,
+          },
+          false,
+          "https://example.test/status",
+        ),
+      ).resolves.toEqual({
+        kind: "legacy_snapshot_required",
+        commandId: "legacy-semantic",
+      });
+    });
+  });
+
+  it("rejects semantic commands when the protocol-3 extension omitted the capability", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      instance.setState({
+        ...instance.state,
+        mode: "attended",
+        status: "connected",
+        activeConnectionId: FAKE_CONNECTION.id,
+        attachmentId: "attachment",
+        protocolVersion: 3,
+        capabilities: ["safe-write-v3"],
+      });
+      Object.assign(instance, { getConnections: () => [FAKE_CONNECTION] });
+      const dispatchV2 = (
+        instance as unknown as {
+          dispatchV2(
+            command: Command,
+            dryRun: boolean,
+            statusUrl: string,
+          ): Promise<{ kind: string; commandId: string }>;
+        }
+      ).dispatchV2.bind(instance);
+
+      await expect(
+        dispatchV2(
+          {
+            type: "capture_elements",
+            commandId: "semantic",
+            scope: "viewport",
+            view: "interactive",
+            limit: 80,
+            changesOnly: false,
+          },
+          false,
+          "https://example.test/status",
+        ),
+      ).resolves.toEqual({ kind: "unsupported", commandId: "semantic" });
+    });
+  });
+
+  it("keeps a card submission pending when the result type does not match", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      setAuthoritative(instance);
+      const attempt = seedAttempt(instance, {
+        state: "granted",
+        commandType: "submit_card",
+        dryRun: false,
+        isWrite: true,
+      });
+
+      await instance.onMessage(
+        FAKE_CONNECTION,
+        JSON.stringify({
+          type: "command_result",
+          attemptId: attempt.attemptId,
+          commandId: attempt.commandId,
+          event: {
+            type: "action_result",
+            commandId: attempt.commandId,
+            ok: true,
+          },
+        }),
+      );
+      await expect(commandState(instance, attempt)).resolves.toBe("granted");
+
+      await instance.onMessage(
+        FAKE_CONNECTION,
+        JSON.stringify({
+          type: "command_result",
+          attemptId: attempt.attemptId,
+          commandId: attempt.commandId,
+          event: {
+            type: "card_submission_result",
+            commandId: attempt.commandId,
+            status: "not_started",
+            reason: "card_not_found",
+          },
+        }),
+      );
+      await expect(instance.getCommandStatus(attempt.commandId)).resolves.toMatchObject({
+        status: "completed",
+        event: {
+          type: "card_submission_result",
+          status: "not_started",
+          reason: "card_not_found",
+        },
+      });
+    });
+  });
+
+  it("settles a late pre-cutover fill_secret result without crashing", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      setAuthoritative(instance);
+      const attempt = seedAttempt(instance, {
+        state: "granted",
+        commandType: "fill_secret",
+        dryRun: false,
+        isWrite: true,
+      });
+
+      await expect(
+        instance.onMessage(
+          FAKE_CONNECTION,
+          JSON.stringify({
+            type: "command_result",
+            attemptId: attempt.attemptId,
+            commandId: attempt.commandId,
+            event: {
+              type: "action_result",
+              commandId: attempt.commandId,
+              ok: true,
+            },
+          }),
+        ),
+      ).resolves.toBeUndefined();
+
+      await expect(instance.getCommandStatus(attempt.commandId)).resolves.toMatchObject({
+        status: "unknown",
+        safeToRetry: false,
+      });
+      expect(
+        instance.sql<{ value: string }>`
+          SELECT value FROM session_flag WHERE key = 'writes_blocked'
+        `[0]?.value,
+      ).toBe("1");
+    });
+  });
+});
+
+describe("protocol-v3 command deadline recovery", () => {
+  it("settles overdue rows on poll even when their scheduler write was lost", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      const preparing = seedAttempt(instance, {
+        state: "preparing",
+        commandType: "click",
+        dryRun: false,
+        isWrite: true,
+        deadlineOffsetMs: -1,
+      });
+      const granted = seedAttempt(instance, {
+        state: "granted",
+        commandType: "click",
+        dryRun: false,
+        isWrite: true,
+        deadlineOffsetMs: -1,
+      });
+
+      await expect(instance.getCommandStatus(preparing.commandId)).resolves.toMatchObject({
+        status: "not_started",
+        safeToRetry: true,
+      });
+      await expect(instance.getCommandStatus(granted.commandId)).resolves.toMatchObject({
+        status: "unknown",
+        safeToRetry: false,
+      });
+    });
+  });
+
+  it("reinstalls future expiry work when an active row is rediscovered", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      const attempt = seedAttempt(instance, {
+        state: "preparing",
+        commandType: "click",
+        dryRun: false,
+        isWrite: true,
+      });
+      const schedule = vi.spyOn(instance, "schedule");
+      await (
+        instance as unknown as { reconcileCommandDeadlines(): Promise<void> }
+      ).reconcileCommandDeadlines();
+
+      expect(schedule).toHaveBeenCalledWith(
+        expect.any(Date),
+        "expireAttempt",
+        { attemptId: attempt.attemptId },
+        { idempotent: true },
+      );
+    });
+  });
+});
+
 describe("unattended terminal lifecycle settlement", () => {
+  it("accepts only the single fence bump used for new-epoch suspended adoption", async () => {
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      const initial = unattendedLease(sessionId);
+      await instance.initializeUnattended("tenantA", initial);
+      await instance.markLifecycle("suspended", true);
+
+      await instance.beginRecovery({
+        ...initial,
+        status: "recovering",
+        leaseEpoch: initial.leaseEpoch + 2,
+        browserEpoch: crypto.randomUUID(),
+      });
+      expect(instance.state.unattended?.status).toBe("suspended");
+
+      const adoptedEpoch = crypto.randomUUID();
+      await instance.beginRecovery({
+        ...initial,
+        status: "recovering",
+        leaseEpoch: initial.leaseEpoch + 1,
+        browserEpoch: adoptedEpoch,
+        allowedOrigins: ["https://shop.example"],
+      });
+      expect(instance.state.unattended).toMatchObject({
+        status: "recovering",
+        leaseEpoch: initial.leaseEpoch + 1,
+        browserEpoch: adoptedEpoch,
+        allowedOrigins: ["https://shop.example"],
+      });
+    });
+  });
+
   it.each(["closing", "closed", "expired", "lost"] as const)(
     "settles every active attempt and notifies a waiter when lifecycle becomes %s",
     async (lifecycle) => {
@@ -1059,6 +1326,72 @@ describe("unattended terminal lifecycle settlement", () => {
       });
     },
   );
+});
+
+describe("attended attachment fencing", () => {
+  it("normalizes legacy attended state without an attachment field", async () => {
+    const stub = await getSessionStub(crypto.randomUUID());
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      const legacy = { ...instance.state } as Record<string, unknown>;
+      delete legacy.attachmentId;
+      instance.setState(legacy as unknown as typeof instance.state);
+
+      await expect(instance.getStatus()).resolves.toMatchObject({
+        mode: "attended",
+        attachmentId: null,
+      });
+    });
+  });
+
+  it("terminalizes prepared and granted commands when the attachment detaches", async () => {
+    const sessionId = crypto.randomUUID();
+    const stub = await getSessionStub(sessionId);
+    await runInDurableObject(stub, async (instance: SessionAgent) => {
+      const attachmentId = crypto.randomUUID();
+      instance.setState({
+        ...instance.state,
+        status: "connected",
+        activeConnectionId: FAKE_CONNECTION.id,
+        attachmentId,
+        browser: { browser: "Chrome", extVersion: "0.2.0" },
+        tabs: [{ tabId: 7, url: "https://example.com", title: "Example", active: true }],
+        currentUrl: "https://example.com",
+      });
+      const prepared = seedAttempt(instance, {
+        state: "preparing",
+        commandType: "click",
+        dryRun: false,
+        isWrite: true,
+      });
+      const granted = seedAttempt(instance, {
+        state: "granted",
+        commandType: "click",
+        dryRun: false,
+        isWrite: true,
+      });
+      instance.sql`
+        UPDATE command_journal SET attachment_id = ${attachmentId}
+        WHERE attempt_id IN (${prepared.attemptId}, ${granted.attemptId})
+      `;
+
+      await instance.onMessage(
+        FAKE_CONNECTION,
+        JSON.stringify({ type: "attended_detached", attachmentId, tabId: 7 }),
+      );
+
+      await expect(commandState(instance, prepared)).resolves.toBe("not_started");
+      await expect(commandState(instance, granted)).resolves.toBe("unknown");
+      expect(await instance.getStatus()).toMatchObject({
+        mode: "attended",
+        status: "idle",
+        attachmentId: null,
+        browser: null,
+        tabs: [],
+        currentUrl: null,
+        dialogs: [],
+      });
+    });
+  });
 });
 
 describe("dialog recording (onMessage → SessionState.dialogs)", () => {

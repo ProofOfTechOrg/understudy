@@ -1,27 +1,32 @@
 {
   "name": "@understudy/backend",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "deploy:production": "bash scripts/deploy-production.sh",
+    "deploy:production:auto": "bash scripts/deploy-target.sh production-auto",
+    "deploy:staging": "bash scripts/deploy-target.sh staging-local",
+    "deploy:staging:ci": "bash scripts/deploy-target.sh staging-ci",
+    "provision:staging": "bash scripts/provision-staging.sh",
+    "verify:production-compatibility": "node scripts/verify-production-compatibility.mjs current",
     "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run && node --test scripts/deploy-target.integration.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "0.8.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@understudy/protocol": "workspace:*",
     "agents": "^0.17.3",
-    "hono": "^4.12.27",
+    "hono": "^4.12.34",
     "zod": "^4"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.0",
-    "@cloudflare/workers-types": "^5.20260706.1",
     "typescript": "^5.6.0",
-    "vitest": "^4.1.9",
+    "vitest": "^4.1.10",
     "wrangler": "^4.107.0"
   }
 }

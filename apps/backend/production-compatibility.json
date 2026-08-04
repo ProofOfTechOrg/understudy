@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "contractVersion": 3,
+  "requiredSecrets": [
+    "AUTH_HMAC_SECRET",
+    "CALLER_TOKENS",
+    "DEVICE_TOKENS",
+    "EXTENSION_ID",
+    "EXTENSION_TOKENS",
+    "WS_TICKET_SECRET"
+  ],
+  "files": {
+    "apps/backend/scripts/production-config.mjs": "41123b1f8c9b199c73739b692103e82d19431f2ba7c4aa6f6e014882b3a91f84",
+    "apps/backend/scripts/validate-production-config.mjs": "afc99f1136fbeb6fd9a706fc5eee762474f96f89bc25670ff7ff11a072191b46",
+    "apps/backend/src/static-device-config.mjs": "e6fae22641f012f6862488ee44ccc39d488d5338abd7ed2e29f6f10fab85cb24"
+  }
+}

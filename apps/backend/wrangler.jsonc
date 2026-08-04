@@ -50,6 +50,10 @@
   "compatibility_date": "2026-07-01",
   // Agents SDK Durable Objects require Node.js compatibility.
   "compatibility_flags": ["nodejs_compat"],
+  "version_metadata": { "binding": "VERSION" },
+  "define": {
+    "__UNDERSTUDY_SERVICE_ORIGIN__": "\"https://understudy.proofof.tech\""
+  },
   "durable_objects": {
     "bindings": [
       // One SessionAgent DO per sessionId (per tenant/case) - DL-006.
@@ -82,23 +86,6 @@
   ],
   "kv_namespaces": [
     {
-      // Credential vault ciphertext store: fill_secret's secretRef ->
-      // AES-256-GCM envelope (src/vault.ts; seed with scripts/vault-put.mjs
-      // - never `wrangler kv key put` a raw plaintext). Resolution is
-      // service-side (secrets.ts via vault.ts) and the plaintext is never
-      // logged or written to DO state (DL-004). A KV namespace gives the
-      // dynamic get-by-key lookup an arbitrary per-fill secretRef needs;
-      // CF's Secrets / Secrets Store bindings are static (one binding per
-      // fixed secret name) and cannot address a runtime-chosen key. A
-      // per-tenant external KMS remains a possible future swap behind the
-      // same Env.VAULT seam (src/types.ts).
-      "binding": "VAULT",
-      // Created 2026-07-17 via `wrangler kv namespace create VAULT` on the
-      // production account (see README "Deploy"). Namespace ids are not
-      // secrets; the values inside are ciphertext envelopes regardless.
-      "id": "b6168345442644e3ac24ef4c43dd7f1e"
-    },
-    {
       // @cloudflare/workers-oauth-provider's grant/token/client store (the
       // binding name is fixed by the library). Holds only hashed tokens and
       // encrypted props by the library's own design. Created 2026-07-30 via
@@ -110,8 +97,6 @@
   "secrets": {
     // AUTH_HMAC_SECRET signs/verifies server-minted sessionIds so
     // scopeSession can verify tenant ownership statelessly (M-006, DL-008).
-    // VAULT_MASTER_KEY (base64url, 32 bytes) envelope-encrypts every vault
-    // value; without it a KV read-back at rest yields only ciphertext.
     // CALLER_TOKENS / EXTENSION_TOKENS must be listed as well: when `secrets`
     // is declared, wrangler loads ONLY the listed keys from .dev.vars and
     // excludes the rest (no "optional" tier exists), which silently breaks
@@ -122,14 +107,8 @@
       "CALLER_TOKENS",
       "EXTENSION_TOKENS",
       "DEVICE_TOKENS",
-      "WS_TICKET_SECRET",
-      "VAULT_MASTER_KEY",
-      // base64url PKCS#8 P-256 private key for the dashboard's client-side
-      // vault-secret upload (§ vault-upload.ts). Listing it here is load-
-      // bearing twice over: deploys fail without it, and — because this key
-      // is also the .dev.vars allowlist — omitting it there would silently
-      // drop it in dev.
-      "VAULT_UPLOAD_PRIVATE_KEY"
+      "EXTENSION_ID",
+      "WS_TICKET_SECRET"
     ]
   },
   // Transactional email (sign-in OTPs) via Cloudflare Email Sending; the
@@ -137,7 +116,7 @@
   // dev the binding needs `wrangler dev --remote` to actually send.
   "send_email": [{ "name": "EMAIL" }],
   "vars": {
-    "QUOTA_POLICY": "{\"sessionCreatesPerActorMinute\":10,\"commandsPerSessionMinute\":120,\"commandsPerTenantMinute\":600,\"credentialFillsPerActorMinute\":30,\"deviceTicketsPerDeviceMinute\":30,\"sessionCommandCap\":10000}",
+    "QUOTA_POLICY": "{\"sessionCreatesPerActorMinute\":10,\"commandsPerSessionMinute\":120,\"commandsPerTenantMinute\":600,\"deviceTicketsPerDeviceMinute\":30,\"sessionCommandCap\":10000}",
     // Gates ONLY the unattended create branch (src/api/sessions.ts); a request
     // with an empty body returns from the attended branch above that gate, so
     // attended callers never reach it. This is the live blast-radius control
@@ -163,7 +142,7 @@
     //
     // Note re MCP: the "prefix:acct-" entry is defence-in-depth only. MCP
     // always dispatches with contractV2:true (account-agent.ts), so its writes
-    // are protected by dispatchV2's protocol-2 requirement, not by this flag —
+    // are protected by dispatchV2's protocol-3 requirement, not by this flag —
     // and an acct- tenant holds no CALLER_TOKENS entry, so it cannot reach the
     // legacy branch at all. The entry keeps the two allowlists symmetric and
     // guards against any future non-MCP acct- caller.
@@ -184,5 +163,87 @@
   ],
   "observability": {
     "enabled": true
+  },
+  "env": {
+    "staging": {
+      "name": "understudy-backend-staging",
+      "workers_dev": false,
+      "routes": [
+        {
+          "pattern": "staging.understudy.proofof.tech",
+          "custom_domain": true
+        }
+      ],
+      "define": {
+        "__UNDERSTUDY_SERVICE_ORIGIN__": "\"https://staging.understudy.proofof.tech\""
+      },
+      "version_metadata": { "binding": "VERSION" },
+      "durable_objects": {
+        "bindings": [
+          { "name": "SESSION", "class_name": "SessionAgent" },
+          { "name": "DEVICE", "class_name": "DeviceAgent" },
+          {
+            "name": "TENANT_CONTROL",
+            "class_name": "TenantDeviceCoordinator"
+          },
+          {
+            "name": "ACCOUNT_DIRECTORY",
+            "class_name": "AccountDirectory"
+          },
+          { "name": "MCP_AGENT", "class_name": "UnderstudyMcp" },
+          { "name": "ACCOUNT", "class_name": "AccountAgent" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["SessionAgent"] },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": ["DeviceAgent", "TenantDeviceCoordinator"]
+        },
+        { "tag": "v3", "new_sqlite_classes": ["AccountDirectory"] },
+        {
+          "tag": "v4",
+          "new_sqlite_classes": ["UnderstudyMcp", "AccountAgent"]
+        }
+      ],
+      "kv_namespaces": [
+        {
+          "binding": "OAUTH_KV",
+          "id": "75b867bea00143a480c5d86a04f5bcf4"
+        }
+      ],
+      "secrets": {
+        "required": [
+          "AUTH_HMAC_SECRET",
+          "CALLER_TOKENS",
+          "EXTENSION_TOKENS",
+          "DEVICE_TOKENS",
+          "EXTENSION_ID",
+          "WS_TICKET_SECRET"
+        ]
+      },
+      "send_email": [{ "name": "EMAIL" }],
+      "vars": {
+        "QUOTA_POLICY": "{\"sessionCreatesPerActorMinute\":10,\"commandsPerSessionMinute\":120,\"commandsPerTenantMinute\":600,\"deviceTicketsPerDeviceMinute\":30,\"sessionCommandCap\":10000}",
+        "UNATTENDED_ENABLED_TENANTS": "[\"prefix:acct-\"]",
+        "SAFE_WRITE_REQUIRED_TENANTS": "[\"prefix:acct-\"]"
+      },
+      "analytics_engine_datasets": [
+        {
+          "binding": "ANALYTICS",
+          "dataset": "understudy_telemetry_staging"
+        }
+      ],
+      "ratelimits": [
+        {
+          "name": "RATE_LIMITER",
+          "namespace_id": "1002",
+          "simple": { "limit": 300, "period": 60 }
+        }
+      ],
+      "observability": {
+        "enabled": true
+      }
+    }
   }
 }

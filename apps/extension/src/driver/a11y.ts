@@ -93,13 +93,6 @@ export function buildA11ySnapshot(
         }
         self.name = name;
       }
-      const value = axString(node.value);
-      if (value !== undefined) {
-        if (utf8ByteLength(value) > 4 * 1024) {
-          throw new Error("a11y value exceeds 4096 bytes");
-        }
-        self.value = value;
-      }
     }
 
     const childForest: A11yNode[] = [];

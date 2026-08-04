@@ -4,11 +4,14 @@ import {
   DEVICE_CONTROL_FRAME_MAX_BYTES,
   PROTOCOL_VERSION,
   safeParseDeviceControlClientFrame,
+  type AssignmentInventory,
   type DeviceControlServerFrame,
+  type OwnedWindow,
   type ProtocolCapability,
 } from "@understudy/protocol";
 import {
-  deviceCredentialLive,
+  currentDeviceAuthority,
+  deviceCredentialStatus,
   mintWsTicket,
   verifyWsTicket,
   type DeviceIdentity,
@@ -56,6 +59,8 @@ interface DeviceAuthorityFence {
   browserEpoch: string;
   credentialDigest: string;
   credentialVersion: number;
+  allowedOrigins: string[];
+  policyVersion: number;
 }
 
 export class DeviceAgent extends Agent<Env, DeviceState> {
@@ -172,12 +177,32 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
       this.env,
     );
     let authority = this.authority();
+    const currentAuthority =
+      claims === null || authority === undefined
+        ? null
+        : await currentDeviceAuthority(
+            authority.credential_digest,
+            {
+              tenantId: claims.tenantId,
+              deviceId: claims.deviceId,
+              credentialVersion: claims.credentialVersion ?? 0,
+            },
+            this.env,
+          );
     if (
       claims === null ||
       authority === undefined ||
+      currentAuthority === null ||
+      currentAuthority.kind === "invalid" ||
       claims.deviceId !== this.name ||
       claims.tenantId !== authority.tenant_id ||
       claims.credentialVersion !== authority.credential_version ||
+      (currentAuthority.kind === "live" &&
+        (claims.policyVersion !== currentAuthority.identity.policyVersion ||
+          !sameOrigins(
+            claims.allowedOrigins ?? [],
+            currentAuthority.identity.allowedOrigins,
+          ))) ||
       !(await this.consumeTicket(claims))
     ) {
       connection.close(1008, "invalid or replayed device ticket");
@@ -278,6 +303,24 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
           connection.close(1008, "device hello fence mismatch");
           return;
         }
+        const currentAuthority = await currentDeviceAuthority(
+          fence.credentialDigest,
+          {
+            tenantId: fence.tenantId,
+            deviceId: this.name,
+            credentialVersion: fence.credentialVersion,
+          },
+          this.env,
+        );
+        if (
+          currentAuthority.kind === "invalid" ||
+          (currentAuthority.kind === "live" &&
+            (currentAuthority.identity.policyVersion !== fence.policyVersion ||
+              !sameOrigins(currentAuthority.identity.allowedOrigins, fence.allowedOrigins)))
+        ) {
+          connection.close(1008, "stale device policy ticket");
+          return;
+        }
         let allowedOrigins: string[];
         try {
           allowedOrigins = canonicalizeOrigins(frame.allowedOrigins);
@@ -300,7 +343,19 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
           browserEpoch: frame.browserEpoch,
           credentialDigest: fence.credentialDigest,
           credentialVersion: fence.credentialVersion,
-          allowedOrigins,
+          allowedOrigins: fence.allowedOrigins,
+          policyVersion: fence.policyVersion,
+          authoritySource:
+            currentAuthority.kind === "live"
+              ? currentAuthority.source
+              : "directory",
+          acknowledgedPolicyVersion:
+            frame.policyVersion === fence.policyVersion &&
+            sameOrigins(allowedOrigins, fence.allowedOrigins)
+              ? fence.policyVersion
+              : null,
+          assignments: frame.assignments,
+          ownedWindows: frame.ownedWindows,
           capabilities: frame.capabilities,
         });
         if (!this.matchesAuthority(connection, fence)) return;
@@ -320,22 +375,46 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
             deviceId: this.name,
           });
         }
+        await this.reconcileInventory(
+          connection,
+          fence,
+          frame.assignments,
+          frame.ownedWindows,
+        );
         return;
       }
       case "heartbeat": {
-        if (
-          frame.deviceId !== this.name ||
-          frame.browserEpoch !== fence.browserEpoch ||
-          !(await deviceCredentialLive(
-            fence.credentialDigest,
+        const credentialStatus =
+          frame.deviceId === this.name && frame.browserEpoch === fence.browserEpoch
+            ? await deviceCredentialStatus(
+                fence.credentialDigest,
+                {
+                  tenantId: fence.tenantId,
+                  deviceId: this.name,
+                  credentialVersion: fence.credentialVersion,
+                },
+                this.env,
+              )
+            : "revoked";
+        if (credentialStatus === "superseded") {
+          if (!this.matchesAuthority(connection, fence)) return;
+          await this.coordinator(fence.tenantId).suspendForCredentialRotation(
+            this.name,
             {
-              tenantId: fence.tenantId,
-              deviceId: this.name,
+              credentialDigest: fence.credentialDigest,
               credentialVersion: fence.credentialVersion,
             },
-            this.env,
-          ))
-        ) {
+          );
+          if (!this.matchesAuthority(connection, fence)) return;
+          await emitTelemetry(this.env, {
+            event: "device_offline",
+            outcome: "credential_rotation_pending",
+            tenantId: fence.tenantId,
+            deviceId: this.name,
+          });
+          return;
+        }
+        if (credentialStatus === "revoked") {
           if (!this.matchesAuthority(connection, fence)) return;
           const revoked = await this.coordinator(fence.tenantId).revokeDevice(
             this.name,
@@ -358,45 +437,81 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
           this.closeRevoked(connection);
           return;
         }
-        if (!this.matchesAuthority(connection, fence)) return;
-        const heartbeat = await this.coordinator(fence.tenantId).heartbeat(
-          this.name,
-          frame.browserEpoch,
-          frame.leaseIds,
-        );
-        if (!this.matchesAuthority(connection, fence)) return;
-        if (!heartbeat.ok) {
-          connection.close(1008, "device heartbeat rejected");
-          return;
-        }
-        for (const lease of heartbeat.recoveries) {
-          const session = await getAgentByName(this.env.SESSION, lease.sessionId);
-          if (!this.matchesAuthority(connection, fence)) return;
-          await session.beginRecovery(lease);
-          if (!this.matchesAuthority(connection, fence)) return;
-          await this.sendProvision(lease, fence);
-          if (!this.matchesAuthority(connection, fence)) return;
-          await emitTelemetry(this.env, {
-            event: "recovery",
-            outcome: "provision_sent",
+        const currentAuthority = await currentDeviceAuthority(
+          fence.credentialDigest,
+          {
             tenantId: fence.tenantId,
             deviceId: this.name,
-            sessionId: lease.sessionId,
-          });
-        }
-        for (const lease of heartbeat.assignments) {
-          const session = await getAgentByName(this.env.SESSION, lease.sessionId);
+            credentialVersion: fence.credentialVersion,
+          },
+          this.env,
+        );
+        if (currentAuthority.kind === "invalid") {
           if (!this.matchesAuthority(connection, fence)) return;
-          if (await session.needsSessionTicket()) {
-            if (!this.matchesAuthority(connection, fence)) return;
-            await this.sendSessionTicket(lease, fence);
+          connection.close(1008, "device authority unavailable");
+          return;
+        }
+        let currentFence = fence;
+        if (
+          currentAuthority.kind === "live" &&
+          (currentAuthority.identity.policyVersion !== fence.policyVersion ||
+            !sameOrigins(currentAuthority.identity.allowedOrigins, fence.allowedOrigins))
+        ) {
+          if (!this.matchesAuthority(connection, fence)) return;
+          if (currentAuthority.source === "static") {
+            const policyUpdated = await this.coordinator(
+              fence.tenantId,
+            ).advanceStaticDevicePolicy({
+              deviceId: this.name,
+              policyVersion: currentAuthority.identity.policyVersion,
+              allowedOrigins: currentAuthority.identity.allowedOrigins,
+              narrowing: fence.allowedOrigins.some(
+                (origin) => !currentAuthority.identity.allowedOrigins.includes(origin),
+              ),
+            });
+            if (!policyUpdated || !this.matchesAuthority(connection, fence)) {
+              connection.close(1008, "stale device policy");
+              return;
+            }
           }
-          if (!this.matchesAuthority(connection, fence)) return;
+          const state = connection.state as AuthorizedConnectionState;
+          connection.setState({
+            authorized: true,
+            claims: {
+              ...state.claims,
+              policyVersion: currentAuthority.identity.policyVersion,
+              allowedOrigins: [...currentAuthority.identity.allowedOrigins],
+            },
+          } satisfies AuthorizedConnectionState);
+          this.send(connection, {
+            type: "policy_update",
+            policyVersion: currentAuthority.identity.policyVersion,
+            allowedOrigins: currentAuthority.identity.allowedOrigins,
+          });
+          currentFence = this.captureAuthority(connection) ?? fence;
         }
-        for (const lease of heartbeat.closures) {
-          if (!this.matchesAuthority(connection, fence)) return;
-          await this.requestClose(lease);
+        await this.reconcileInventory(
+          connection,
+          currentFence,
+          frame.assignments,
+          frame.ownedWindows,
+        );
+        return;
+      }
+      case "policy_ack": {
+        if (
+          frame.deviceId !== this.name ||
+          frame.browserEpoch !== fence.browserEpoch ||
+          frame.policyVersion !== fence.policyVersion
+        ) {
+          connection.close(1008, "device policy acknowledgement mismatch");
+          return;
         }
+        await this.coordinator(fence.tenantId).acknowledgePolicy(
+          this.name,
+          fence.browserEpoch,
+          frame.policyVersion,
+        );
         return;
       }
       case "provisioned": {
@@ -434,12 +549,18 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
         });
         return;
       }
-      case "provision_failed":
-        await this.coordinator(fence.tenantId).markProvisionFailed({
+      case "provision_failed": {
+        const lease = await this.coordinator(fence.tenantId).markProvisionFailed({
           ...frame,
           deviceId: this.name,
         });
         if (!this.matchesAuthority(connection, fence)) return;
+        if (lease !== null) {
+          const session = await getAgentByName(this.env.SESSION, frame.sessionId);
+          await session.markLifecycle("closing", true);
+          if (!this.matchesAuthority(connection, fence)) return;
+          await this.requestClose(lease);
+        }
         await emitTelemetry(this.env, {
           event: "provisioning",
           outcome: "failed",
@@ -448,6 +569,7 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
           sessionId: frame.sessionId,
         });
         return;
+      }
       case "closed": {
         const confirmation = await this.coordinator(fence.tenantId).confirmClosed({
           ...frame,
@@ -484,6 +606,58 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
     this.setState({ ...this.state, activeConnectionId: null });
   }
 
+  private async reconcileInventory(
+    connection: Connection,
+    fence: DeviceAuthorityFence,
+    assignments: AssignmentInventory[],
+    ownedWindows: OwnedWindow[],
+  ): Promise<void> {
+    if (!this.matchesAuthority(connection, fence)) return;
+    const heartbeat = await this.coordinator(fence.tenantId).heartbeat(
+      this.name,
+      fence.browserEpoch,
+      assignments,
+      ownedWindows,
+    );
+    if (!this.matchesAuthority(connection, fence)) return;
+    if (!heartbeat.ok) {
+      connection.close(1008, "device inventory rejected");
+      return;
+    }
+    for (const lease of heartbeat.recoveries) {
+      const session = await getAgentByName(this.env.SESSION, lease.sessionId);
+      if (!this.matchesAuthority(connection, fence)) return;
+      await session.beginRecovery(lease);
+      if (!this.matchesAuthority(connection, fence)) return;
+      await this.sendProvision(lease, fence);
+      if (!this.matchesAuthority(connection, fence)) return;
+      await emitTelemetry(this.env, {
+        event: "recovery",
+        outcome: "provision_sent",
+        tenantId: fence.tenantId,
+        deviceId: this.name,
+        sessionId: lease.sessionId,
+      });
+    }
+    for (const lease of heartbeat.assignments) {
+      const session = await getAgentByName(this.env.SESSION, lease.sessionId);
+      if (!this.matchesAuthority(connection, fence)) return;
+      if (await session.needsSessionTicket()) {
+        if (!this.matchesAuthority(connection, fence)) return;
+        await this.sendSessionTicket(lease, fence);
+      }
+      if (!this.matchesAuthority(connection, fence)) return;
+    }
+    for (const lease of heartbeat.closures) {
+      if (!this.matchesAuthority(connection, fence)) return;
+      await this.requestClose(lease);
+    }
+    for (const orphan of heartbeat.orphans) {
+      if (!this.matchesAuthority(connection, fence)) return;
+      this.send(connection, { type: "close_orphan", ...orphan });
+    }
+  }
+
   async requestProvision(lease: LeaseResource): Promise<boolean> {
     if (
       this.state.tenantId === null ||
@@ -493,6 +667,30 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
       return false;
     }
     return this.sendProvision(lease);
+  }
+
+  async pushPolicy(
+    tenantId: string,
+    policyVersion: number,
+    allowedOrigins: string[],
+  ): Promise<boolean> {
+    const connection = this.authoritativeConnection();
+    if (connection === undefined) return false;
+    const fence = this.captureAuthority(connection);
+    if (fence === null || fence.tenantId !== tenantId || policyVersion <= fence.policyVersion) {
+      return false;
+    }
+    const state = connection.state as AuthorizedConnectionState;
+    connection.setState({
+      authorized: true,
+      claims: {
+        ...state.claims,
+        policyVersion,
+        allowedOrigins: [...allowedOrigins],
+      },
+    } satisfies AuthorizedConnectionState);
+    this.send(connection, { type: "policy_update", policyVersion, allowedOrigins });
+    return true;
   }
 
   async requestClose(lease: LeaseResource): Promise<boolean> {
@@ -515,10 +713,9 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
   }
 
   /**
-   * Dashboard kill switch. The persisted marker — not the close — is what
-   * defeats the Worker's 60 s positive credential cache: authorizeCredential
-   * and onConnect refuse marked devices, so a cached-positive credential can
-   * neither re-mint a ticket nor ride a pre-minted one back in.
+   * Dashboard kill switch. The persisted marker — not the close — makes an
+   * already-minted ticket fail in authorizeCredential/onConnect while the
+   * directory revocation independently blocks fresh tickets.
    *
    * Fenced on tenant because the DEVICE namespace is global —
    * `getByName(deviceId)` reaches any tenant's agent, so a foreign deviceId
@@ -529,8 +726,8 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
    * not a route handler — is the only path here.
    *
    * The marker is irreversible: nothing clears it, and there is no un-revoke.
-   * Recovery is re-pairing, which mints a fresh deviceId and therefore a fresh
-   * agent — which is also why a marked agent can never shadow a later device.
+   * Recovery rotates the installation's directory credential. The extension
+   * must reconnect with the new credential before this agent accepts it.
    *
    * Closes every connection, authorized or not — a superseded socket can idle
    * open, and one that never finished authorizing is no safer to leave up.
@@ -601,6 +798,7 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
       leaseEpoch: lease.leaseEpoch,
       browserEpoch: lease.browserEpoch,
       allowedOrigins: lease.allowedOrigins,
+      policyVersion: lease.policyVersion,
       sessionTicket,
     });
     return true;
@@ -709,6 +907,8 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
       claims.tenantId !== authority.tenant_id ||
       claims.deviceId !== authority.device_id ||
       claims.credentialVersion !== authority.credential_version ||
+      claims.allowedOrigins === undefined ||
+      claims.policyVersion === undefined ||
       this.state.tenantId !== claims.tenantId ||
       this.state.browserEpoch !== claims.browserEpoch
     ) {
@@ -720,6 +920,8 @@ export class DeviceAgent extends Agent<Env, DeviceState> {
       browserEpoch: claims.browserEpoch,
       credentialDigest: authority.credential_digest,
       credentialVersion: authority.credential_version,
+      allowedOrigins: [...claims.allowedOrigins],
+      policyVersion: claims.policyVersion,
     };
   }
 
@@ -779,8 +981,14 @@ function sameAuthorityFence(
     left.tenantId === right.tenantId &&
     left.browserEpoch === right.browserEpoch &&
     left.credentialDigest === right.credentialDigest &&
-    left.credentialVersion === right.credentialVersion
+    left.credentialVersion === right.credentialVersion &&
+    left.policyVersion === right.policyVersion &&
+    sameOrigins(left.allowedOrigins, right.allowedOrigins)
   );
+}
+
+function sameOrigins(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((origin, index) => origin === right[index]);
 }
 
 async function sha256Hex(value: string): Promise<string> {

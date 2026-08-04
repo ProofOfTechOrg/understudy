@@ -1,26 +1,33 @@
 /**
- * MCP auth branches (PR 3): the static usk_ fast path, its positive-only
- * cache, and the discovery-grade 401 contract that keeps OAuth clients able
- * to bootstrap. Shared-storage caveat applies: every test mints fresh
- * users/tokens and clears the module-level token cache it exercises.
+ * MCP auth branches (PR 3): the static usk_ fast path, per-request credential
+ * revalidation, and the discovery-grade 401 contract that keeps OAuth clients
+ * able to bootstrap. Every test mints fresh users and tokens.
  */
 
 import { env, exports } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { sha256Hex } from "../src/auth";
-import { clearMcpTokenCache, tryStaticMcpAuth } from "../src/mcp/static-auth";
+import { tryStaticMcpAuth } from "../src/mcp/static-auth";
 import type { Env } from "../src/types";
-import { directory, mintUser } from "./helpers";
+import { directory, mintUser, pairDevice } from "./helpers";
 
 const MCP_URL = "https://understudy.proofof.tech/mcp";
 
-async function mintUserToken(): Promise<{ userId: string; tenantId: string; token: string; tokenId: string }> {
+async function mintUserToken(): Promise<{
+  userId: string;
+  tenantId: string;
+  deviceId: string;
+  token: string;
+  tokenId: string;
+}> {
   const user = await mintUser();
-  const created = await directory().createMcpToken(user.userId, "test");
+  const device = await pairDevice(user.userId);
+  const created = await directory().createMcpToken(user.userId, device.deviceId, "test");
   if (created === null) throw new Error("token mint failed");
   return {
     userId: user.userId,
     tenantId: user.tenantId,
+    deviceId: device.deviceId,
     token: created.token,
     tokenId: created.tokenId,
   };
@@ -68,10 +75,6 @@ function noDirectoryEnv(): Env {
   };
 }
 
-beforeEach(() => {
-  clearMcpTokenCache();
-});
-
 describe("static MCP auth", () => {
   it("admits a valid usk_ token to the MCP endpoint", async () => {
     const minted = await mintUserToken();
@@ -82,18 +85,21 @@ describe("static MCP auth", () => {
     expect(body).toContain("understudy");
   });
 
-  it("refuses a revoked token once the cache no longer holds it", async () => {
+  it("refuses a revoked token on the next request", async () => {
     const minted = await mintUserToken();
-    // Prime the cache with a successful call.
+    // Establish that the token was valid before revocation.
     expect((await mcpFetch({ authorization: `Bearer ${minted.token}` })).status).toBe(200);
     await directory().revokeMcpToken(minted.userId, minted.tokenId);
-    // The positive cache may still admit it inside the 60s TTL...
-    expect((await mcpFetch({ authorization: `Bearer ${minted.token}` })).status).toBe(200);
-    // ...and the directory is authoritative once the entry is gone.
-    clearMcpTokenCache();
     const res = await mcpFetch({ authorization: `Bearer ${minted.token}` });
     expect(res.status).toBe(401);
     expect(res.headers.get("www-authenticate")).toContain("resource_metadata");
+  });
+
+  it("refuses a token immediately after its bound browser is revoked", async () => {
+    const minted = await mintUserToken();
+    expect((await mcpFetch({ authorization: `Bearer ${minted.token}` })).status).toBe(200);
+    expect(await directory().revokeDevice(minted.userId, minted.deviceId)).toBe("revoked");
+    expect((await mcpFetch({ authorization: `Bearer ${minted.token}` })).status).toBe(401);
   });
 
   it("refuses a well-formed token whose secret is wrong", async () => {

@@ -15,6 +15,7 @@ export type DialogEventFields = Omit<
 // can branch on `decision.bumpGeneration` / `decision.pageEvent` / etc.
 export interface CdpDecision {
   bumpGeneration?: boolean;
+  preserveDeltaBaseline?: boolean;
   loadStarted?: boolean;
   pageEvent?: { kind: "navigated" | "load"; url: string };
   newMainFrameId?: string;
@@ -88,13 +89,15 @@ function asDialogOpening(params: unknown): Omit<DialogEventFields, "disposition"
 export function classifyCdpEvent(
   method: string,
   params: unknown,
-  ctx: { currentUrl: string; mainFrameId: string },
+  ctx: { currentUrl: string; mainFrameId: string; isRootSession?: boolean },
 ): CdpDecision {
   switch (method) {
     case "Page.frameNavigated": {
       const evt = asFrameNavigated(params);
-      // Main frame only: a subframe navigation carries a parentId and is ignored.
-      if (evt === null || evt.frame.parentId !== undefined) return {};
+      if (evt === null) return {};
+      if (evt.frame.parentId !== undefined || ctx.isRootSession === false) {
+        return { bumpGeneration: true };
+      }
       const url = `${evt.frame.url}${evt.frame.urlFragment ?? ""}`;
       return {
         newMainFrameId: evt.frame.id,
@@ -106,7 +109,10 @@ export function classifyCdpEvent(
     }
     case "Page.navigatedWithinDocument": {
       const evt = asNavigatedWithinDocument(params);
-      if (evt === null || evt.frameId !== ctx.mainFrameId) return {};
+      if (evt === null) return {};
+      if (evt.frameId !== ctx.mainFrameId || ctx.isRootSession === false) {
+        return { bumpGeneration: true };
+      }
       return {
         newUrl: evt.url,
         bumpGeneration: true,
@@ -115,10 +121,24 @@ export function classifyCdpEvent(
     }
     case "Page.loadEventFired":
       // The load event carries no URL; use the generation-tracked current URL.
-      return { pageEvent: { kind: "load", url: ctx.currentUrl } };
-    case "DOM.documentUpdated":
-      // A SPA DOM swap invalidates every outstanding ref, so bump the generation.
+      return ctx.isRootSession === false
+        ? {}
+        : { pageEvent: { kind: "load", url: ctx.currentUrl } };
+    case "Page.frameAttached":
+    case "Page.frameDetached":
       return { bumpGeneration: true };
+    case "Accessibility.loadComplete":
+    case "DOM.documentUpdated":
+    case "DOM.attributeModified":
+    case "DOM.attributeRemoved":
+    case "DOM.characterDataModified":
+    case "DOM.childNodeInserted":
+    case "DOM.childNodeRemoved":
+    case "DOM.shadowRootPushed":
+    case "DOM.shadowRootPopped":
+    case "DOM.pseudoElementAdded":
+    case "DOM.pseudoElementRemoved":
+      return { bumpGeneration: true, preserveDeltaBaseline: true };
     case "Page.javascriptDialogOpening": {
       const opening = asDialogOpening(params);
       // Unclassifiable dialog (not expected - DialogType is a closed CDP enum):

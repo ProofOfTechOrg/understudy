@@ -11,12 +11,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   actInput,
   BROWSER_ACT_CONNECTOR,
-  BROWSER_FILL_CREDENTIAL_CONNECTOR,
   BROWSER_WRITE_CONNECTOR_IDS,
   type ActInput,
   type ActOutput,
   type ConnectorStores,
-  type FillCredentialOutput,
   type ObserveInput,
   type ObserveOutput,
   callBrowserDryRun,
@@ -103,9 +101,7 @@ describe("grant gate (fail closed)", () => {
   });
 
   it("lists exactly the write connectors for grant minting", () => {
-    expect(BROWSER_WRITE_CONNECTOR_IDS).toContain(BROWSER_ACT_CONNECTOR);
-    expect(BROWSER_WRITE_CONNECTOR_IDS).toContain(BROWSER_FILL_CREDENTIAL_CONNECTOR);
-    expect(BROWSER_WRITE_CONNECTOR_IDS).toHaveLength(2);
+    expect(BROWSER_WRITE_CONNECTOR_IDS).toEqual([BROWSER_ACT_CONNECTOR]);
   });
 });
 
@@ -278,59 +274,6 @@ describe("observe (read - no grant, no idempotency)", () => {
     expect(init.method).toBe("GET");
     expect(init.headers.authorization).toBe("Bearer caller-token-1");
     expect(init.body).toBeUndefined();
-  });
-});
-
-describe("fill_credential (vaulted write)", () => {
-  const INPUT = {
-    sessionId: "s-1",
-    ref: "opaque-ref",
-    secretRef: "vault://acme/portal/password",
-  };
-
-  it("passes the opaque secretRef through - the wire carries no plaintext field", async () => {
-    const fetchSpy = vi.fn().mockResolvedValue(
-      eventResponse({ type: "action_result", commandId: "c1", ok: true }),
-    );
-    vi.stubGlobal("fetch", fetchSpy);
-    const { fillCredential } = createBrowserConnectors(ENV, stores());
-
-    const out = await callBrowserWrite<typeof INPUT, FillCredentialOutput>(
-      fillCredential,
-      INPUT,
-      grantFor(BROWSER_FILL_CREDENTIAL_CONNECTOR),
-      "case1:login:fill",
-    );
-
-    expect(out).toEqual({ ok: true, filled: true, error: undefined });
-    const { body } = sentRequest(fetchSpy);
-    expect(body).toMatchObject({
-      command: {
-        type: "fill_secret",
-        ref: "opaque-ref",
-        secretRef: "vault://acme/portal/password",
-      },
-    });
-    expect(Object.keys((body as { command: Record<string, unknown> }).command).sort()).toEqual([
-      "commandId",
-      "ref",
-      "secretRef",
-      "type",
-    ]);
-  });
-
-  it("dry-run confirms the ref without filling: filled stays false, simulated true", async () => {
-    const fetchSpy = vi.fn().mockResolvedValue(
-      eventResponse({ type: "action_result", commandId: "c1", ok: true, simulated: true }),
-    );
-    vi.stubGlobal("fetch", fetchSpy);
-    const { fillCredential } = createBrowserConnectors(ENV, stores());
-
-    const preview = await callBrowserDryRun<typeof INPUT, FillCredentialOutput>(fillCredential, INPUT);
-
-    expect(preview).toEqual({ ok: true, filled: false, error: undefined, simulated: true });
-    const { body } = sentRequest(fetchSpy);
-    expect(body).toMatchObject({ dryRun: true });
   });
 });
 
@@ -570,13 +513,10 @@ describe("service bridge hardening", () => {
 });
 
 describe("write-classification sync with @understudy/protocol", () => {
-  // Compile-time pin: act gates exactly the protocol write class minus
-  // fill_secret (which fill_credential carries). Since the protocol
-  // reclassified scroll/switch_tab as writes, that is the whole relationship -
-  // no extras. If WRITE_COMMAND_TYPES changes upstream, this assignment stops
-  // compiling until actInput is deliberately revisited.
+  // Payment submission is intentionally MCP-only. The public connector gates
+  // every other protocol write.
   type GatedActionType = ActInput["action"]["type"];
-  type ExpectedGatedActionType = Exclude<WriteCommandType, "fill_secret">;
+  type ExpectedGatedActionType = Exclude<WriteCommandType, "submit_card">;
   type MutuallyAssignable<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
   const actGateMatchesProtocol: MutuallyAssignable<GatedActionType, ExpectedGatedActionType> = true;
 
@@ -584,35 +524,12 @@ describe("write-classification sync with @understudy/protocol", () => {
     // #given the literal action types the act schema actually accepts
     const gated = new Set(actInput.shape.action.options.map((option) => option.shape.type.value));
 
-    // #then they are exactly protocol WRITE_COMMAND_TYPES minus fill_secret
+    // #then they are exactly protocol WRITE_COMMAND_TYPES minus submit_card
     const expected = new Set<string>(
-      WRITE_COMMAND_TYPES.filter((type) => type !== "fill_secret"),
+      WRITE_COMMAND_TYPES.filter((type) => type !== "submit_card"),
     );
     expect(gated).toEqual(expected);
     expect(actGateMatchesProtocol).toBe(true);
   });
 
-  it("fill_credential carries the remaining protocol write with a key-derived commandId", async () => {
-    // #given a granted fill_credential call under an idempotency key
-    const fetchSpy = vi.fn().mockResolvedValue(
-      eventResponse({ type: "action_result", commandId: "c1", ok: true }),
-    );
-    vi.stubGlobal("fetch", fetchSpy);
-    const { fillCredential } = createBrowserConnectors(ENV, stores());
-
-    // #when it executes
-    await callBrowserWrite(
-      fillCredential,
-      { sessionId: "s-1", ref: "opaque-ref", secretRef: "vault://x" },
-      grantFor(BROWSER_FILL_CREDENTIAL_CONNECTOR),
-      "case1:login:fill",
-    );
-
-    // #then the wire carries fill_secret under the derived stable id
-    const body = sentRequest(fetchSpy).body as {
-      command: { type: string; commandId: string };
-    };
-    expect(body.command.type).toBe("fill_secret");
-    expect(body.command.commandId).toMatch(/^ik_[0-9a-f]{64}$/);
-  });
 });

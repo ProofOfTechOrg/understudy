@@ -2,7 +2,7 @@
  * Shared cross-module contract for @understudy/backend.
  *
  * The SessionCoordinator (M-003), the SessionAgent Durable Object (M-004),
- * caller/tenant auth (M-006), and vault secret resolution (M-007) all import
+ * caller/tenant auth (M-006) all import
  * Env, SessionState, and SessionStatus from this module rather than
  * declaring their own copies, so the Worker bindings and the per-session DO
  * state have exactly one definition each.
@@ -20,12 +20,6 @@ import type {
   UnattendedSessionLifecycle,
 } from "@understudy/protocol";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
-import type { SessionAgent } from "./session";
-import type { DeviceAgent } from "./device";
-import type { TenantDeviceCoordinator } from "./tenant-coordinator";
-import type { AccountDirectory } from "./account-directory";
-import type { AccountAgent } from "./account-agent";
-import type { UnderstudyMcp } from "./mcp/mcp-agent";
 
 /**
  * The non-tabs fields of the extension's hello event: what it reports about
@@ -42,113 +36,17 @@ type HelloBrowserInfo = Pick<Extract<Event, { type: "hello" }>, "browser" | "ext
 export type { DialogRecord };
 
 /**
- * The credential-vault seam that secrets.ts (M-007) resolves fill_secret's
- * secretRef through. Deliberately narrow (read-by-key only) and backend-
- * agnostic: the concrete Cloudflare binding is a KV namespace (see
- * wrangler.jsonc's VAULT binding), because an arbitrary per-fill secretRef
- * needs a dynamic keyed lookup that CF's Secrets / Secrets Store bindings -
- * one static binding per fixed secret name - cannot address.
- *
- * Two layers implement this same interface: Env.VAULT (the raw KV namespace,
- * which stores only AES-256-GCM envelopes - never plaintext at rest) and
- * vault.ts's EncryptedKvVault (which wraps it and decrypts with
- * VAULT_MASTER_KEY). resolveSecret always goes through the decrypting layer
- * via vault.ts's createVault(env). A per-tenant external KMS remains a
- * possible future swap behind this seam.
+ * Runtime bindings come from `wrangler types`. The additions below exist only
+ * for request-scoped OAuth injection and the optional maintenance latch.
  */
-export interface VaultBinding {
-  get(secretRef: string): Promise<string | null>;
-  /**
-   * KV-namespace-shaped key listing (names only, never values, never
-   * decrypted) for the MCP `browser_list_secrets` tool. Optional because
-   * narrow test fakes implement only `get`; the production binding is a real
-   * KV namespace, which always has it. vault.ts's listVaultSecretNames is
-   * the one consumer and treats absence as an empty vault.
-   */
-  list?(options: { prefix: string; cursor?: string }): Promise<{
-    keys: { name: string }[];
-    list_complete: boolean;
-    cursor?: string;
-  }>;
-  /**
-   * Envelope write for the dashboard vault upload (vault.ts's
-   * writeVaultSecret). Optional for the same test-fake reason as list;
-   * writes through this seam are ALWAYS pre-sealed v1 envelopes, never
-   * plaintext.
-   */
-  put?(secretRef: string, envelope: string): Promise<void>;
-}
-
-/** Worker bindings and environment configuration, wired in wrangler.jsonc. */
-export interface Env {
-  /** One Durable Object per sessionId (per tenant/case) - DL-006. */
-  SESSION: DurableObjectNamespace<SessionAgent>;
-  DEVICE: DurableObjectNamespace<DeviceAgent>;
-  TENANT_CONTROL: DurableObjectNamespace<TenantDeviceCoordinator>;
-  /**
-   * Singleton account store (instance "directory") for self-serve users,
-   * devices, tokens, OTP challenges, and pairing codes. Never on the
-   * per-command hot path — see account-directory.ts.
-   */
-  ACCOUNT_DIRECTORY: DurableObjectNamespace<AccountDirectory>;
-  /** One UnderstudyMcp DO per MCP connection (named by the transport). */
-  MCP_AGENT: DurableObjectNamespace<UnderstudyMcp>;
-  /**
-   * One AccountAgent DO per tenant (idFromName(tenantId)): holds the
-   * current session binding, the ref-staleness guard, and the one-command-
-   * at-a-time mutex for MCP callers. Deliberately not per-MCP-connection —
-   * the binding must survive client reconnects.
-   */
-  ACCOUNT: DurableObjectNamespace<AccountAgent>;
-  /** Grant/token store for @cloudflare/workers-oauth-provider (name fixed by the library). */
-  OAUTH_KV: KVNamespace;
+export interface Env extends Cloudflare.Env {
   /**
    * OAuth helper methods the provider injects into env for requests that
    * flow through it (the dashboard defaultHandler uses them for consent).
    * Absent on requests that bypass the provider.
    */
   OAUTH_PROVIDER?: OAuthHelpers;
-  VAULT: VaultBinding;
-  /** Signs/verifies server-minted sessionIds so scopeSession can verify tenant ownership statelessly (M-006, DL-008). */
-  AUTH_HMAC_SECRET: string;
-  /**
-   * Static caller-token -> tenantId map (JSON) for the dev auth verifier
-   * (M-006). Required, not optional: wrangler.jsonc lists it in
-   * `secrets.required`, which is also the .dev.vars allowlist, so a
-   * deployment without it cannot start. auth.ts still guards the empty
-   * string at runtime.
-   */
-  CALLER_TOKENS: string;
-  /** Extension per-user token(s) (JSON), verified independently of caller auth. Required via `secrets.required`, like CALLER_TOKENS. */
-  EXTENSION_TOKENS: string;
-  DEVICE_TOKENS: string;
-  WS_TICKET_SECRET: string;
-  QUOTA_POLICY: string;
-  UNATTENDED_ENABLED_TENANTS: string;
-  SAFE_WRITE_REQUIRED_TENANTS: string;
-  RATE_LIMITER?: RateLimit;
-  ANALYTICS?: AnalyticsEngineDataset;
-  /**
-   * base64url-encoded 32-byte AES-256-GCM key that envelope-encrypts every
-   * vault value (vault.ts). KV holds only ciphertext; without this secret a
-   * KV read-back at rest yields nothing usable. Required via
-   * `secrets.required`, like the token maps.
-   */
-  VAULT_MASTER_KEY: string;
-  /**
-   * base64url PKCS#8 of the P-256 private key the dashboard's client-side
-   * vault upload encrypts to (dashboard/vault-upload.ts). Defense against
-   * accidental plaintext exposure in transit/logs — not against a malicious
-   * server, which serves the encrypting JavaScript. Required via
-   * `secrets.required`.
-   */
-  VAULT_UPLOAD_PRIVATE_KEY: string;
-  /**
-   * Email Sending binding for sign-in OTPs. Optional so the send seam can
-   * signal (not throw) when it is unbound; the vitest pool DOES emulate it,
-   * so the happy path runs in tests. See dashboard/email.ts.
-   */
-  EMAIL?: SendEmail;
+  AUTH_EPOCH_CUTOVER?: string;
 }
 
 /**
@@ -156,7 +54,7 @@ export interface Env {
  * (M-004), SessionCoordinator.setStatus (M-003), and the GET
  * /v1/sessions/:id status route (M-005).
  */
-export type SessionStatus = "pending" | "connected" | "detached";
+export type SessionStatus = "pending" | "idle" | "connected" | "detached";
 
 export interface LegacyCommandTombstone {
   commandId: string;
@@ -193,6 +91,8 @@ export interface SessionState {
   awaitingCommandIds: string[];
   awaitingCommands?: PersistedLegacyAwaiting[];
   status: SessionStatus;
+  /** Current attended attachment incarnation. Unattended sessions keep null. */
+  attachmentId: string | null;
   /**
    * The one authenticated extension connection allowed to receive Commands
    * and submit Events. `null` means no authoritative connection. Sessions
@@ -210,7 +110,6 @@ export interface SessionState {
    * second execution, closing the write-performed-but-response-lost gap.
    * New entries hold bounded action_results plus the exact command type and
    * request fingerprint. Legacy ID-only entries remain conflict tombstones.
-   * Fill-secret results carry only ok/error and never plaintext.
    */
   completedWrites: PersistedCompletedLegacyWrite[];
   legacyCommandTombstones?: PersistedLegacyCommandTombstone[];
@@ -220,13 +119,13 @@ export interface SessionState {
    * via GET /v1/sessions/:id so an agent/governance layer sees what a page said
    * and how it was auto-answered. An after-the-fact record, not a response
    * channel: dialogs are answered synchronously extension-side (an open dialog
-   * blocks the CDP channel), never by a consumer round-trip. Protocol 2
+   * blocks the CDP channel), never by a consumer round-trip. Protocol 3
    * acknowledges and replays records within one browser epoch. The public
    * payload list remains capped, so this is an operational surface rather than
    * a durable audit log.
    */
   dialogs: DialogRecord[];
-  protocolVersion?: 1 | 2;
+  protocolVersion?: 1 | 2 | 3;
   capabilities?: ProtocolCapability[];
   mode?: "attended" | "unattended";
   unattended?: {
@@ -247,7 +146,7 @@ export interface SessionState {
 }
 
 /**
- * What dispatch/fillSecret return across the DO RPC boundary. Expected
+ * What dispatch returns across the DO RPC boundary. Expected
  * delivery failures travel as data, not exceptions: a rejected RPC promise
  * is logged by workerd as an uncaught exception even when the Worker-side
  * caller handles it, and a typed reason beats message-prefix parsing at the
@@ -277,6 +176,7 @@ export type V2DispatchOutcome =
   | { kind: "id_conflict"; commandId: string }
   | { kind: "busy"; commandId: string }
   | { kind: "not_connected"; commandId: string }
+  | { kind: "legacy_snapshot_required"; commandId: string }
   | { kind: "unsupported"; commandId: string }
   | { kind: "terminal_session"; commandId: string };
 

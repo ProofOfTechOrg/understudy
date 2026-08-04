@@ -25,13 +25,13 @@ describe("classifyCdpEvent", () => {
     });
   });
 
-  it("ignores a subframe navigation (parentId present)", () => {
+  it("invalidates refs for a subframe navigation without emitting a top-level event", () => {
     const decision = classifyCdpEvent(
       "Page.frameNavigated",
       { frame: { id: "F2", parentId: "F1", url: "https://ads.example/iframe" } },
       ctx,
     );
-    expect(decision).toEqual({});
+    expect(decision).toEqual({ bumpGeneration: true });
   });
 
   it("tracks a same-document navigation for the main frame without starting a load", () => {
@@ -54,7 +54,7 @@ describe("classifyCdpEvent", () => {
     });
   });
 
-  it("ignores a same-document navigation from a subframe", () => {
+  it("invalidates refs for a same-document subframe navigation", () => {
     const decision = classifyCdpEvent(
       "Page.navigatedWithinDocument",
       {
@@ -64,7 +64,7 @@ describe("classifyCdpEvent", () => {
       },
       ctx,
     );
-    expect(decision).toEqual({});
+    expect(decision).toEqual({ bumpGeneration: true });
   });
 
   it("emits a load pageEvent carrying ctx.currentUrl, not a url from the event", () => {
@@ -72,8 +72,38 @@ describe("classifyCdpEvent", () => {
     expect(decision).toEqual({ pageEvent: { kind: "load", url: "https://example.com/current" } });
   });
 
-  it("bumps generation only for DOM.documentUpdated", () => {
-    expect(classifyCdpEvent("DOM.documentUpdated", {}, ctx)).toEqual({ bumpGeneration: true });
+  it("preserves the prior semantic baseline for DOM.documentUpdated", () => {
+    expect(classifyCdpEvent("DOM.documentUpdated", {}, ctx)).toEqual({
+      bumpGeneration: true,
+      preserveDeltaBaseline: true,
+    });
+  });
+
+  it("invalidates semantic state for frame, AX, and meaningful cached-node changes", () => {
+    for (const method of [
+      "Page.frameAttached",
+      "Page.frameDetached",
+    ]) {
+      expect(classifyCdpEvent(method, {}, ctx), method).toEqual({ bumpGeneration: true });
+    }
+    for (const method of [
+      "Accessibility.loadComplete",
+      "DOM.attributeModified",
+      "DOM.characterDataModified",
+      "DOM.childNodeInserted",
+      "DOM.childNodeRemoved",
+      "DOM.shadowRootPushed",
+      "DOM.shadowRootPopped",
+    ]) {
+      expect(classifyCdpEvent(method, {}, ctx), method).toEqual({
+        bumpGeneration: true,
+        preserveDeltaBaseline: true,
+      });
+    }
+  });
+
+  it("does not treat DOM.setChildNodes cache hydration as a page mutation", () => {
+    expect(classifyCdpEvent("DOM.setChildNodes", {}, ctx)).toEqual({});
   });
 
   it("accepts an alert dialog and reports it (single OK button - just close the info box)", () => {

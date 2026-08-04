@@ -1,5 +1,5 @@
 import {
-  PROTOCOL_CAPABILITIES,
+  ATTENDED_PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
   WS_CLOSE_SESSION_TERMINAL,
   isWriteCommand,
@@ -8,6 +8,7 @@ import {
 } from "@understudy/protocol";
 import type { Command, Event, SessionServerFrame } from "@understudy/protocol";
 import type { Browser } from "wxt/browser";
+import { settleBeforeDeadline } from "../core/attended-deadline";
 import { CommandIngress, type StartedCommand } from "../core/command-ingress";
 import { WriteDedupe } from "../core/dedupe";
 import {
@@ -18,24 +19,29 @@ import { resolveAttendedTransition } from "../core/attended-switch";
 import { sendIfPeerCurrent } from "../core/peer-binding";
 import { routeCommand } from "../core/router";
 import { RetryableStartupGate } from "../core/startup-gate";
+import { externalPairingOffer } from "../core/external-pairing";
 import {
   DEFAULT_SERVICE_ORIGIN,
   PairingError,
-  redeemPairingCode,
+  PairingClaimCoordinator,
+  type PairingClaim,
+  redeemPairingOffer,
 } from "../core/pairing-client";
 import { ReconnectingWs } from "../core/ws-client";
 import { ProfileClient } from "../core/profile-client";
-import { WriteJournal } from "../core/write-journal";
+import { WriteJournal, type WriteJournalRecord } from "../core/write-journal";
 import { CdpSession } from "../driver/cdp";
 import { classifyCdpEvent } from "../driver/cdp-events";
 import { errorMessage } from "../events";
 import type {
   AttachedTab,
+  CardVaultSaveResultMsg,
   LogEntry,
   LogLevel,
   LogMsg,
   PanelMsg,
   StateMsg,
+  SwMsg,
   WsStatus,
 } from "../messaging";
 import { controlledTabInfo } from "../tabs";
@@ -46,6 +52,7 @@ const WS_URL_KEY = "wsUrl";
 const WS_ISOLATION_BLOCK_KEY = "understudy:wsIsolationBlocked";
 // Persisted across SW eviction so a wake can re-discover the driven tab.
 const ATTACHED_TAB_KEY = "understudy:attachedTabId";
+const ATTACHMENT_ID_KEY = "understudy:attachmentId";
 const BACKSTOP_ALARM = "ws-backstop";
 const LOG_CAP = 50;
 
@@ -71,13 +78,20 @@ let wsSwitching = false;
 let wsIsolationFailed = false;
 let wsSwitchRequest = 0;
 let wsSwitchTail: Promise<unknown> = Promise.resolve();
+let pairingTail: Promise<void> = Promise.resolve();
 
 let session: CdpSession | null = null;
 let attachedTitle: string | undefined;
+let attachmentId: string | null = null;
 // Progress of the most recent pairing attempt, surfaced in StateMsg.pairing.
 let pairingState: StateMsg["pairing"];
 let hostingStopRequested = false;
 let hostingStopRequest = 0;
+let cardVaultState: StateMsg["cardVault"] = {
+  aliases: [],
+  approvedOrigins: [],
+  revision: 0,
+};
 
 interface AttendedRuntime {
   dedupe: WriteDedupe;
@@ -106,8 +120,9 @@ let attendedWritesBlocked = false;
 let attendedTerminal = false;
 const profileClient = new ProfileClient(
   () => broadcastState(),
-  __UNDERSTUDY_STORE__ ? DEFAULT_SERVICE_ORIGIN : undefined,
+  __UNDERSTUDY_ORIGIN_PINNED__ ? DEFAULT_SERVICE_ORIGIN : undefined,
 );
+const pairingClaims = new PairingClaimCoordinator(browser.storage.local);
 
 const logBuffer: LogEntry[] = [];
 const ports = new Set<Browser.runtime.Port>();
@@ -130,6 +145,7 @@ export default defineBackground({
     browser.debugger.onDetach.addListener(onDetach);
     browser.tabs.onCreated.addListener(onTabCreated);
     browser.runtime.onConnect.addListener(onConnect);
+    browser.runtime.onMessageExternal.addListener(onExternalMessage);
     browser.sidePanel
       .setPanelBehavior({ openPanelOnActionClick: true })
       .catch((cause: unknown) => {
@@ -140,12 +156,21 @@ export default defineBackground({
     });
 
     // Kick off the async wake tasks without awaiting (main() must stay non-async).
+    const pairingRecoveryRequest = ++hostingStopRequest;
     if (__UNDERSTUDY_STORE__) {
       fireAndForget("store startup", () => storeRuntimeGate.wait());
+      fireAndForget("pairing recovery", async () => {
+        await storeRuntimeGate.wait();
+        await recoverPendingPairing(pairingRecoveryRequest);
+      });
     } else {
       fireAndForget("ensureConnection", ensureConnection);
       fireAndForget("reconcileAttachment", reconcileAttachment);
       fireAndForget("profileClient", () => profileClient.start());
+      fireAndForget("card vault", refreshCardVaultState);
+      fireAndForget("pairing recovery", () =>
+        recoverPendingPairing(pairingRecoveryRequest),
+      );
     }
   },
 });
@@ -164,6 +189,7 @@ async function startStoreRuntime(): Promise<void> {
       "understudy:completedWrites",
       "understudy:attendedJournal",
       "understudy:attendedDialogs",
+      ATTACHMENT_ID_KEY,
       ...(typeof tabId === "number"
         ? [`understudy:cdp:gen:${tabId}`]
         : []),
@@ -171,6 +197,7 @@ async function startStoreRuntime(): Promise<void> {
     browser.storage.local.remove(WS_URL_KEY),
   ]);
   await profileClient.start();
+  await refreshCardVaultState();
 }
 
 // ── WebSocket lifecycle ──────────────────────────────────────────────────────
@@ -272,8 +299,11 @@ async function sendHello(peer: ReconnectingWs): Promise<void> {
     sendIfPeerCurrent(peer, acceptingPeer, (current) => {
       current.send({
         type: "hello",
+        protocolVersion: PROTOCOL_VERSION,
+        capabilities: [...ATTENDED_PROTOCOL_CAPABILITIES],
         browser: navigator.userAgent,
         extVersion: browser.runtime.getManifest().version,
+        attachmentId: null,
         tabs: [],
       });
     });
@@ -284,9 +314,10 @@ async function sendHello(peer: ReconnectingWs): Promise<void> {
     current.send({
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
-      capabilities: [...PROTOCOL_CAPABILITIES],
+      capabilities: [...ATTENDED_PROTOCOL_CAPABILITIES],
       browser: navigator.userAgent,
       extVersion: browser.runtime.getManifest().version,
+      attachmentId,
       tabs: [
         {
           tabId: active.tabId,
@@ -302,11 +333,11 @@ async function sendHello(peer: ReconnectingWs): Promise<void> {
 
 function onCommand(raw: unknown, peer: ReconnectingWs): void {
   if (attendedTerminal || peer !== acceptingPeer) return;
-  const v2 = safeParseSessionServerFrame(raw);
-  if (v2.success) {
-    fireAndForget("v2 command ingress", () =>
+  const frame = safeParseSessionServerFrame(raw);
+  if (frame.success) {
+    fireAndForget("session command ingress", () =>
       internalRuntime().commandIngress.enqueue(() =>
-        startV2Frame(v2.data, peer),
+        startSessionFrame(frame.data, peer),
       ),
     );
     return;
@@ -316,14 +347,16 @@ function onCommand(raw: unknown, peer: ReconnectingWs): void {
   );
 }
 
-async function startV2Frame(
+async function startSessionFrame(
   frame: SessionServerFrame,
   peer: ReconnectingWs,
 ): Promise<StartedCommand | undefined> {
   if (attendedTerminal || peer !== acceptingPeer) return undefined;
   switch (frame.type) {
     case "command": {
-      if (deadline(frame.deadlineAt) <= Date.now()) return undefined;
+      if (!matchesAttendedFence(frame) || deadline(frame.deadlineAt) <= Date.now()) {
+        return undefined;
+      }
       const active = session;
       const completion = executeAttendedCommand(
         frame.command,
@@ -332,16 +365,14 @@ async function startV2Frame(
         active,
         peer,
       );
-      fireAndForget("v2 read execution", async () => completion);
+      fireAndForget("session read execution", async () => completion);
       return { completion };
     }
     case "write_prepare":
       if (
         attendedWritesBlocked ||
         deadline(frame.deadlineAt) <= Date.now() ||
-        frame.leaseId !== undefined ||
-        frame.leaseEpoch !== undefined ||
-        frame.browserEpoch !== undefined
+        !matchesAttendedFence(frame)
       ) {
         return undefined;
       }
@@ -349,6 +380,7 @@ async function startV2Frame(
         attemptId: frame.attemptId,
         commandId: frame.commandId,
         requestFingerprint: frame.requestFingerprint,
+        attachmentId: frame.attachmentId,
       });
       sendIfPeerCurrent(peer, acceptingPeer, (current) => {
         current.send({
@@ -356,6 +388,7 @@ async function startV2Frame(
           attemptId: frame.attemptId,
           commandId: frame.commandId,
           deadlineAt: frame.deadlineAt,
+          attachmentId: frame.attachmentId,
           requestFingerprint: frame.requestFingerprint,
         });
       });
@@ -365,16 +398,15 @@ async function startV2Frame(
         attendedWritesBlocked ||
         !isWriteCommand(frame.command) ||
         deadline(frame.deadlineAt) <= Date.now() ||
-        frame.leaseId !== undefined ||
-        frame.leaseEpoch !== undefined ||
-        frame.browserEpoch !== undefined
+        !matchesAttendedFence(frame)
       ) {
         return undefined;
       }
       const record = await internalRuntime().journal.get(frame.attemptId);
       if (
         record?.state !== "prepared" ||
-        record.commandId !== frame.command.commandId
+        record.commandId !== frame.command.commandId ||
+        record.attachmentId !== frame.attachmentId
       ) {
         return undefined;
       }
@@ -387,7 +419,7 @@ async function startV2Frame(
         active,
         peer,
       );
-      fireAndForget("v2 write execution", async () => completion);
+      fireAndForget("session write execution", async () => completion);
       return { completion };
     }
     case "attempt_cancel":
@@ -446,19 +478,12 @@ async function executeAttendedWithDeadline(
   active: CdpSession | null,
 ): Promise<Event | null> {
   const remaining = deadline(deadlineAt) - Date.now();
-  if (remaining <= 0) return null;
-  let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), remaining);
-  });
-  const event = await Promise.race([routeCommand(command, active), timeout]);
-  clearTimeout(timer!);
-  if (event !== null) return event;
-  if (session === active && active !== null) {
+  return settleBeforeDeadline(() => routeCommand(command, active), remaining, async () => {
+    if (session !== active || active === null) return;
+    sendAttendedDetached(active.tabId);
     await active.detach().catch(() => {});
     await clearAttachment();
-  }
-  return null;
+  });
 }
 
 function sendAttendedResult(
@@ -472,6 +497,7 @@ function sendAttendedResult(
       type: "command_result",
       attemptId,
       commandId,
+      ...(attachmentId === null ? {} : { attachmentId }),
       event,
     });
   });
@@ -479,6 +505,10 @@ function sendAttendedResult(
 
 async function replayAttendedState(peer: ReconnectingWs): Promise<void> {
   for (const record of await internalRuntime().journal.recover()) {
+    if (record.attachmentId !== attachmentId) {
+      await retireAttendedWrite(record);
+      continue;
+    }
     if (record.state === "prepared") {
       sendIfPeerCurrent(peer, acceptingPeer, (current) => {
         current.send({
@@ -486,6 +516,7 @@ async function replayAttendedState(peer: ReconnectingWs): Promise<void> {
           attemptId: record.attemptId,
           commandId: record.commandId,
           deadlineAt: new Date(Date.now() + 1_000).toISOString(),
+          attachmentId: record.attachmentId,
           requestFingerprint: record.requestFingerprint,
         });
       });
@@ -578,7 +609,7 @@ function extractCommandId(raw: unknown): string | null {
 // Generation is bumped exclusively via session.bumpGeneration() (the persisting,
 // monotonic path) — never by mutating session.generation directly.
 async function onCdpEvent(
-  source: { tabId?: number },
+  source: Browser.debugger.DebuggerSession,
   method: string,
   params: unknown,
 ): Promise<void> {
@@ -588,9 +619,25 @@ async function onCdpEvent(
   if (active === null || source.tabId !== active.tabId) return;
   const eventPeer = acceptingPeer;
   try {
+    if (method === "Target.attachedToTarget") {
+      await active.handleAttachedTarget(source.sessionId, params, false);
+      await active.bumpGeneration();
+      return;
+    }
+    if (method === "Target.detachedFromTarget") {
+      if (active.handleDetachedTarget(params)) await active.bumpGeneration();
+      return;
+    }
+    if (method === "Accessibility.nodesUpdated") {
+      if (active.hasMeaningfulAccessibilityUpdate(params, source.sessionId)) {
+        await active.bumpGeneration(true);
+      }
+      return;
+    }
     const decision = classifyCdpEvent(method, params, {
       currentUrl: active.currentUrl,
       mainFrameId: active.mainFrameId,
+      isRootSession: source.sessionId === undefined,
     });
     if (decision.newMainFrameId !== undefined) {
       active.mainFrameId = decision.newMainFrameId;
@@ -602,7 +649,7 @@ async function onCdpEvent(
       active.markLoadStarted();
     }
     if (decision.bumpGeneration === true) {
-      await active.bumpGeneration();
+      await active.bumpGeneration(decision.preserveDeltaBaseline === true);
     }
     if (session !== active) return;
     if (decision.pageEvent?.kind === "load") {
@@ -658,8 +705,8 @@ async function onCdpEvent(
         }`,
       );
     }
-  } catch (cause) {
-    log(`cdp event (${method}) failed: ${errorMessage(cause)}`, "error");
+  } catch {
+    log(`cdp event (${method}) failed`, "error");
   }
 }
 
@@ -668,7 +715,8 @@ async function onDetach(source: { tabId?: number }, reason: string): Promise<voi
   if (__UNDERSTUDY_STORE__) return;
   const active = session;
   if (active === null || source.tabId !== active.tabId) return;
-  await fenceStartedAttendedWrites();
+  sendAttendedDetached(active.tabId);
+  await fenceAttendedWrites();
   await clearAttachment();
   log(`debugger detached from tab ${active.tabId} (${reason})`);
   broadcastState();
@@ -705,9 +753,16 @@ async function attach(): Promise<void> {
         throw cause;
       }
     }
+    const nextAttachmentId = crypto.randomUUID();
+    try {
+      await persistAttachment(tabId, nextAttachmentId);
+    } catch (cause) {
+      await next.detach().catch(() => {});
+      throw cause;
+    }
     session = next;
+    attachmentId = nextAttachmentId;
     attachedTitle = tab.title;
-    await persistAttachedTabId(tabId);
     log(`attached to tab ${tabId}`);
     if (acceptingPeer !== null) await sendHello(acceptingPeer);
     broadcastState();
@@ -719,6 +774,8 @@ async function attach(): Promise<void> {
 
 async function detach(): Promise<void> {
   const active = session;
+  if (active !== null) sendAttendedDetached(active.tabId);
+  await fenceAttendedWrites();
   try {
     if (active !== null) await active.detach();
   } catch (cause) {
@@ -735,18 +792,30 @@ async function detach(): Promise<void> {
 // this so the three stay consistent.
 async function clearAttachment(): Promise<void> {
   session = null;
+  attachmentId = null;
   attachedTitle = undefined;
   try {
-    await browser.storage.session.remove(ATTACHED_TAB_KEY);
+    await browser.storage.session.remove([ATTACHED_TAB_KEY, ATTACHMENT_ID_KEY]);
   } catch (cause) {
     log(`clear attached tabId failed: ${errorMessage(cause)}`, "warn");
   }
 }
 
-async function fenceStartedAttendedWrites(): Promise<void> {
+async function fenceAttendedWrites(): Promise<void> {
   for (const record of await internalRuntime().journal.recover()) {
-    if (record.state !== "started") continue;
+    await retireAttendedWrite(record);
+  }
+}
+
+async function retireAttendedWrite(record: WriteJournalRecord): Promise<void> {
+  if (record.state === "prepared") {
+    await internalRuntime().journal.cancelPrepared(record.attemptId);
+  } else if (record.state === "started") {
     await internalRuntime().journal.markUnknown(record.attemptId);
+    attendedWritesBlocked = true;
+  } else if (record.state === "completed_unacked") {
+    await internalRuntime().journal.acknowledge(record.attemptId);
+  } else {
     attendedWritesBlocked = true;
   }
 }
@@ -757,10 +826,18 @@ async function fenceStartedAttendedWrites(): Promise<void> {
 async function reconcileAttachment(): Promise<void> {
   let tabId: number;
   try {
-    const stored = await browser.storage.session.get(ATTACHED_TAB_KEY);
+    const stored = await browser.storage.session.get([ATTACHED_TAB_KEY, ATTACHMENT_ID_KEY]);
     const value = stored[ATTACHED_TAB_KEY];
     if (typeof value !== "number") return;
     tabId = value;
+    const storedAttachmentId = stored[ATTACHMENT_ID_KEY];
+    attachmentId =
+      typeof storedAttachmentId === "string" && storedAttachmentId.length > 0
+        ? storedAttachmentId
+        : crypto.randomUUID();
+    if (storedAttachmentId !== attachmentId) {
+      await persistAttachment(tabId, attachmentId);
+    }
   } catch (cause) {
     log(`reconcile: read attached tabId failed: ${errorMessage(cause)}`, "warn");
     return;
@@ -783,12 +860,34 @@ async function reconcileAttachment(): Promise<void> {
   broadcastState();
 }
 
-async function persistAttachedTabId(tabId: number): Promise<void> {
-  try {
-    await browser.storage.session.set({ [ATTACHED_TAB_KEY]: tabId });
-  } catch (cause) {
-    log(`persist attached tabId failed: ${errorMessage(cause)}`, "warn");
-  }
+async function persistAttachment(tabId: number, id: string): Promise<void> {
+  await browser.storage.session.set({
+    [ATTACHED_TAB_KEY]: tabId,
+    [ATTACHMENT_ID_KEY]: id,
+  });
+}
+
+function sendAttendedDetached(tabId: number): void {
+  const id = attachmentId;
+  const peer = acceptingPeer;
+  if (id === null || peer === null) return;
+  peer.send({ type: "attended_detached", attachmentId: id, tabId });
+}
+
+function matchesAttendedFence(frame: {
+  attachmentId?: string;
+  leaseId?: string;
+  leaseEpoch?: number;
+  browserEpoch?: string;
+}): boolean {
+  return (
+    session !== null &&
+    attachmentId !== null &&
+    frame.attachmentId === attachmentId &&
+    frame.leaseId === undefined &&
+    frame.leaseEpoch === undefined &&
+    frame.browserEpoch === undefined
+  );
 }
 
 async function setWsUrl(url: string): Promise<void> {
@@ -886,6 +985,26 @@ async function setWsUrl(url: string): Promise<void> {
 
 // ── Panel Port host ──────────────────────────────────────────────────────────
 
+function onExternalMessage(
+  message: unknown,
+  sender: Browser.runtime.MessageSender,
+  sendResponse: (response: { ok: boolean }) => void,
+): true {
+  const offer = externalPairingOffer(message, sender);
+  if (offer === null) {
+    sendResponse({ ok: false });
+    return true;
+  }
+  const request = ++hostingStopRequest;
+  hostingStopRequested = false;
+  const redemption = schedulePairing(offer, request);
+  void redemption.then(
+    (paired) => sendResponse({ ok: paired }),
+    () => sendResponse({ ok: false }),
+  );
+  return true;
+}
+
 function onConnect(port: Browser.runtime.Port): void {
   if (port.name !== "panel") return;
   ports.add(port);
@@ -907,9 +1026,11 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
     const request = ++hostingStopRequest;
     hostingStopRequested = true;
     pairingState = undefined;
-    const stopping = __UNDERSTUDY_STORE__
-      ? storeRuntimeGate.wait().then(() => profileClient.stopAll())
-      : profileClient.stopAll();
+    const stopping = pairingClaims.cancel().then(() =>
+      __UNDERSTUDY_STORE__
+        ? storeRuntimeGate.wait().then(() => profileClient.stopAll())
+        : profileClient.stopAll(),
+    );
     broadcastState();
     fireAndForget("stopAll", async () => {
       try {
@@ -923,8 +1044,41 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
     });
     return;
   }
-  if (msg.type === "pair") {
-    fireAndForget("pair", () => pairDevice(msg.code));
+  if (msg.type === "saveCard") {
+    fireAndForget("saveCard", async () => {
+      const saved = await mutateCardVault(() =>
+        profileClient.paymentVault().save(msg.card),
+      );
+      const result: CardVaultSaveResultMsg = saved
+        ? { type: "cardVaultSaveResult", requestId: msg.requestId, ok: true }
+        : {
+            type: "cardVaultSaveResult",
+            requestId: msg.requestId,
+            ok: false,
+            error: "The local card-vault operation failed.",
+          };
+      postToPort(port, result);
+    });
+    return;
+  }
+  if (msg.type === "deleteCard") {
+    fireAndForget("deleteCard", async () => {
+      await mutateCardVault(() => profileClient.paymentVault().delete(msg.alias));
+    });
+    return;
+  }
+  if (msg.type === "deleteCardVault") {
+    fireAndForget("deleteCardVault", async () => {
+      await mutateCardVault(() => profileClient.paymentVault().deleteAll());
+    });
+    return;
+  }
+  if (msg.type === "setPaymentOrigins") {
+    fireAndForget("setPaymentOrigins", async () => {
+      await mutateCardVault(() =>
+        profileClient.paymentVault().setApprovedOrigins(msg.origins).then(() => undefined),
+      );
+    });
     return;
   }
   if (__UNDERSTUDY_STORE__) return;
@@ -944,50 +1098,145 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
     case "configureProfile":
       hostingStopRequest += 1;
       hostingStopRequested = false;
-      fireAndForget("configureProfile", () =>
-        profileClient.configure({
-          serviceOrigin: msg.serviceOrigin,
-          unattendedEnabled: msg.enabled,
-          deviceId: msg.deviceId,
-          deviceCredential: msg.deviceCredential,
-          originPolicy: msg.originPolicy,
-        }),
-      );
+      fireAndForget("configureProfile", async () => {
+        await pairingClaims.cancel();
+        await profileClient.configure({
+            serviceOrigin: msg.serviceOrigin,
+            unattendedEnabled: msg.enabled,
+            deviceId: msg.deviceId,
+            deviceCredential: msg.deviceCredential,
+            originPolicy: msg.originPolicy,
+            policyVersion: msg.policyVersion,
+          });
+      });
       break;
   }
 }
 
-// Redeems a dashboard pairing code and feeds the minted config through the
-// SAME profileClient.configure path the manual form uses — a fresh
-// deviceId+credential per redemption means the new profileKey can never
-// match a stored ControlBlock, so pairing again is the universal recovery.
-async function pairDevice(code: string): Promise<void> {
-  hostingStopRequest += 1;
-  hostingStopRequested = false;
+// The dashboard offer is redeemed only after Chrome verifies the external sender.
+function schedulePairing(offer: string, request: number): Promise<boolean> {
   pairingState = { phase: "pairing" };
   broadcastState();
-  try {
-    if (__UNDERSTUDY_STORE__) await storeRuntimeGate.wait();
-    const result = await redeemPairingCode(code);
-    await profileClient.configure({
-      serviceOrigin: result.serviceOrigin,
-      unattendedEnabled: result.unattendedEnabled,
-      deviceId: result.deviceId,
-      deviceCredential: result.deviceCredential,
-      originPolicy: result.originPolicy,
-    });
-    pairingState = { phase: "success" };
-    log("paired with account; unattended hosting enabled");
-  } catch (cause) {
-    pairingState = {
-      phase: "error",
-      message:
-        cause instanceof PairingError
-          ? cause.message
-          : "Pairing failed. Generate a fresh code and try again.",
-    };
-    log(`pairing failed: ${errorMessage(cause)}`, "error");
+  const queued = pairingClaims.request(offer);
+  const redemption = pairingTail.then(async () => {
+    try {
+      await queued;
+      if (request !== hostingStopRequest) return false;
+      return await pairDevice(offer, request);
+    } catch (cause) {
+      reportPairingFailure(cause, request);
+      return false;
+    }
+  });
+  pairingTail = redemption.then(
+    () => undefined,
+    () => undefined,
+  );
+  return redemption;
+}
+
+async function pairDevice(
+  targetOffer: string | null,
+  request: number,
+): Promise<boolean> {
+  for (;;) {
+    let claim: PairingClaim | null = null;
+    try {
+      claim = await pairingClaims.next(targetOffer, async () => {
+        if (__UNDERSTUDY_STORE__) await storeRuntimeGate.wait();
+        return profileClient.pairingCredential();
+      });
+      if (claim === null) return false;
+      if (!(await pairingClaims.markDispatched(claim))) {
+        if (request !== hostingStopRequest) return false;
+        continue;
+      }
+      const result = await redeemPairingOffer(
+        claim.offer,
+        claim.previousCredential,
+        DEFAULT_SERVICE_ORIGIN,
+        claim.claimId,
+      );
+      const disposition = await pairingClaims.disposition(claim);
+      if (disposition === null) {
+        throw new Error("pairing intent changed after dispatch");
+      }
+      const recoveredConfig = {
+        serviceOrigin: result.serviceOrigin,
+        unattendedEnabled:
+          result.unattendedEnabled && disposition.allowHosting,
+        deviceId: result.deviceId,
+        deviceCredential: result.deviceCredential,
+        originPolicy: result.originPolicy,
+        policyVersion: result.policyVersion,
+      };
+      try {
+        await profileClient.configurePaired(
+          recoveredConfig,
+          claim.previousCredential,
+        );
+      } catch (cause) {
+        if (!(await profileClient.pairingTransitionPersisted(recoveredConfig))) {
+          throw cause;
+        }
+      }
+      const committedDisposition = await pairingClaims.disposition(claim);
+      if (committedDisposition === null) {
+        throw new Error("pairing intent changed after profile commit");
+      }
+      if (!committedDisposition.allowHosting) {
+        await profileClient.stopAll();
+      }
+      if (!(await pairingClaims.complete(claim))) {
+        throw new Error("pairing intent changed before durable completion");
+      }
+    } catch (cause) {
+      if (cause instanceof PairingError && cause.status === 404 && claim !== null) {
+        await pairingClaims.reject(claim).catch(() => {});
+        if (
+          claim.offer !== targetOffer &&
+          request === hostingStopRequest
+        ) {
+          continue;
+        }
+      }
+      if (targetOffer !== null) reportPairingFailure(cause, request);
+      return false;
+    }
+
+    if (request !== hostingStopRequest) return false;
+    if (targetOffer === null) continue;
+    if (claim.offer === targetOffer) {
+      pairingState = { phase: "success" };
+      log("paired with account; unattended hosting enabled");
+      broadcastState();
+      return true;
+    }
+    if (request !== hostingStopRequest) return false;
   }
+}
+
+async function recoverPendingPairing(request: number): Promise<void> {
+  await profileClient.start();
+  const redemption = pairingTail.then(() => pairDevice(null, request));
+  pairingTail = redemption.then(
+    () => undefined,
+    () => undefined,
+  );
+  await redemption;
+  if (request === hostingStopRequest) broadcastState();
+}
+
+function reportPairingFailure(cause: unknown, request: number): void {
+  if (request !== hostingStopRequest) return;
+  pairingState = {
+    phase: "error",
+    message:
+      cause instanceof PairingError
+        ? cause.message
+        : "Pairing failed. Send a fresh dashboard offer and try again.",
+  };
+  log(`pairing failed: ${errorMessage(cause)}`, "error");
   broadcastState();
 }
 
@@ -1015,9 +1264,52 @@ function buildState(): StateMsg {
         ? { ...profileConfig, unattendedEnabled: false }
         : profileConfig,
     ...(pairingState === undefined ? {} : { pairing: pairingState }),
+    cardVault: {
+      ...cardVaultState,
+      aliases: [...cardVaultState.aliases],
+      approvedOrigins: [...cardVaultState.approvedOrigins],
+    },
     ...(blockedReason === null ? {} : { profileStatusReason: blockedReason }),
     logs: [...logBuffer],
   };
+}
+
+async function refreshCardVaultState(): Promise<void> {
+  try {
+    const summary = await profileClient.paymentVault().summary();
+    cardVaultState = {
+      ...summary,
+      revision: cardVaultState.revision,
+    };
+  } catch {
+    cardVaultState = {
+      aliases: [],
+      approvedOrigins: [],
+      revision: cardVaultState.revision,
+      error: "The local card vault is unavailable. Delete it to create a new key.",
+    };
+  }
+  broadcastState();
+}
+
+async function mutateCardVault(operation: () => Promise<void>): Promise<boolean> {
+  try {
+    await operation();
+    const summary = await profileClient.paymentVault().summary();
+    cardVaultState = {
+      ...summary,
+      revision: cardVaultState.revision + 1,
+    };
+    broadcastState();
+    return true;
+  } catch {
+    cardVaultState = {
+      ...cardVaultState,
+      error: "The local card-vault operation failed.",
+    };
+    broadcastState();
+    return false;
+  }
 }
 
 function pushState(port: Browser.runtime.Port): void {
@@ -1037,7 +1329,7 @@ function log(message: string, level?: LogLevel): void {
   for (const port of [...ports]) postToPort(port, msg);
 }
 
-function postToPort(port: Browser.runtime.Port, msg: StateMsg | LogMsg): void {
+function postToPort(port: Browser.runtime.Port, msg: SwMsg): void {
   try {
     port.postMessage(msg);
   } catch {

@@ -2,7 +2,6 @@ export interface QuotaPolicy {
   sessionCreatesPerActorMinute: number;
   commandsPerSessionMinute: number;
   commandsPerTenantMinute: number;
-  credentialFillsPerActorMinute: number;
   deviceTicketsPerDeviceMinute: number;
   sessionCommandCap: number;
 }
@@ -11,7 +10,6 @@ export const DEFAULT_QUOTA_POLICY: QuotaPolicy = {
   sessionCreatesPerActorMinute: 10,
   commandsPerSessionMinute: 120,
   commandsPerTenantMinute: 600,
-  credentialFillsPerActorMinute: 30,
   deviceTicketsPerDeviceMinute: 30,
   sessionCommandCap: 10_000,
 };
