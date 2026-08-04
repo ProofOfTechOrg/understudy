@@ -1,12 +1,5 @@
 # @understudy/connector
 
-## 0.6.0
-
-### Minor Changes
-
-- Require protocol 3, remove credential filling, and consume the coordinated
-  protocol release that adds bounded semantic-element commands and results.
-
 ## 0.5.1
 
 ### Patch Changes

@@ -2,7 +2,7 @@
 
 # Finish the protocol-3 production rollout
 
-This handoff tells the release operator exactly what remains after the local protocol-3 implementation. The source and automated checks are complete. Network disruption tests, publishing, production changes, destructive cleanup, canary acceptance, and the HTTPS Strict Transport Security (HSTS) apex rollout still require operator action.
+This runbook defines the release sequence after the local protocol-3 implementation. The source and automated checks are complete. Network disruption tests, publishing, production changes, destructive cleanup, canary acceptance, and the HTTPS Strict Transport Security (HSTS) apex rollout still require operator action.
 
 ## Handoff baseline
 
@@ -10,17 +10,16 @@ Use this table to establish the source and environment before you act:
 
 | Field | Recorded value |
 | --- | --- |
-| Release branch | `feat/protocol-3-local-card-vault` |
-| Branch point | `3d7ddeedafa90c6b28cbe7204ae411cda93bffa4` |
-| Fetched `origin/dev` on 2026-08-03 | `857e0e3ebb8312be3e260e7339968f602703afdf` |
+| Integration branch | `feat/semantic-elements` |
+| Comparison base | `origin/dev` at `857e0e3ebb8312be3e260e7339968f602703afdf` |
+| Semantic tranche base | `554a09c53dd4a9b64755da38d0260d4da37fa3d2` (`feat: add guarded deployment workflow`) |
+| Fetched `origin/dev` on 2026-08-04 | `857e0e3ebb8312be3e260e7339968f602703afdf` |
 | Release source | The commit containing this handoff; resolve it with `git rev-parse HEAD` |
 | Node.js | 24.16.0; repository minimum is 22 |
 | pnpm | 11.5.2; the root manifest pins this version |
-| Production state last inspected | 2026-08-02; refresh every external value before acting |
+| Production state last inspected | 2026-08-04 for HTTP/HTTPS health; DNS inventory remains from 2026-08-02; refresh every external value before acting |
 
-The branch includes the pre-existing local commit `3d7ddee` plus the protocol-3 implementation commit. Do not deploy a dirty tree or a later unreviewed commit.
-
-The baseline named `docs/.local-card-vault-security-requirements.md.swp` as user-owned state. The final preservation check found no file at that path or with that exact name in accessible workspace and `/tmp` locations. No replacement was created.
+The integration branch intentionally includes the local card-vault requirements, protocol-3/card-vault implementation, guarded deployment workflow, and semantic-elements tranche. Do not split or rebase this stack onto the older remote ref without re-running the compatibility review. Do not deploy a dirty tree or a later unreviewed commit.
 
 ## Implemented release
 
@@ -33,7 +32,7 @@ The coordinated release contains these versions:
 | Extension | 0.2.0 |
 | Backend | 0.2.0 |
 
-The implementation removes the cloud vault, `fill_secret`, both MCP secret tools, legacy `usk_v1` acceptance, and OAuth grants without current device binding. It adds browser-bound authentication, direct extension pairing, versioned origin policy, suspended lease adoption, physical-window convergence, attended `idle`, provenance reporting, HSTS response headers, and the extension-local payment-card vault.
+The implementation removes the cloud vault, `fill_secret`, both MCP secret tools, legacy `usk_v1` acceptance, and OAuth grants without current device binding. It adds browser-bound authentication, direct extension pairing, versioned origin policy, suspended lease adoption, physical-window convergence, attended `idle`, provenance reporting, HSTS response headers, the extension-local payment-card vault, and bounded semantic-element capture, search, inspection, continuation, deltas, and live ref validation.
 
 No cloud-vault values migrate into the local card vault. Users must enroll cards again in the extension.
 
@@ -43,27 +42,27 @@ These results apply to the source code in this branch. A code or configuration c
 
 | Gate | Evidence | State |
 | --- | --- | --- |
-| Unit tests | 2026-08-02: 685 tests; protocol 47, connector 29, extension 248, backend 361 | Passed |
+| Unit and integration tests | 2026-08-04: 778 tests; protocol 52, connector 29, extension 307 plus 3 release integration tests, backend 383 plus 4 deployment integration tests | Passed |
 | Typecheck and build | `pnpm typecheck` and `pnpm build` after all review fixes | Passed |
 | Local Chrome end-to-end | Vault restart, Chrome DevTools Protocol submission, worker-eviction recovery, deletion, and synthetic-marker non-egress | Passed |
 | Store package | Pre-workflow `0.2.0` artifact SHA-256 `3b492a1608131088c607e5254317708165e8785c67ee73c393c40578fff9b54f` | Superseded; rebuild after the deployment changes |
 | Wrangler | Generated types current; deployment dry run completed without upload | Passed |
 | Review lanes | Independent clean-code, architecture, and quality-assurance reviews returned clean after fixes | Passed |
 | Network baseline | Test A 10s and 30s passed; Test A 60s and 120s plus Test B 30s remain | Partial |
-| Production HSTS | Last probe found no HTTP upgrade, no HTTPS HSTS header, and no apex address record | Pending |
+| Production HSTS | 2026-08-04 probes found no HTTP upgrade and no HTTPS HSTS header; the 2026-08-02 DNS inventory found no apex address record | Pending |
 | Cloud-vault cleanup | No values, namespace, or production secrets were deleted | Pending |
 
 The store ZIP is ignored build output. Rebuild it from the merged release commit and record its new size and SHA-256 before submission.
 
-## Pending work overview
+## Follow the release sequence
 
 Complete the remaining work in this order:
 
-| Step | Pending action | Required authority or input | Completion evidence |
+| Step | Action | Required authority or input | Completion evidence |
 | ---: | --- | --- | --- |
 | 1 | Run the remaining pre-fix network baseline | No active soak; caller credential; exact device and origin; approval immediately before firewall or Tailscale mutation | Mode-0600 JSONL evidence outside Git |
 | 2 | Apply the deterministic reconnect result | Baseline evidence from step 1 | Selected branch recorded; any required code change reviewed and verified |
-| 3 | Finish the one-time staging CI prerequisites, then push, review, and merge the release branch into `dev` | Repository and staging GitHub-environment authority | Scoped Cloudflare token present, staging secrets provisioned, pull request, merge SHA, and automatic staging deployment evidence |
+| 3 | Confirm the integration pull request is merged into `dev`, then verify the automatic staging deployment | Repository and staging GitHub-environment authority | Scoped Cloudflare token present, staging secrets provisioned, pull request, merge SHA, and automatic staging deployment evidence |
 | 4 | Verify staging with the pinned staging extension | Staging account and dedicated Chrome profile | Pairing, OAuth/MCP, and hosted-control evidence |
 | 5 | Publish protocol 0.9.0 and connector 0.6.0 | Package-registry release authority | Registry versions and package integrity values |
 | 6 | Build, submit, and publish extension 0.2.0 | Chrome Web Store authority | Submitted ZIP, normalized content digest, published status, and source SHA in `store-release.json` |
@@ -80,7 +79,7 @@ Complete the remaining work in this order:
 
 Do not combine steps 8 and 11 into one unobserved change. First prove that the compatibility deployment is healthy. Then start the separately confirmed hard-cut window.
 
-Before the first `dev` merge, create the GitHub `staging` environment, restrict it to `dev`, and add a `CLOUDFLARE_API_TOKEN` secret scoped only to the staging Worker and its required resources. Provision the six staging Worker secrets with the backend command documented below. Create the `production` environment separately, restrict it to `master`, add a production-scoped token, and leave `PRODUCTION_AUTODEPLOY_ENABLED=false` until step 9. Never reuse either deployment token or any Worker runtime secret across targets.
+If the environments are not already configured, create the GitHub `staging` environment, restrict it to `dev`, and add a `CLOUDFLARE_API_TOKEN` secret scoped only to the staging Worker and its required resources before relying on the staging deployment. Provision the six staging Worker secrets with the backend command documented below. Create the `production` environment separately, restrict it to `master`, add a production-scoped token, and leave `PRODUCTION_AUTODEPLOY_ENABLED=false` until step 9. Never reuse either deployment token or any Worker runtime secret across targets.
 
 ## Run the remaining network baseline
 

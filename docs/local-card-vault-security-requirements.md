@@ -1,4 +1,6 @@
-# Extension-local payment-card vault requirements
+<!-- Content type: Reference -->
+
+# Meet the extension-local payment-card vault requirements
 
 ## Decision
 
@@ -34,7 +36,7 @@ The extension-origin IndexedDB database contains:
 
 - one persisted, non-extractable AES-256-GCM `CryptoKey`;
 - card records with an opaque UUID, non-sensitive alias, schema version,
-  purpose, random IV, ciphertext, and update timestamp;
+  purpose, random IV, and ciphertext;
 - a local list of exact approved payment origins.
 
 Each write uses a fresh random 96-bit IV. Additional authenticated data is the

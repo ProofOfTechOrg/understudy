@@ -17,11 +17,13 @@ The backend is a Cloudflare Worker with Hono, OAuth Provider, Agents SDK Durable
 
 Migrations `v1` through `v4` are additive. Do not remove them during rollback.
 
+Pairing offers retain the internal `pairing_codes` table name for migration compatibility. The public interface passes a direct one-time offer and never asks a person to transcribe a code.
+
 ## Semantic MCP workflow
 
 The hosted MCP surface returns object-shaped `structuredContent` for every
 tool. Page-derived fields are nested under
-`{ source: "untrusted_page", page: ... }`; the compact text fallback uses a
+`{ source: "untrusted_page", page: page_data_here }`; the compact text fallback uses a
 random per-result boundary and JSON-quotes page strings.
 
 Use `browser_find` when the target label is known, a viewport-interactive
@@ -124,7 +126,7 @@ Copy `.dev.vars.example` to `.dev.vars` for local development. Never commit `.de
 
 ## Transport and response policy
 
-The canonical host is `https://understudy.proofof.tech`. Canonical HTTP requests receive `308` before routing. Every canonical HTTPS response—including errors, redirects, dashboard, OAuth, MCP, well-known metadata, and `/v1`—carries HSTS. The current staged value is five minutes; do not add `includeSubDomains; preload` until every `proofof.tech` hostname is valid HTTPS and the apex ramp is complete.
+The canonical host is `https://understudy.proofof.tech`. Canonical HTTP requests receive `308` before routing. Every canonical HTTPS response, including errors, redirects, dashboard, OAuth, MCP, well-known metadata, and `/v1`, carries HSTS. The current staged value is five minutes; do not add `includeSubDomains; preload` until every `proofof.tech` hostname is valid HTTPS and the apex ramp is complete.
 
 `/health` returns the Worker source tag, active version ID, and deployment timestamp from the `VERSION` metadata binding.
 

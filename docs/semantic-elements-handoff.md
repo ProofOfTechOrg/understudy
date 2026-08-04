@@ -1,6 +1,6 @@
-<!-- Content type: Explanation -->
+<!-- Content type: Reference -->
 
-# Semantic elements implementation handoff
+# Understand the semantic elements implementation
 
 ## Objective
 
@@ -57,7 +57,7 @@ The hosted MCP surface provides:
 
 Every tool has an MCP output schema and object-shaped `structuredContent`.
 Page-derived fields are nested below
-`{ source: "untrusted_page", page: ... }`. Compact text fallbacks use a random
+`{ source: "untrusted_page", page: page_data_here }`. Compact text fallbacks use a random
 128-bit boundary and JSON-quote page strings instead of duplicating the full
 structured object.
 
@@ -187,7 +187,7 @@ export const MEANINGFUL_ROLES: Set<string> = new Set([
   "button",
   "link",
   "textbox",
-  // ...
+  // Remaining roles omitted from this baseline excerpt.
   "cell",
 ]);
 ```
@@ -249,10 +249,10 @@ the exact source tree on which it ran.
 | Protocol focused tests | Passed: 52 tests |
 | Backend suite | Passed: 383 Vitest and 4 deployment integration tests |
 | Extension focused semantic/event tests | Passed: 87 tests in the final focused run |
-| Extension full suite | Passed: 303 Vitest and 3 release integration tests |
+| Extension full suite | Passed: 307 Vitest and 3 release integration tests |
 | Root typecheck/build/test | Passed; connector 29 tests also passed |
 | Real-Chrome E2E | Passed: large bounded capture, late find, frames/shadow DOM, pointer replacement, eviction, payment, and non-egress |
-| Store build and ZIP | Passed; store ZIP is 141.55 KiB |
+| Store build and ZIP | Passed; store ZIP is 142,127 bytes |
 | Wrangler types and dry run | Passed; dry run emitted only the known multi-environment warning |
 | Independent clean-code review | Clean after all fixes |
 | Independent architecture review | Clean; the AX call-count decision was resolved in favor of Stagehand's per-frame model |
@@ -274,8 +274,7 @@ pnpm exec wrangler types --check
 pnpm exec wrangler deploy --dry-run
 ```
 
-All commands above pass on the current working tree. Remaining completion work
-is the reviewable tranche commits and a final clean Git-state check.
+All commands above pass on the implementation tree. The implementation tranche is committed; publication still requires the Changesets version pull request and the `dev` to `master` promotion described in the release runbook.
 
 ## Out of scope
 

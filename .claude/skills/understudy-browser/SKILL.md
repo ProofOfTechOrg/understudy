@@ -28,7 +28,7 @@ Example CLI configuration:
 
 ```bash
 claude mcp add --transport http understudy https://understudy.proofof.tech/mcp \
-  --header "Authorization: Bearer usk_v2_..."
+  --header "Authorization: Bearer your_usk_v2_token_here"
 ```
 
 An OAuth grant or API token is bound to one device. Revoking that device makes
@@ -103,8 +103,8 @@ To submit a card:
 `not_started` means no card byte was inserted. Take a fresh snapshot before a
 manual retry. Once any byte is inserted, every result is `outcome_unknown`.
 
-Stop before any other irreversible action—purchase, send, delete, publish,
-OAuth grant—and obtain the user's explicit approval for that exact action.
+Stop before any other irreversible action: purchase, send, delete, publish, or
+an OAuth grant. Obtain the user's explicit approval for that exact action.
 
 ## Failure handling
 

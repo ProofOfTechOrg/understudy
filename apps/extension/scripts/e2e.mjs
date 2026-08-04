@@ -122,21 +122,17 @@ try {
     "state.cardVault.revision === 0");
   assert(initial.cardVault.aliases.length === 0, "vault was not empty in a fresh Chrome profile");
 
-  const saved = await panelCommand(
+  const saved = await panelCardSave(
     client,
     panel.sessionId,
     {
-      type: "saveCard",
-      card: {
-        alias: "e2e-card",
-        cardholderName: marker,
-        pan: "4111111111111111",
-        expiryMonth: "12",
-        expiryYear: "2099",
-        cvv: "123",
-      },
+      alias: "e2e-card",
+      cardholderName: marker,
+      pan: "4111111111111111",
+      expiryMonth: "12",
+      expiryYear: "2099",
+      cvv: "123",
     },
-    "state.cardVault.aliases.includes('e2e-card')",
   );
   assert(!JSON.stringify(saved).includes(marker), "card marker escaped through extension state");
   await panelCommand(
@@ -1531,6 +1527,39 @@ function panelCommand(client, sessionId, message, condition) {
       }
     });
     port.postMessage(${JSON.stringify(message)});
+  })`);
+}
+
+function panelCardSave(client, sessionId, card) {
+  const requestId = `e2e-save-${Date.now()}`;
+  return evaluate(client, sessionId, `new Promise((resolve, reject) => {
+    const port = chrome.runtime.connect({name: "panel"});
+    const timer = setTimeout(() => { port.disconnect(); reject(new Error("card save timeout")); }, 10000);
+    let savedState;
+    let acknowledged = false;
+    const finish = () => {
+      if (savedState === undefined || !acknowledged) return;
+      clearTimeout(timer);
+      port.disconnect();
+      resolve(savedState);
+    };
+    port.onMessage.addListener((message) => {
+      if (message?.type === "state" && message.cardVault.aliases.includes(${JSON.stringify(card.alias)})) {
+        savedState = message;
+        finish();
+      }
+      if (message?.type === "cardVaultSaveResult" && message.requestId === ${JSON.stringify(requestId)}) {
+        if (!message.ok) {
+          clearTimeout(timer);
+          port.disconnect();
+          reject(new Error(message.error));
+          return;
+        }
+        acknowledged = true;
+        finish();
+      }
+    });
+    port.postMessage(${JSON.stringify({ type: "saveCard", requestId, card })});
   })`);
 }
 

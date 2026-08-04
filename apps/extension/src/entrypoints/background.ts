@@ -35,11 +35,13 @@ import { classifyCdpEvent } from "../driver/cdp-events";
 import { errorMessage } from "../events";
 import type {
   AttachedTab,
+  CardVaultSaveResultMsg,
   LogEntry,
   LogLevel,
   LogMsg,
   PanelMsg,
   StateMsg,
+  SwMsg,
   WsStatus,
 } from "../messaging";
 import { controlledTabInfo } from "../tabs";
@@ -1043,27 +1045,40 @@ function handlePanelMsg(msg: PanelMsg, port: Browser.runtime.Port): void {
     return;
   }
   if (msg.type === "saveCard") {
-    fireAndForget("saveCard", () => mutateCardVault(() =>
-      profileClient.paymentVault().save(msg.card),
-    ));
+    fireAndForget("saveCard", async () => {
+      const saved = await mutateCardVault(() =>
+        profileClient.paymentVault().save(msg.card),
+      );
+      const result: CardVaultSaveResultMsg = saved
+        ? { type: "cardVaultSaveResult", requestId: msg.requestId, ok: true }
+        : {
+            type: "cardVaultSaveResult",
+            requestId: msg.requestId,
+            ok: false,
+            error: "The local card-vault operation failed.",
+          };
+      postToPort(port, result);
+    });
     return;
   }
   if (msg.type === "deleteCard") {
-    fireAndForget("deleteCard", () => mutateCardVault(() =>
-      profileClient.paymentVault().delete(msg.alias),
-    ));
+    fireAndForget("deleteCard", async () => {
+      await mutateCardVault(() => profileClient.paymentVault().delete(msg.alias));
+    });
     return;
   }
   if (msg.type === "deleteCardVault") {
-    fireAndForget("deleteCardVault", () => mutateCardVault(() =>
-      profileClient.paymentVault().deleteAll(),
-    ));
+    fireAndForget("deleteCardVault", async () => {
+      await mutateCardVault(() => profileClient.paymentVault().deleteAll());
+    });
     return;
   }
   if (msg.type === "setPaymentOrigins") {
-    fireAndForget("setPaymentOrigins", () => mutateCardVault(() =>
-      profileClient.paymentVault().setApprovedOrigins(msg.origins).then(() => undefined),
-    ));
+    fireAndForget("setPaymentOrigins", async () => {
+      await mutateCardVault(() =>
+        profileClient.paymentVault().setApprovedOrigins(msg.origins).then(() => undefined),
+      );
+    });
     return;
   }
   if (__UNDERSTUDY_STORE__) return;
@@ -1277,7 +1292,7 @@ async function refreshCardVaultState(): Promise<void> {
   broadcastState();
 }
 
-async function mutateCardVault(operation: () => Promise<void>): Promise<void> {
+async function mutateCardVault(operation: () => Promise<void>): Promise<boolean> {
   try {
     await operation();
     const summary = await profileClient.paymentVault().summary();
@@ -1285,13 +1300,16 @@ async function mutateCardVault(operation: () => Promise<void>): Promise<void> {
       ...summary,
       revision: cardVaultState.revision + 1,
     };
+    broadcastState();
+    return true;
   } catch {
     cardVaultState = {
       ...cardVaultState,
       error: "The local card-vault operation failed.",
     };
+    broadcastState();
+    return false;
   }
-  broadcastState();
 }
 
 function pushState(port: Browser.runtime.Port): void {
@@ -1311,7 +1329,7 @@ function log(message: string, level?: LogLevel): void {
   for (const port of [...ports]) postToPort(port, msg);
 }
 
-function postToPort(port: Browser.runtime.Port, msg: StateMsg | LogMsg): void {
+function postToPort(port: Browser.runtime.Port, msg: SwMsg): void {
   try {
     port.postMessage(msg);
   } catch {

@@ -9,7 +9,9 @@ import type {
   ProfileBlockReason,
   SwMsg,
 } from "../../messaging";
+import type { PaymentCardInput } from "../../payment/card-validation";
 import { DASHBOARD_URL, PRIVACY_URL } from "../../service-origin";
+import { CardSaveRequests, commitCardEnrollment } from "./card-save";
 
 const SUPPORT_URL = "https://github.com/ProofOfTechOrg/understudy/issues";
 const RECONNECT_DELAY_MS = 500;
@@ -25,6 +27,16 @@ type HostStatus =
 export function App(): ReactElement {
   const [swState, setSwState] = useState<StateSnapshot | null>(null);
   const portRef = useRef<Browser.runtime.Port | null>(null);
+  const cardSaveRequestsRef = useRef<CardSaveRequests | null>(null);
+  if (cardSaveRequestsRef.current === null) {
+    cardSaveRequestsRef.current = new CardSaveRequests((message) => {
+      const port = portRef.current;
+      if (port === null) {
+        throw new Error("The background service is reconnecting. Try again.");
+      }
+      port.postMessage(message);
+    });
+  }
 
   const send = (msg: PanelMsg): void => {
     try {
@@ -44,7 +56,9 @@ export function App(): ReactElement {
       portRef.current = port;
       port.onMessage.addListener((raw) => {
         const msg = raw as SwMsg;
-        if (msg.type === "state") {
+        if (msg.type === "cardVaultSaveResult") {
+          cardSaveRequestsRef.current?.settle(msg);
+        } else if (msg.type === "state") {
           setSwState(msg);
         } else {
           setSwState((previous) =>
@@ -56,6 +70,9 @@ export function App(): ReactElement {
       });
       port.onDisconnect.addListener(() => {
         if (portRef.current === port) portRef.current = null;
+        cardSaveRequestsRef.current?.rejectAll(
+          "The background service disconnected before the card was saved. Review the form and try again.",
+        );
         if (disposed) return;
         reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
       });
@@ -66,6 +83,9 @@ export function App(): ReactElement {
     return () => {
       disposed = true;
       clearTimeout(reconnectTimer);
+      cardSaveRequestsRef.current?.rejectAll(
+        "The side panel closed before the card was saved.",
+      );
       portRef.current?.disconnect();
       portRef.current = null;
     };
@@ -181,7 +201,11 @@ export function App(): ReactElement {
         </button>
       </section>
 
-      <CardVaultPanel vault={swState?.cardVault ?? null} send={send} />
+      <CardVaultPanel
+        vault={swState?.cardVault ?? null}
+        save={(card) => cardSaveRequestsRef.current!.save(card)}
+        send={send}
+      />
 
       {__UNDERSTUDY_STORE__ ? null : (
         <InternalTools
@@ -208,27 +232,45 @@ export function App(): ReactElement {
 
 function CardVaultPanel({
   vault,
+  save,
   send,
 }: {
   vault: StateSnapshot["cardVault"] | null;
+  save: (card: PaymentCardInput) => Promise<void>;
   send: (message: PanelMsg) => void;
 }): ReactElement {
-  const saveCard = (event: FormEvent<HTMLFormElement>): void => {
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const savingRef = useRef(false);
+
+  const saveCard = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
+    if (savingRef.current) return;
     const form = event.currentTarget;
     const data = new FormData(form);
-    send({
-      type: "saveCard",
-      card: {
-        alias: String(data.get("alias") ?? ""),
-        cardholderName: String(data.get("cardholderName") ?? ""),
-        pan: String(data.get("pan") ?? ""),
-        expiryMonth: String(data.get("expiryMonth") ?? ""),
-        expiryYear: String(data.get("expiryYear") ?? ""),
-        cvv: String(data.get("cvv") ?? ""),
-      },
-    });
-    form.reset();
+    const card = {
+      alias: String(data.get("alias") ?? ""),
+      cardholderName: String(data.get("cardholderName") ?? ""),
+      pan: String(data.get("pan") ?? ""),
+      expiryMonth: String(data.get("expiryMonth") ?? ""),
+      expiryYear: String(data.get("expiryYear") ?? ""),
+      cvv: String(data.get("cvv") ?? ""),
+    };
+    savingRef.current = true;
+    setIsSaving(true);
+    setSaveError(null);
+    try {
+      await commitCardEnrollment(card, save, () => form.reset());
+    } catch (cause) {
+      setSaveError(
+        cause instanceof Error
+          ? cause.message
+          : "The local card-vault operation failed.",
+      );
+    } finally {
+      savingRef.current = false;
+      setIsSaving(false);
+    }
   };
 
   const saveOrigins = (event: FormEvent<HTMLFormElement>): void => {
@@ -264,8 +306,8 @@ function CardVaultPanel({
         Card values and the non-exportable encryption key stay inside this
         extension. Only aliases are exposed to an authorized agent.
       </p>
-      {vault?.error === undefined ? null : (
-        <p className="warning" role="status">{vault.error}</p>
+      {saveError === null && vault?.error === undefined ? null : (
+        <p className="warning" role="status">{saveError ?? vault?.error}</p>
       )}
       <form className="enrollment-form" onSubmit={saveCard} autoComplete="off">
         <label>
@@ -307,8 +349,8 @@ function CardVaultPanel({
             />
           </label>
         </div>
-        <button className="button button-primary" type="submit">
-          Encrypt card locally
+        <button className="button button-primary" type="submit" disabled={isSaving}>
+          {isSaving ? "Encrypting card…" : "Encrypt card locally"}
         </button>
       </form>
 

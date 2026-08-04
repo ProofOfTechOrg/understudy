@@ -6,6 +6,10 @@
   "linked": [],
   "access": "public",
   "baseBranch": "dev",
+  "privatePackages": {
+    "version": false,
+    "tag": false
+  },
   "updateInternalDependencies": "patch",
   "ignore": [],
   "___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH": {

@@ -49,6 +49,7 @@ export interface StopAllMsg {
 
 export interface SaveCardMsg {
   type: "saveCard";
+  requestId: string;
   card: PaymentCardInput;
 }
 
@@ -129,4 +130,17 @@ export interface LogMsg {
   entry: LogEntry;
 }
 
-export type SwMsg = StateMsg | LogMsg;
+export type CardVaultSaveResultMsg =
+  | {
+      type: "cardVaultSaveResult";
+      requestId: string;
+      ok: true;
+    }
+  | {
+      type: "cardVaultSaveResult";
+      requestId: string;
+      ok: false;
+      error: string;
+    };
+
+export type SwMsg = StateMsg | LogMsg | CardVaultSaveResultMsg;

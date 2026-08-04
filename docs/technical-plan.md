@@ -1,4 +1,6 @@
-# Understudy protocol-3 architecture
+<!-- Content type: Conceptual -->
+
+# Understand the Understudy protocol-3 architecture
 
 ## Release contract
 

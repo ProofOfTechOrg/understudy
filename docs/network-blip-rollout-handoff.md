@@ -1,8 +1,10 @@
-# Network-blip diagnosis and rollout handoff
+<!-- Content type: Troubleshooting -->
+
+# Diagnose network blips and finish the rollout
 
 ## Current state
 
-This record applies to release branch `feat/protocol-3-local-card-vault`, which starts at implementation base `3d7ddeedafa90c6b28cbe7204ae411cda93bffa4`. Production still serves the pre-change Worker until an operator runs the gated release process.
+This record applies to integration branch `feat/semantic-elements`, compared with `origin/dev` at `857e0e3ebb8312be3e260e7339968f602703afdf`. The semantic tranche starts after `554a09c53dd4a9b64755da38d0260d4da37fa3d2`. Production still serves the pre-change Worker until an operator runs the gated release process.
 
 Historical sanitized observations:
 
@@ -49,7 +51,7 @@ immediate pre-break `lastSeenAt`, requires a changed post-break value, records
 the lease outcome, and verifies network restoration and capacity cleanup
 through traps.
 
-The credential file accepts one JSON string, `{ "token": "..." }`, or a
+The credential file accepts one JSON string, `{ "token": "your_token_here" }`, or a
 one-key legacy token map. Its value is never written to evidence or stdout.
 
 ## Deterministic result rule
