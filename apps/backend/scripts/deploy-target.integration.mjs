@@ -22,7 +22,7 @@ describe("deployment target integration", () => {
     const fixture = await deploymentFixture({ FAKE_SYSTEM_DNS: "missing" });
     const result = runDeployment(fixture);
 
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.status, 0, commandFailure(result));
     const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
     assert.equal(evidence.outcome, "verified");
     assert.equal(evidence.activeWorkerVersion.id, "v1");
@@ -43,8 +43,7 @@ describe("deployment target integration", () => {
     assert.match(result.stderr, /expected source provenance/);
     assert.match(await readFile(fixture.log, "utf8"), /deploy --strict/);
     const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
-    assert.equal(evidence.outcome, "failed");
-    assert.equal(evidence.failureStage, "verification");
+    assertFailedEvidence(evidence, result, "verification");
     assert.equal(evidence.priorDeployment.versions[0].version_id, "v0");
   });
 
@@ -55,33 +54,59 @@ describe("deployment target integration", () => {
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /health provenance did not converge/);
     const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
-    assert.equal(evidence.outcome, "failed");
-    assert.equal(evidence.failureStage, "verification");
+    assertFailedEvidence(evidence, result, "verification");
     assert.equal(evidence.health, null);
+  });
+
+  it("records failed evidence when deployment credentials are missing", async () => {
+    const fixture = await deploymentFixture({ FAKE_REQUIRE_AUTH: "true" });
+    delete fixture.env.CLOUDFLARE_API_TOKEN;
+    const result = runDeployment(fixture);
+
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      /Cloudflare API token required/,
+      commandFailure(result),
+    );
+    const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
+    assertFailedEvidence(evidence, result, "prior-deployment");
+    assert.equal(evidence.priorDeployment, null);
+  });
+
+  it("rejects malformed prior-deployment JSON before upload", async () => {
+    const fixture = await deploymentFixture({
+      FAKE_PRIOR_DEPLOYMENT_JSON: "{not-json",
+    });
+    const result = runDeployment(fixture);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /prior deployment did not return a JSON object/);
+    const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
+    assertFailedEvidence(evidence, result, "prior-deployment");
+    assert.equal(evidence.priorDeployment, null);
+    assert.doesNotMatch(await readFile(fixture.log, "utf8"), /deploy --strict/);
+  });
+
+  it("records build failures before any control-plane access", async () => {
+    const fixture = await deploymentFixture({ FAKE_BUILD_FAILURE: "true" });
+    const result = runDeployment(fixture);
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /protocol build failed/);
+    const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
+    assertFailedEvidence(evidence, result, "build");
+    assert.equal(evidence.priorDeployment, null);
+    assert.doesNotMatch(await readFile(fixture.log, "utf8"), /deployments status/);
   });
 });
 
 describe("manual production cutover integration", () => {
   it("attributes each new secret version from newest-first inventories", async () => {
     const fixture = await manualDeploymentFixture();
-    const result = spawnSync(
-      "bash",
-      [
-        MANUAL_SCRIPT,
-        fixture.evidence,
-        fixture.deviceTokens,
-        fixture.extensionId,
-        fixture.canaryCredential,
-      ],
-      {
-        cwd: REPO_ROOT,
-        env: fixture.env,
-        input: "DEPLOY\n",
-        encoding: "utf8",
-      },
-    );
+    const result = runManualDeployment(fixture);
 
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.status, 0, commandFailure(result));
     const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
     assert.equal(evidence.outcome, "verified");
     assert.equal(evidence.deviceTokensSecretVersion.id, "device-secret-new");
@@ -98,6 +123,40 @@ describe("manual production cutover integration", () => {
     assert.match(log, /install --frozen-lockfile --offline auth=absent/);
     assert.match(log, /secret put DEVICE_TOKENS.*auth=present/);
     assert.match(log, /secret put EXTENSION_ID.*auth=present/);
+  });
+
+  it("records missing production credentials before secret mutation", async () => {
+    const fixture = await manualDeploymentFixture({ FAKE_REQUIRE_AUTH: "true" });
+    delete fixture.env.CLOUDFLARE_API_TOKEN;
+    const result = runManualDeployment(fixture);
+
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      /Cloudflare API token required/,
+      commandFailure(result),
+    );
+    const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
+    assertFailedEvidence(evidence, result, "prior-deployment");
+    assert.equal(evidence.priorDeployment, null);
+    assert.equal(evidence.secretMutationPossible, false);
+    assert.doesNotMatch(await readFile(fixture.log, "utf8"), /secret put/);
+  });
+
+  it("attributes a post-secret source-ref failure", async () => {
+    const fixture = await manualDeploymentFixture({
+      FAKE_LATE_SOURCE_FAILURE: "true",
+    });
+    const result = runManualDeployment(fixture);
+
+    assert.notEqual(result.status, 0);
+    const evidence = JSON.parse(await readFile(fixture.evidence, "utf8"));
+    assertFailedEvidence(evidence, result, "source-ref");
+    assert.equal(evidence.secretMutationPossible, true);
+    const log = await readFile(fixture.log, "utf8");
+    assert.match(log, /secret put DEVICE_TOKENS/);
+    assert.match(log, /secret put EXTENSION_ID/);
+    assert.doesNotMatch(log, /deploy --strict/);
   });
 });
 
@@ -131,7 +190,12 @@ auth=absent
 if [[ -n "\${CLOUDFLARE_API_TOKEN:-}" ]]; then auth=present; fi
 printf '%s auth=%s\\n' "$*" "$auth" >>"$FAKE_LOG"
 case "$*" in
-  "--filter @understudy/protocol build") ;;
+  "--filter @understudy/protocol build")
+    if [[ "\${FAKE_BUILD_FAILURE:-}" == "true" ]]; then
+      printf 'protocol build failed\n' >&2
+      exit 1
+    fi
+    ;;
   "--version") printf '11.5.2\\n' ;;
   *"wrangler deploy --dry-run"*) ;;
   *"wrangler deploy --strict"*) ;;
@@ -139,6 +203,14 @@ case "$*" in
     printf '[{"id":"v1","annotations":{"workers/tag":"%s","workers/message":"source %s"}}]\\n' "\${FAKE_VERSION_TAG:-$FAKE_SHA}" "$FAKE_SHA"
     ;;
   *"wrangler deployments status --json"*)
+    if [[ "\${FAKE_REQUIRE_AUTH:-}" == "true" && "$auth" == "absent" ]]; then
+      printf 'Cloudflare API token required\n' >&2
+      exit 1
+    fi
+    if [[ -n "\${FAKE_PRIOR_DEPLOYMENT_JSON:-}" ]]; then
+      printf '%s\n' "$FAKE_PRIOR_DEPLOYMENT_JSON"
+      exit 0
+    fi
     count_file="$FAKE_STATE/status-count"
     count=0
     if [[ -f "$count_file" ]]; then count="$(<"$count_file")"; fi
@@ -184,7 +256,7 @@ printf '{"ok":true,"commit":"%s","versionId":"v1","deployedAt":"2030-01-01T00:00
   };
 }
 
-async function manualDeploymentFixture() {
+async function manualDeploymentFixture(overrides = {}) {
   const root = await mkdtemp(join(tmpdir(), "understudy-manual-deploy-test-"));
   temporary.push(root);
   const bin = join(root, "bin");
@@ -222,7 +294,18 @@ async function manualDeploymentFixture() {
 set -eu
 case "$*" in
   *"rev-parse --show-toplevel"*) printf '%s\\n' "$FAKE_REPO_ROOT" ;;
-  *"rev-parse refs/remotes/origin/master"*) printf '%s\\n' "$FAKE_SHA" ;;
+  *"rev-parse refs/remotes/origin/master"*)
+    count_file="$FAKE_STATE/master-ref-count"
+    count=0
+    if [[ -f "$count_file" ]]; then count="$(<"$count_file")"; fi
+    count=$((count + 1))
+    printf '%s' "$count" >"$count_file"
+    if [[ "\${FAKE_LATE_SOURCE_FAILURE:-}" == "true" && "$count" -ge 3 ]]; then
+      printf '%s\\n' "c\${FAKE_SHA:1}"
+    else
+      printf '%s\\n' "$FAKE_SHA"
+    fi
+    ;;
   *"rev-parse HEAD"*) printf '%s\\n' "$FAKE_SHA" ;;
   *"status --porcelain"*) ;;
   *"fetch --quiet origin"*) ;;
@@ -258,6 +341,10 @@ case "$*" in
   *"wrangler deploy --dry-run"*|*"wrangler deploy --strict"*) ;;
   *"wrangler secret put"*) IFS= read -r _ || true ;;
   *"wrangler deployments status --json"*)
+    if [[ "\${FAKE_REQUIRE_AUTH:-}" == "true" && "$auth" == "absent" ]]; then
+      printf 'Cloudflare API token required\n' >&2
+      exit 1
+    fi
     count_file="$FAKE_STATE/deployment-count"
     count=0
     if [[ -f "$count_file" ]]; then count="$(<"$count_file")"; fi
@@ -299,6 +386,7 @@ printf '{"ok":true,"commit":"%s","versionId":"v1","deployedAt":"2030-01-01T00:00
     log,
     env: {
       ...process.env,
+      ...overrides,
       PATH: `${bin}:${process.env.PATH}`,
       FAKE_LOG: log,
       FAKE_REPO_ROOT: REPO_ROOT,
@@ -316,6 +404,42 @@ function runDeployment(fixture) {
     env: fixture.env,
     encoding: "utf8",
   });
+}
+
+function runManualDeployment(fixture) {
+  return spawnSync(
+    "bash",
+    [
+      MANUAL_SCRIPT,
+      fixture.evidence,
+      fixture.deviceTokens,
+      fixture.extensionId,
+      fixture.canaryCredential,
+    ],
+    {
+      cwd: REPO_ROOT,
+      env: fixture.env,
+      input: "DEPLOY\n",
+      encoding: "utf8",
+    },
+  );
+}
+
+function commandFailure(result) {
+  return JSON.stringify({
+    status: result.status,
+    signal: result.signal,
+    error: result.error?.message,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  });
+}
+
+function assertFailedEvidence(evidence, result, failureStage) {
+  assert.notEqual(result.status, 0);
+  assert.equal(evidence.outcome, "failed");
+  assert.equal(evidence.failureStage, failureStage);
+  assert.equal(evidence.exitCode, result.status);
 }
 
 async function executable(path, contents) {

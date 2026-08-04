@@ -79,18 +79,6 @@ assert_source_unchanged() {
     "$initial_fingerprint" "$(worktree_fingerprint)"
 }
 
-cd "$repo_root"
-pnpm --filter @understudy/protocol build
-store_release='null'
-compatibility='null'
-if [[ "$MODE" == "production-auto" ]]; then
-  pnpm --filter @understudy/extension build:store
-  pnpm --filter @understudy/extension zip:store
-  store_release="$(pnpm --silent --filter @understudy/extension verify:store-release)"
-  compatibility="$(node "$backend_dir/scripts/verify-production-compatibility.mjs" live)"
-fi
-assert_source_unchanged
-
 dry_run_dir="$(mktemp -d)"
 temporary=""
 cleanup() {
@@ -99,27 +87,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-understudy_deploy_init "$target" "$backend_dir" "$full_sha" "$source_tag"
-understudy_deploy_dry_run "$dry_run_dir"
-assert_source_unchanged
-
 pnpm_version="$(pnpm --version)"
 lockfile_sha256="$(sha256sum "$repo_root/pnpm-lock.yaml" | cut -d ' ' -f 1)"
-UNDERSTUDY_PRIOR_DEPLOYMENT="$(understudy_wrangler_control_plane deployments status --json)"
+store_release='null'
+compatibility='null'
+UNDERSTUDY_PRIOR_DEPLOYMENT='null'
 UNDERSTUDY_HEALTH='null'
 UNDERSTUDY_SOURCE_RELEASE='null'
 UNDERSTUDY_ACTIVE_VERSION='null'
 UNDERSTUDY_DEPLOYMENT='null'
 deployment_stage="prepared"
-
-if [[ -n "$branch" ]]; then
-  git -C "$repo_root" fetch --quiet origin \
-    "+refs/heads/$branch:refs/remotes/origin/$branch"
-  remote_sha="$(git -C "$repo_root" rev-parse "refs/remotes/origin/$branch")"
-  node "$backend_dir/scripts/deployment-policy.mjs" current-ref \
-    "$branch" "$full_sha" "$remote_sha"
-  assert_source_unchanged
-fi
 
 write_evidence() {
   local outcome="$1"
@@ -179,6 +156,13 @@ record_failed_deployment() {
   local exit_code="$?"
   trap - EXIT
   set +e
+  UNDERSTUDY_HEALTH="$(understudy_json_or_null "$UNDERSTUDY_HEALTH")"
+  UNDERSTUDY_SOURCE_RELEASE="$(understudy_json_or_null "$UNDERSTUDY_SOURCE_RELEASE")"
+  UNDERSTUDY_ACTIVE_VERSION="$(understudy_json_or_null "$UNDERSTUDY_ACTIVE_VERSION")"
+  UNDERSTUDY_DEPLOYMENT="$(understudy_json_or_null "$UNDERSTUDY_DEPLOYMENT")"
+  UNDERSTUDY_PRIOR_DEPLOYMENT="$(understudy_json_or_null "$UNDERSTUDY_PRIOR_DEPLOYMENT")"
+  store_release="$(understudy_json_or_null "$store_release")"
+  compatibility="$(understudy_json_or_null "$compatibility")"
   write_evidence "failed" "$deployment_stage" "$exit_code"
   cleanup
   exit "$exit_code"
@@ -186,6 +170,36 @@ record_failed_deployment() {
 
 write_evidence "attempting"
 trap record_failed_deployment EXIT
+deployment_stage="build"
+cd "$repo_root"
+pnpm --filter @understudy/protocol build
+if [[ "$MODE" == "production-auto" ]]; then
+  pnpm --filter @understudy/extension build:store
+  pnpm --filter @understudy/extension zip:store
+  store_release="$(pnpm --silent --filter @understudy/extension verify:store-release)"
+  compatibility="$(node "$backend_dir/scripts/verify-production-compatibility.mjs" live)"
+fi
+assert_source_unchanged
+
+understudy_deploy_init "$target" "$backend_dir" "$full_sha" "$source_tag"
+deployment_stage="dry-run"
+understudy_deploy_dry_run "$dry_run_dir"
+assert_source_unchanged
+
+deployment_stage="prior-deployment"
+UNDERSTUDY_PRIOR_DEPLOYMENT="$(understudy_wrangler_control_plane deployments status --json)"
+understudy_require_json_type "$UNDERSTUDY_PRIOR_DEPLOYMENT" object "prior deployment"
+
+if [[ -n "$branch" ]]; then
+  deployment_stage="source-ref"
+  git -C "$repo_root" fetch --quiet origin \
+    "+refs/heads/$branch:refs/remotes/origin/$branch"
+  remote_sha="$(git -C "$repo_root" rev-parse "refs/remotes/origin/$branch")"
+  node "$backend_dir/scripts/deployment-policy.mjs" current-ref \
+    "$branch" "$full_sha" "$remote_sha"
+  assert_source_unchanged
+fi
+
 deployment_stage="upload"
 understudy_deploy_release
 deployment_stage="verification"
