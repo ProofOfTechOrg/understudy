@@ -44,6 +44,7 @@ These results apply to the source code in this branch. A code or configuration c
 | --- | --- | --- |
 | Unit and integration tests | 2026-08-04: 778 tests; protocol 52, connector 29, extension 307 plus 3 release integration tests, backend 383 plus 4 deployment integration tests | Passed |
 | Typecheck and build | `pnpm typecheck` and `pnpm build` after all review fixes | Passed |
+| Dependency audit | 2026-08-04: 0 critical/high; 2 moderate and 2 low transitive advisories remain | Passed release threshold |
 | Local Chrome end-to-end | Vault restart, Chrome DevTools Protocol submission, worker-eviction recovery, deletion, and synthetic-marker non-egress | Passed |
 | Store package | Pre-workflow `0.2.0` artifact SHA-256 `3b492a1608131088c607e5254317708165e8785c67ee73c393c40578fff9b54f` | Superseded; rebuild after the deployment changes |
 | Wrangler | Generated types current; deployment dry run completed without upload | Passed |

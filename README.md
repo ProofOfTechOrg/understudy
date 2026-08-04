@@ -50,7 +50,10 @@ pnpm typecheck
 pnpm test
 ```
 
-Dependencies use a 7-day minimum release age through `pnpm-workspace.yaml`. First-party `@proofoftech/*` packages are exempt.
+Dependencies use a 7-day minimum release age through `pnpm-workspace.yaml`.
+`@proofoftech/breakwater` is exempt because the workspace consumes its
+first-party releases immediately. Emergency security-patch exceptions use
+exact package-version selectors, so later releases remain quarantined.
 
 For the production extension:
 

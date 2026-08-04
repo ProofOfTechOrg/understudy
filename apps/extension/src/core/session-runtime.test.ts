@@ -34,7 +34,7 @@ function host(): RuntimeHost & { onFenced: ReturnType<typeof vi.fn> } {
 
 function stubBrowser(
   remove: () => Promise<void>,
-  getAll = vi.fn(async () => []),
+  getAll: () => Promise<Array<{ id?: number }>> = vi.fn(async () => []),
   storage: SessionStorageArea = {
     get: vi.fn(async () => ({})),
     set: vi.fn(async () => {}),

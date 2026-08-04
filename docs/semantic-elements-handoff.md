@@ -251,6 +251,7 @@ the exact source tree on which it ran.
 | Extension focused semantic/event tests | Passed: 87 tests in the final focused run |
 | Extension full suite | Passed: 307 Vitest and 3 release integration tests |
 | Root typecheck/build/test | Passed; connector 29 tests also passed |
+| Dependency audit | Passed release threshold: 0 critical/high; 2 moderate and 2 low transitive advisories remain |
 | Real-Chrome E2E | Passed: large bounded capture, late find, frames/shadow DOM, pointer replacement, eviction, payment, and non-egress |
 | Store build and ZIP | Passed; store ZIP is 142,127 bytes |
 | Wrangler types and dry run | Passed; dry run emitted only the known multi-environment warning |
